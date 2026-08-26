@@ -1,0 +1,12 @@
+# pnpm settings.
+#
+# As of pnpm 10/11 these live here rather than in package.json. This file does
+# NOT declare a workspace monorepo — the repository is a single package. It
+# exists only to hold the setting below.
+#
+# esbuild's postinstall script links its platform-specific binary. It is a
+# transitive dependency of tsx and vitest, and both fail without it. Allowlisting
+# it explicitly keeps installs reproducible on any machine and in CI, instead of
+# depending on a local `pnpm approve-builds` decision that is not committed.
+allowBuilds:
+  esbuild: true
