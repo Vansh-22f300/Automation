@@ -26,12 +26,77 @@ export const LOG_LEVELS = [
   'silent',
 ] as const;
 
+/** Schemes PostgreSQL connection URLs are allowed to use. */
+const POSTGRES_PROTOCOLS = ['postgres:', 'postgresql:'];
+
+/**
+ * A PostgreSQL connection URL.
+ *
+ * Validation is structural only — it proves the string is a well-formed
+ * `postgresql://` URL naming a host and a database. It deliberately does not
+ * attempt a connection: configuration parsing must stay synchronous, pure and
+ * free of I/O. Reachability is checked separately at startup by
+ * `verifyConnection()` in src/db/client.ts.
+ *
+ * Every failure message describes the *shape* problem without echoing the URL,
+ * because the URL carries a password and these messages are written to stderr
+ * and may be captured by a process supervisor.
+ */
+const postgresUrl = z
+  .string({ error: 'must be set to a PostgreSQL connection string' })
+  .min(1, 'must not be empty')
+  .superRefine((value, ctx) => {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          'must be a valid URL of the form postgresql://user:password@host:5432/database',
+      });
+      return;
+    }
+
+    if (!POSTGRES_PROTOCOLS.includes(url.protocol)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `must use the postgres:// or postgresql:// scheme (found ${url.protocol}//)`,
+      });
+    }
+    if (url.hostname === '') {
+      ctx.addIssue({ code: 'custom', message: 'must include a host' });
+    }
+    if (url.pathname === '' || url.pathname === '/') {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'must include a database name, for example postgresql://…/ai_workforce',
+      });
+    }
+  });
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(LOG_LEVELS).default('info'),
   /** Bind address. 127.0.0.1 locally; 0.0.0.0 when containerised. */
   HOST: z.string().min(1).default('127.0.0.1'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
+
+  /**
+   * Required. No default and no fallback: an application that silently connects
+   * to the wrong database is worse than one that refuses to start. Any standard
+   * PostgreSQL URL works — local, Neon, Supabase, RDS — so the provider stays a
+   * deployment decision rather than a code decision. TLS is requested through
+   * the URL itself (`?sslmode=require`), not a separate variable.
+   */
+  DATABASE_URL: postgresUrl,
+
+  /**
+   * Maximum pooled connections *per process*. Two processes run (api, worker),
+   * so the real ceiling against the server is roughly double this. Serverless
+   * Postgres plans cap connections aggressively; keep this modest.
+   */
+  DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
 });
 
 export type Env = z.infer<typeof envSchema>;
