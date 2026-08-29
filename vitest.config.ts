@@ -10,5 +10,9 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['src/test/**/*.test.ts'],
+    // The first test to build a Fastify app pays a one-time cost (plugin
+    // registration plus cold module transform under vitest) that can exceed the
+    // 5s default on a slow machine. Steady-state runs are milliseconds.
+    testTimeout: 20_000,
   },
 });

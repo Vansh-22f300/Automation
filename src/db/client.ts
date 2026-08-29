@@ -57,6 +57,12 @@ export interface DatabaseHandle {
   readonly pool: Pool;
   /** Proves the database is reachable. Throws `RetryableError` if it is not. */
   verifyConnection(): Promise<void>;
+  /**
+   * A lightweight `select 1`, for the health endpoint. Unlike `verifyConnection`
+   * it neither logs nor wraps the error — the caller decides what a failure
+   * means. Rejects if the query does not succeed.
+   */
+  ping(): Promise<void>;
   /** Drains the pool. Idempotent enough to be safe in a shutdown handler. */
   close(): Promise<void>;
 }
@@ -162,6 +168,12 @@ export function createDatabase(
         );
       }
       logger.info({ database: target }, 'database connected');
+    },
+
+    async ping() {
+      // No wrapping, no logging: the health endpoint calls this on every probe
+      // and just needs to know whether a trivial query round-trips.
+      await pool.query('select 1');
     },
 
     async close() {

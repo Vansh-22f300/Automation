@@ -1,22 +1,22 @@
 /**
  * API process entrypoint.
  *
- * Step 2 scope: boot a Fastify server, connect to PostgreSQL, log clearly, shut
- * both down cleanly. There are intentionally NO routes yet — health checks,
- * webhook ingestion and authentication arrive in Steps 3 and 4. An unmatched
- * request returns Fastify's default 404, which is itself proof the server is
- * serving.
- *
- * The database handle is created here and would be handed to route handlers and
- * services as they appear. Nothing below reads it yet; the wiring exists so that
- * a misconfigured or unreachable database is caught at boot rather than by the
- * first user request.
+ * Step 3 scope: boot Fastify with a health endpoint and API-key authentication,
+ * connect to PostgreSQL, log clearly, shut everything down cleanly. This file is
+ * the composition root's *process* half — it constructs the real dependencies
+ * (pool, authenticator, repositories), hands them to `buildApp`, then listens.
+ * `buildApp` itself (src/api/app.ts) knows nothing about how they were built,
+ * which is what lets the whole app be exercised in tests without a network.
  */
 
-import Fastify from 'fastify';
 import { loadEnv } from '@/config/env.js';
 import { createDatabase } from '@/db/client.js';
 import { createLogger } from '@/observability/logger.js';
+import { buildApp } from '@/api/app.js';
+import { ApiKeyAuthenticator } from '@/auth/api-key-authenticator.js';
+import { DrizzleApiKeyStore } from '@/auth/api-key-store.js';
+import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
+import { TenantScope } from '@/repositories/tenant-scope.js';
 
 /** Time allowed for in-flight requests to drain before we stop waiting. */
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -26,13 +26,13 @@ const logger = createLogger(env, { service: 'api' });
 
 const database = createDatabase(env, logger, { service: 'api' });
 
-const app = Fastify({
-  loggerInstance: logger,
-  // 1 MiB. Webhook payloads are small; a low ceiling is a cheap DoS guard.
-  bodyLimit: 1_048_576,
-  // Flip on only when running behind a proxy we control, so X-Forwarded-For
-  // cannot be spoofed to defeat rate limiting.
-  trustProxy: false,
+const app = await buildApp({
+  logger,
+  authenticator: new ApiKeyAuthenticator(new DrizzleApiKeyStore(database.db)),
+  checkDatabase: () => database.ping(),
+  // One tenant-scoped service per authenticated request — the repository is
+  // pinned to that tenant and cannot reach across tenants.
+  apiKeyServiceFor: (auth) => new ApiKeyRepository(new TenantScope(database.db, auth.tenantId)),
 });
 
 let shuttingDown = false;
@@ -88,7 +88,7 @@ try {
   await app.listen({ host: env.HOST, port: env.PORT });
   logger.info(
     { host: env.HOST, port: env.PORT, node_env: env.NODE_ENV },
-    'api listening (no routes registered yet)',
+    'api listening',
   );
 } catch (error) {
   logger.fatal({ err: error }, 'api failed to start');
