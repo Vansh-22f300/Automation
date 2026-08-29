@@ -4,11 +4,13 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 4A of 13 — workflow authoring (definition, versions, tenant-scoped service).**
+> **Status: Step 4B of 13 — webhook ingestion (events, workflow runs, idempotency).**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
-> API with a health endpoint and tenant API-key authentication, and a tenant-scoped
-> service for authoring workflows and their immutable, versioned definitions. There
-> is still no webhook ingestion, no queue, no workflow engine and no AI integration.
+> API with a health endpoint and tenant API-key authentication, a tenant-scoped
+> service for authoring workflows and their immutable versioned definitions, and a
+> webhook endpoint that captures events idempotently and creates a queued workflow
+> run when a source has an active workflow. There is still no queue, no workflow
+> engine and no AI integration — a run is created but nothing executes it yet.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -65,6 +67,7 @@ pnpm db:migrate
 | `pnpm tenant:create "<name>"` | Create a tenant; prints its id. Bootstrap step before minting a first key. |
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
+| `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events and workflow runs (read-only dev aid to verify ingestion). |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
 | `pnpm build` | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths. |
@@ -112,6 +115,39 @@ It verifies the database is reachable **before** opening the port, then binds to
 | `POST` | `/v1/api-keys` | Bearer key | Create a key for the caller's tenant. Returns the plaintext **once**. |
 | `GET` | `/v1/api-keys` | Bearer key | List the caller's own keys (metadata only — never the key). |
 | `POST` | `/v1/api-keys/:id/revoke` | Bearer key | Revoke one of the caller's keys. `204` on success, `404` if it is not theirs. |
+| `POST` | `/v1/webhooks/:source` | Bearer key | Ingest a webhook. Captures the event idempotently and, if `:source` has an active workflow, creates a queued run. |
+
+#### Webhook ingestion (`POST /v1/webhooks/:source`)
+
+The event is **always accepted**; only the routing outcome varies. Ingestion is
+idempotent: the dedupe key is the caller's `X-Event-ID` header if present, else a
+SHA-256 of the raw request body — a retried delivery never creates a second event
+or run. The event and (when configured) its run are written in one transaction.
+
+| Outcome | Status | Body |
+| --- | --- | --- |
+| New event, active workflow matched | `202` | `{ event_id, run_id, status: "queued" }` |
+| New event, no workflow for the source | `202` | `{ event_id, run_id: null, status: "accepted", workflow: "not_configured" }` |
+| Duplicate delivery | `200` | `{ event_id, run_id, status: "duplicate" }` |
+
+```bash
+curl -s -X POST http://127.0.0.1:3000/v1/webhooks/github \
+  -H "Authorization: Bearer awk_your_key_here" \
+  -H "Content-Type: application/json" \
+  -H "X-Event-ID: delivery-123" \
+  -d '{"action":"opened"}'
+```
+
+Routing is DB-enforced: **one tenant + one webhook source = one active workflow**,
+via a partial unique index on `(tenant_id, trigger_config->>'source') WHERE
+is_active`. A created run pins the exact `workflow_version_id` at creation, so
+activating a newer version never changes runs already in flight.
+
+> **HMAC signature verification is not implemented yet.** A bearer key is the only
+> authentication. The raw request body is preserved (`request.rawBody`) precisely
+> so per-provider signature verification can be added at this boundary without a
+> rewrite. **Provider webhooks must not be enabled in production before that
+> lands.**
 
 Authentication is a bearer API key:
 
@@ -199,7 +235,7 @@ src/
 │   ├── errors.ts             HTTP error taxonomy + one error envelope
 │   ├── error-handler.ts      Central error/not-found handler
 │   ├── auth-hook.ts          HTTP → AuthContext adapter (onRequest)
-│   └── routes/               health.ts, api-keys.ts
+│   └── routes/               health.ts, api-keys.ts, webhooks.ts
 ├── auth/
 │   ├── context.ts            Framework-free Authenticator seam + AuthContext
 │   ├── api-key.ts            Key generation, hashing, parsing, verification
@@ -208,8 +244,9 @@ src/
 ├── repositories/
 │   ├── tenant-scope.ts       TenantScope + TenantScopedRepository base
 │   ├── api-key-repository.ts Tenant-scoped create/list/revoke
-│   └── workflow-repository.ts  Tenant-scoped workflow + immutable version authoring
-├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts (bootstrap)
+│   ├── workflow-repository.ts  Tenant-scoped workflow + immutable version authoring
+│   └── webhook-repository.ts   Tenant-scoped webhook ingestion (event + run, one txn)
+├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts, inspect-webhooks.ts (bootstrap/dev)
 ├── worker/main.ts            Entrypoint 2 — background worker loop
 ├── db/
 │   ├── schema.ts             Tables, enums, constraints — source of truth
@@ -221,7 +258,8 @@ src/
 │   ├── ids.ts                UUIDv7 id generator
 │   ├── errors.ts             RetryableError / PermanentError taxonomy
 │   ├── workflow-definition.ts  Zod schema for linear noop workflow definitions
-│   └── workflow-trigger.ts   Zod schema for webhook trigger config
+│   ├── workflow-trigger.ts   Zod schema for webhook trigger config
+│   └── workflow-run.ts       Run-context builder (trigger facts + empty steps)
 └── test/
     ├── unit/                 No external dependencies
     └── integration/          Requires PostgreSQL; skipped without it
@@ -279,6 +317,8 @@ definition as a single immutable versioned value.
 | `users` | A human, belonging to one tenant | No auth material yet. Unique per tenant on `lower(email)`. |
 | `workflows` | The stable identity of a process | Name, status. Holds no logic itself. |
 | `workflow_versions` | An immutable snapshot of the logic | `definition` jsonb, trigger config, version number. |
+| `events` | A raw external signal captured at the webhook boundary | `source`, `dedupe_key`, `payload` jsonb, `received_at`. Idempotent per `(tenant_id, source, dedupe_key)`. |
+| `workflow_runs` | One execution of a workflow, born from an event | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. Nothing executes it yet. |
 | `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
 
 Two constraints are worth calling out because they encode invariants the
@@ -298,7 +338,14 @@ A version also cannot be attached to a workflow in a different tenant: the
 foreign key is composite, `(tenant_id, workflow_id) → workflows(tenant_id, id)`.
 Cross-tenant corruption is the most damaging bug class in a multi-tenant system
 and the hardest to notice, so it is made unrepresentable rather than merely
-avoided.
+avoided. `events` and `workflow_runs` follow the same rule: a run's three foreign
+keys are all composite `(tenant_id, X) → parent(tenant_id, id)`, so a run cannot
+reference a workflow, version or event from another tenant. Ingestion idempotency
+is the database's job too — a `UNIQUE(tenant_id, source, dedupe_key)` on `events`,
+combined with `INSERT … ON CONFLICT DO NOTHING`, not an application check-then-insert
+(which races). Routing is enforced by a second partial unique index on
+`(tenant_id, trigger_config->>'source') WHERE is_active`: at most one active
+workflow per tenant per source, so a delivery resolves to exactly one version.
 
 ### Authentication and tenant isolation
 
@@ -356,7 +403,7 @@ refuse to run unless the database name contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–4A)
+### Implemented (Steps 1–4B)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -365,7 +412,8 @@ refuse to run unless the database name contains `test`.
 - Worker process with a heartbeat loop and clean shutdown
 - `RetryableError` / `PermanentError` taxonomy
 - PostgreSQL schema for `tenants`, `users`, `workflows`, `workflow_versions`,
-  `api_keys`, with time-ordered UUIDv7 primary keys generated application-side
+  `events`, `workflow_runs`, `api_keys`, with time-ordered UUIDv7 primary keys
+  generated application-side
 - Drizzle ORM setup, connection pool with clean shutdown, and a migration
   workflow that needs no database to generate or verify
 - Database connectivity verified at startup before the API opens its port
@@ -390,6 +438,14 @@ refuse to run unless the database name contains `test`.
   updated), numbers versions monotonically with a `FOR UPDATE` lock plus the DB
   unique constraint as backstop, and promotes a version inside one transaction so
   "at most one active" always holds
+- **Webhook ingestion (Step 4B)** — `POST /v1/webhooks/:source` under the existing
+  tenant API-key auth: the raw body is preserved for future HMAC, the dedupe key is
+  `X-Event-ID` or a SHA-256 of the body, and the event plus (when a source has an
+  active workflow) its `queued` run are written in one transaction via `INSERT …
+  ON CONFLICT DO NOTHING`. Idempotency and "one active workflow per (tenant,
+  source)" are both DB-enforced; a run pins its exact version at creation. No
+  workflow for a source is a success (event kept, no run), not an error. A
+  `webhooks:inspect` CLI lists a tenant's events and runs.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -399,7 +455,6 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| Webhook ingestion, event persistence, idempotency | Step 4B |
 | Job queue (`FOR UPDATE SKIP LOCKED`), worker claim loop, lease reaper | Step 5 |
 | The step executor that runs a definition | Step 6 |
 | Claude integration behind an `LlmProvider` interface | Steps 7–8 |
@@ -407,10 +462,11 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 | Retry policy and backoff | Step 11 |
 | Run inspection endpoints and log redaction | Step 12 |
 | Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
+| HMAC / provider signature verification on webhooks | before production webhooks |
 
-The tables those steps need — `events`, `workflow_runs`, `step_runs`, `jobs`,
-`connections`, `audit_log` — are not in the schema yet, for the same reason the
-directories are empty: they arrive with the code that uses them.
+The tables later steps need — `step_runs`, `jobs`, `connections`, `audit_log` —
+are not in the schema yet, for the same reason the directories are empty: they
+arrive with the code that uses them.
 
 Explicitly out of scope for the MVP entirely: OAuth flows, billing, a visual
 workflow builder, Redis/Kafka, Kubernetes, microservices, vector stores or agent

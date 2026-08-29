@@ -26,6 +26,8 @@ import { registerApiKeyRoutes } from '@/api/routes/api-keys.js';
 import type { ApiKeyServiceFactory } from '@/api/routes/api-keys.js';
 import { registerHealthRoute } from '@/api/routes/health.js';
 import type { DatabaseHealthCheck } from '@/api/routes/health.js';
+import { registerWebhookRoutes } from '@/api/routes/webhooks.js';
+import type { WebhookIngestorFactory } from '@/api/routes/webhooks.js';
 import type { ApiServer } from '@/api/types.js';
 import type { Authenticator } from '@/auth/context.js';
 import { newId } from '@/domain/ids.js';
@@ -37,6 +39,8 @@ export interface AppDependencies {
   readonly checkDatabase: DatabaseHealthCheck;
   /** Builds a tenant-scoped API-key service for an authenticated request. */
   readonly apiKeyServiceFor: ApiKeyServiceFactory;
+  /** Builds a tenant-scoped webhook ingestor for an authenticated request. */
+  readonly webhookIngestorFor: WebhookIngestorFactory;
   /** Structured logger; Fastify attaches a per-request child of it. */
   readonly logger: Logger;
 }
@@ -82,6 +86,30 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
 
   registerErrorHandling(app);
 
+  // Preserve the exact request bytes before JSON parsing. Webhook signature
+  // verification (HMAC) will need the raw body, and it must be the untouched
+  // bytes — re-serialising the parsed object would change them. This replaces
+  // the default JSON parser for every route; parse failures surface as 400.
+  app.addContentTypeParser(
+    'application/json',
+    { parseAs: 'buffer' },
+    (request, body, done) => {
+      const raw = body as Buffer;
+      request.rawBody = raw;
+      if (raw.length === 0) {
+        done(null, undefined);
+        return;
+      }
+      try {
+        done(null, JSON.parse(raw.toString('utf8')) as unknown);
+      } catch (error) {
+        const err = error as Error & { statusCode?: number };
+        err.statusCode = 400;
+        done(err, undefined);
+      }
+    },
+  );
+
   // Public, unauthenticated route. Registered at the top level so no auth hook
   // applies to it; it exempts itself from the rate limiter internally.
   registerHealthRoute(app, deps.checkDatabase);
@@ -94,6 +122,7 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     const protectedScope = rawScope as unknown as ApiServer;
     registerApiKeyAuth(protectedScope, deps.authenticator);
     registerApiKeyRoutes(protectedScope, deps.apiKeyServiceFor);
+    registerWebhookRoutes(protectedScope, deps.webhookIngestorFor);
   });
 
   return app;

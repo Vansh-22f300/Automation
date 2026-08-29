@@ -142,6 +142,16 @@ async function makeApp(): Promise<Harness> {
       if (!dbHealthy.value) throw new Error('connection refused to 10.0.0.9:5432');
     },
     apiKeyServiceFor: backend.serviceFor,
+    // Not exercised here; the webhook route has its own suite. A no-op ingestor
+    // keeps buildApp's dependency satisfied.
+    webhookIngestorFor: () => ({
+      ingest: async () => ({
+        eventId: newId(),
+        runId: null,
+        duplicate: false,
+        workflowConfigured: false,
+      }),
+    }),
   });
 
   return { app, lines, backend, dbHealthy };
