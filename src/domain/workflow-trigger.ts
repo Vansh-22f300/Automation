@@ -25,14 +25,21 @@ export type TriggerType = (typeof SUPPORTED_TRIGGER_TYPES)[number];
  */
 export const TRIGGER_SOURCE_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 
+/**
+ * The `source` identifier on its own. Exported so the webhook route can validate
+ * the `:source` path segment with the *same* rule the stored trigger config uses
+ * — one definition of "safe source", not two that can drift.
+ */
+export const webhookSourceSchema = z
+  .string()
+  .regex(
+    TRIGGER_SOURCE_PATTERN,
+    'source must be a lowercase identifier (a-z, 0-9, _, -), starting with a letter',
+  );
+
 export const webhookTriggerConfigSchema = z
   .object({
-    source: z
-      .string()
-      .regex(
-        TRIGGER_SOURCE_PATTERN,
-        'source must be a lowercase identifier (a-z, 0-9, _, -), starting with a letter',
-      ),
+    source: webhookSourceSchema,
   })
   .strict();
 

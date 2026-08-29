@@ -102,6 +102,21 @@ export const workflowStatus = pgEnum('workflow_status', ['draft', 'active', 'dis
  */
 export const triggerType = pgEnum('trigger_type', ['webhook']);
 
+/**
+ * The lifecycle of a single workflow run. `queued` is where every run starts;
+ * the engine (Step 5+) drives it through `running`/`waiting` to a terminal
+ * `succeeded`/`failed`/`cancelled`. The set is fixed here so an invalid state is
+ * unrepresentable, even though nothing executes runs yet.
+ */
+export const workflowRunStatus = pgEnum('workflow_run_status', [
+  'queued',
+  'running',
+  'waiting',
+  'succeeded',
+  'failed',
+  'cancelled',
+]);
+
 // ---------------------------------------------------------------------------
 // tenants
 // ---------------------------------------------------------------------------
@@ -284,6 +299,14 @@ export const workflowVersions = pgTable(
     unique('workflow_versions_workflow_id_version_key').on(t.workflowId, t.version),
 
     /**
+     * Backs the composite foreign key that `workflow_runs` uses to pin a run to
+     * a version *in the same tenant*. Redundant for uniqueness (`id` is already
+     * unique) but Postgres will only reference a column set with an explicit
+     * unique constraint.
+     */
+    unique('workflow_versions_tenant_id_id_key').on(t.tenantId, t.id),
+
+    /**
      * At most one active version per workflow, enforced by the database rather
      * than by application discipline. A partial index is what makes this
      * expressible: unaffected by the many inactive rows.
@@ -291,6 +314,139 @@ export const workflowVersions = pgTable(
     uniqueIndex('workflow_versions_one_active_per_workflow_idx')
       .on(t.workflowId)
       .where(sql`${t.isActive}`),
+
+    /**
+     * The routing invariant: **one tenant + one webhook source = one active
+     * workflow.** An incoming `POST /v1/webhooks/:source` must resolve to a
+     * single active version, so two active versions in the same tenant sharing a
+     * `trigger_config.source` would be ambiguous. This partial unique index over
+     * the extracted source makes that unrepresentable — activation of a colliding
+     * version fails at the database, not merely by convention. Scoped to the
+     * tenant, so tenant B may independently use the same source.
+     */
+    uniqueIndex('workflow_versions_one_active_per_tenant_source_idx')
+      .on(t.tenantId, sql`(${t.triggerConfig} ->> 'source')`)
+      .where(sql`${t.isActive}`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// events
+// ---------------------------------------------------------------------------
+
+/**
+ * A raw external signal received at the webhook boundary, captured verbatim
+ * before anything acts on it.
+ *
+ * Events are the durable, replayable record of "something happened": persisted
+ * first, then a run may be created from one. The dedupe key is what makes
+ * ingestion idempotent — a provider that retries the same delivery, or a caller
+ * that resends an identical body, must not produce a second event or a second
+ * run. That guarantee is the database's, via the unique constraint below, not the
+ * application's "check then insert" (which races).
+ */
+export const events = pgTable(
+  'events',
+  {
+    id: primaryId(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id, { onDelete: 'cascade' }),
+    /** Which webhook source this arrived on, e.g. `stripe`. From the URL path. */
+    source: text('source').notNull(),
+    /**
+     * The idempotency key: the caller's `X-Event-ID` if supplied, otherwise a
+     * SHA-256 of the raw request body. Deterministic on purpose — the same body
+     * always yields the same key — so a retry collides rather than duplicates.
+     */
+    dedupeKey: text('dedupe_key').notNull(),
+    /** The parsed JSON payload, stored whole. */
+    payload: jsonb('payload').notNull().$type<unknown>(),
+    /** When the signal was received at the boundary. */
+    receivedAt: timestamp('received_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    /**
+     * Idempotency, enforced by the database. Scoped to the tenant and source so
+     * the same key is independent across tenants and across sources — exactly
+     * the collision domain the webhook flow relies on.
+     */
+    unique('events_tenant_id_source_dedupe_key_key').on(t.tenantId, t.source, t.dedupeKey),
+    /**
+     * Backs the composite foreign key that `workflow_runs` uses to tie a run to
+     * an event *in the same tenant*.
+     */
+    unique('events_tenant_id_id_key').on(t.tenantId, t.id),
+    /** Tenant/source/time lookup for inspecting recent events. */
+    index('events_tenant_id_source_received_at_idx').on(
+      t.tenantId,
+      t.source,
+      t.receivedAt.desc(),
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// workflow_runs
+// ---------------------------------------------------------------------------
+
+/**
+ * One execution of a workflow, born from an event.
+ *
+ * Created at `queued` and nothing advances it yet — the worker and executor are
+ * Step 5+. What matters here is what a run *pins* at creation: both the workflow
+ * and the exact `workflow_version_id`. A run must never re-resolve "the active
+ * version" later, or promoting a new version would silently change the logic of
+ * runs already in flight. The composite foreign keys make cross-tenant attachment
+ * impossible: a run can only reference a workflow, version and event of its own
+ * tenant.
+ */
+export const workflowRuns = pgTable(
+  'workflow_runs',
+  {
+    id: primaryId(),
+    tenantId: uuid('tenant_id').notNull(),
+    workflowId: uuid('workflow_id').notNull(),
+    /** The pinned version. Never the "current active" — the one resolved at creation. */
+    workflowVersionId: uuid('workflow_version_id').notNull(),
+    /** The event that triggered this run. */
+    eventId: uuid('event_id').notNull(),
+    status: workflowRunStatus('status').notNull().default('queued'),
+    /** Where execution is, once it starts. The first step key at creation. */
+    currentStepKey: text('current_step_key'),
+    /** Accumulated run state: trigger data and per-step results. Small for now. */
+    context: jsonb('context').notNull().default({}).$type<Record<string, unknown>>(),
+    /** Populated only on failure; a structured error, never a raw stack to a client. */
+    error: jsonb('error').$type<Record<string, unknown>>(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }),
+    finishedAt: timestamp('finished_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    /** The run's workflow must be in the run's tenant. */
+    foreignKey({
+      name: 'workflow_runs_tenant_id_workflow_id_fkey',
+      columns: [t.tenantId, t.workflowId],
+      foreignColumns: [workflows.tenantId, workflows.id],
+    }).onDelete('cascade'),
+    /** The pinned version must be in the run's tenant. */
+    foreignKey({
+      name: 'workflow_runs_tenant_id_workflow_version_id_fkey',
+      columns: [t.tenantId, t.workflowVersionId],
+      foreignColumns: [workflowVersions.tenantId, workflowVersions.id],
+    }).onDelete('cascade'),
+    /** The triggering event must be in the run's tenant. */
+    foreignKey({
+      name: 'workflow_runs_tenant_id_event_id_fkey',
+      columns: [t.tenantId, t.eventId],
+      foreignColumns: [events.tenantId, events.id],
+    }).onDelete('cascade'),
+    /** Tenant-scoped listing, newest first. */
+    index('workflow_runs_tenant_id_created_at_idx').on(t.tenantId, t.createdAt.desc()),
   ],
 );
 
@@ -373,6 +529,8 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   workflows: many(workflows),
   workflowVersions: many(workflowVersions),
   apiKeys: many(apiKeys),
+  events: many(events),
+  workflowRuns: many(workflowRuns),
 }));
 
 export const usersRelations = relations(users, ({ one }) => ({
@@ -399,6 +557,24 @@ export const workflowVersionsRelations = relations(workflowVersions, ({ one }) =
   }),
 }));
 
+export const eventsRelations = relations(events, ({ one, many }) => ({
+  tenant: one(tenants, { fields: [events.tenantId], references: [tenants.id] }),
+  runs: many(workflowRuns),
+}));
+
+export const workflowRunsRelations = relations(workflowRuns, ({ one }) => ({
+  tenant: one(tenants, { fields: [workflowRuns.tenantId], references: [tenants.id] }),
+  workflow: one(workflows, {
+    fields: [workflowRuns.workflowId],
+    references: [workflows.id],
+  }),
+  version: one(workflowVersions, {
+    fields: [workflowRuns.workflowVersionId],
+    references: [workflowVersions.id],
+  }),
+  event: one(events, { fields: [workflowRuns.eventId], references: [events.id] }),
+}));
+
 // ---------------------------------------------------------------------------
 // Inferred row types
 // ---------------------------------------------------------------------------
@@ -420,3 +596,9 @@ export type NewWorkflowVersion = typeof workflowVersions.$inferInsert;
 
 export type ApiKey = typeof apiKeys.$inferSelect;
 export type NewApiKey = typeof apiKeys.$inferInsert;
+
+export type Event = typeof events.$inferSelect;
+export type NewEvent = typeof events.$inferInsert;
+
+export type WorkflowRun = typeof workflowRuns.$inferSelect;
+export type NewWorkflowRun = typeof workflowRuns.$inferInsert;

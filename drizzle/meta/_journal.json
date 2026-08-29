@@ -15,6 +15,13 @@
       "when": 1788020222928,
       "tag": "0001_step3_uuidv7_and_api_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788025194469,
+      "tag": "0002_remarkable_nightshade",
+      "breakpoints": true
     }
   ]
 }

@@ -17,6 +17,7 @@ import { ApiKeyAuthenticator } from '@/auth/api-key-authenticator.js';
 import { DrizzleApiKeyStore } from '@/auth/api-key-store.js';
 import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
+import { WebhookRepository } from '@/repositories/webhook-repository.js';
 
 /** Time allowed for in-flight requests to drain before we stop waiting. */
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -33,6 +34,7 @@ const app = await buildApp({
   // One tenant-scoped service per authenticated request — the repository is
   // pinned to that tenant and cannot reach across tenants.
   apiKeyServiceFor: (auth) => new ApiKeyRepository(new TenantScope(database.db, auth.tenantId)),
+  webhookIngestorFor: (auth) => new WebhookRepository(new TenantScope(database.db, auth.tenantId)),
 });
 
 let shuttingDown = false;

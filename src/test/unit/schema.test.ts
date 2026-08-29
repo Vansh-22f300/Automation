@@ -16,11 +16,14 @@ import type { PgTable } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
 import {
   apiKeys,
+  events,
   tenantStatus,
   tenants,
   triggerType,
   userStatus,
   users,
+  workflowRunStatus,
+  workflowRuns,
   workflowStatus,
   workflowVersions,
   workflows,
@@ -52,12 +55,16 @@ const ALL_TABLES = {
   workflows,
   workflow_versions: workflowVersions,
   api_keys: apiKeys,
+  events,
+  workflow_runs: workflowRuns,
 };
 const TENANT_SCOPED = {
   users,
   workflows,
   workflow_versions: workflowVersions,
   api_keys: apiKeys,
+  events,
+  workflow_runs: workflowRuns,
 };
 
 describe('table naming', () => {
@@ -156,6 +163,14 @@ describe('enumerated columns', () => {
     expect(userStatus.enumValues).toEqual(['active', 'disabled']);
     expect(workflowStatus.enumValues).toEqual(['draft', 'active', 'disabled']);
     expect(triggerType.enumValues).toEqual(['webhook']);
+    expect(workflowRunStatus.enumValues).toEqual([
+      'queued',
+      'running',
+      'waiting',
+      'succeeded',
+      'failed',
+      'cancelled',
+    ]);
   });
 
   it('are applied to the columns that use them, with defaults where sensible', () => {
@@ -309,5 +324,94 @@ describe('api_keys', () => {
     // Revocation and last-use are the only mutations, each with its own column;
     // there is no generic updated_at.
     expect(names).not.toContain('updated_at');
+  });
+});
+
+describe('events', () => {
+  it('captures the raw signal with a jsonb payload and a received_at', () => {
+    const payload = column(events, 'payload');
+    expect(payload.getSQLType()).toBe('jsonb');
+    expect(payload.notNull).toBe(true);
+
+    const receivedAt = column(events, 'received_at');
+    expect(receivedAt.getSQLType()).toBe('timestamp with time zone');
+    expect(receivedAt.notNull).toBe(true);
+    expect(receivedAt.hasDefault).toBe(true);
+
+    // An event is an immutable record of what arrived: no updated_at.
+    expect([...columns(events).keys()]).not.toContain('updated_at');
+  });
+
+  it('makes ingestion idempotent per (tenant, source, dedupe_key)', () => {
+    const unique = getTableConfig(events).uniqueConstraints.find(
+      (u) => u.name === 'events_tenant_id_source_dedupe_key_key',
+    );
+
+    expect(unique).toBeDefined();
+    expect(columnNames(unique?.columns ?? [])).toEqual(['tenant_id', 'source', 'dedupe_key']);
+  });
+
+  it('exposes (tenant_id, id) as a unique constraint so runs can reference it', () => {
+    const unique = getTableConfig(events).uniqueConstraints.find(
+      (u) => u.name === 'events_tenant_id_id_key',
+    );
+
+    expect(unique).toBeDefined();
+    expect(columnNames(unique?.columns ?? [])).toEqual(['tenant_id', 'id']);
+  });
+});
+
+describe('workflow_versions routing invariant', () => {
+  it('allows at most one active version per (tenant, source), via a partial unique index', () => {
+    const index = getTableConfig(workflowVersions).indexes.find(
+      (i) => i.config.name === 'workflow_versions_one_active_per_tenant_source_idx',
+    );
+
+    expect(index).toBeDefined();
+    expect(index?.config.unique).toBe(true);
+    // tenant_id leads, then the extracted trigger_config->>'source' as an expression.
+    expect(columnNames(index?.config.columns ?? [])).toEqual(['tenant_id', '(expression)']);
+    // The WHERE (is_active) clause is what scopes this to active versions only.
+    expect(index?.config.where).toBeDefined();
+  });
+});
+
+describe('workflow_runs', () => {
+  it('starts queued and carries a jsonb context', () => {
+    expect(column(workflowRuns, 'status').getSQLType()).toBe('workflow_run_status');
+    expect(column(workflowRuns, 'status').hasDefault).toBe(true);
+
+    const context = column(workflowRuns, 'context');
+    expect(context.getSQLType()).toBe('jsonb');
+    expect(context.notNull).toBe(true);
+    expect(context.hasDefault).toBe(true);
+  });
+
+  it('pins both the workflow and the exact version at creation', () => {
+    const names = [...columns(workflowRuns).keys()];
+    expect(names).toContain('workflow_id');
+    expect(names).toContain('workflow_version_id');
+    expect(names).toContain('event_id');
+  });
+
+  it('cannot attach to a workflow, version or event of a different tenant', () => {
+    const foreignKeys = getTableConfig(workflowRuns).foreignKeys;
+    expect(foreignKeys).toHaveLength(3);
+
+    // Every FK is composite on (tenant_id, X) → parent(tenant_id, id).
+    const targets = foreignKeys.map((fk) => {
+      const ref = fk.reference();
+      return {
+        columns: columnNames(ref.columns),
+        table: getTableConfig(ref.foreignTable).name,
+        foreignColumns: columnNames(ref.foreignColumns),
+      };
+    });
+
+    for (const t of targets) {
+      expect(t.columns[0]).toBe('tenant_id');
+      expect(t.foreignColumns).toEqual(['tenant_id', 'id']);
+    }
+    expect(targets.map((t) => t.table).sort()).toEqual(['events', 'workflow_versions', 'workflows']);
   });
 });
