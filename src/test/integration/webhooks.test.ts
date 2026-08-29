@@ -31,8 +31,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parseEnv } from '@/config/env.js';
 import { createDatabase, describeDatabaseUrl } from '@/db/client.js';
 import type { DatabaseHandle } from '@/db/client.js';
-import { events, tenants, workflowRuns } from '@/db/schema.js';
+import { events, jobs, tenants, workflowRuns } from '@/db/schema.js';
 import { createLogger } from '@/observability/logger.js';
+import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
@@ -53,7 +54,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
   let tenantB: string;
 
   const ingestorFor = (tenantId: string): WebhookRepository =>
-    new WebhookRepository(new TenantScope(handle.db, tenantId));
+    new WebhookRepository(new TenantScope(handle.db, tenantId), new PostgresJobQueue(handle.db));
   const workflowsFor = (tenantId: string): WorkflowRepository =>
     new WorkflowRepository(new TenantScope(handle.db, tenantId));
 
@@ -159,6 +160,13 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
       .from(workflowRuns)
       .where(eq(workflowRuns.eventId, result.eventId));
     expect(runs).toHaveLength(0);
+
+    // No run means no job either.
+    const runJobs = await handle.db
+      .select()
+      .from(jobs)
+      .where(eq(jobs.tenantId, tenantA));
+    expect(runJobs.every((j) => j.runId !== result.eventId)).toBe(true);
   });
 
   it('creates a queued run with the right fields when an active workflow matches', async () => {
@@ -193,6 +201,22 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
       trigger: { source: 'routed', event_id: result.eventId, payload: { order: 7 } },
       steps: {},
     });
+
+    // The first job was created atomically with the run: pending, attempt 0,
+    // the default ceiling, pointing at the run's first step, ready to run now.
+    const runJobs = await handle.db
+      .select()
+      .from(jobs)
+      .where(eq(jobs.runId, result.runId as string));
+    expect(runJobs).toHaveLength(1);
+    expect(runJobs[0]!.status).toBe('pending');
+    expect(runJobs[0]!.tenantId).toBe(tenantA);
+    expect(runJobs[0]!.stepKey).toBe('first');
+    expect(runJobs[0]!.attempt).toBe(0);
+    expect(runJobs[0]!.maxAttempts).toBe(5);
+    expect(runJobs[0]!.lockedBy).toBeNull();
+    expect(runJobs[0]!.leaseExpiresAt).toBeNull();
+    expect(runJobs[0]!.runAt).toBeInstanceOf(Date);
   });
 
   it('does not let tenant A trigger tenant B’s workflow on the same source', async () => {
@@ -279,5 +303,12 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
       .from(workflowRuns)
       .where(eq(workflowRuns.eventId, first.eventId));
     expect(runs).toHaveLength(1);
+
+    // And exactly one first job — the retry did not enqueue a second.
+    const runJobs = await handle.db
+      .select()
+      .from(jobs)
+      .where(eq(jobs.runId, first.runId as string));
+    expect(runJobs).toHaveLength(1);
   });
 });

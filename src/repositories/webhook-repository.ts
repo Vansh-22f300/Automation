@@ -25,8 +25,9 @@ import { and, desc, eq, sql } from 'drizzle-orm';
 
 import { parseWorkflowDefinition } from '@/domain/workflow-definition.js';
 import { buildRunContext } from '@/domain/workflow-run.js';
-import { events, workflowRuns, workflowVersions } from '@/db/schema.js';
-import type { Event, WorkflowRun } from '@/db/schema.js';
+import { events, jobs, workflowRuns, workflowVersions } from '@/db/schema.js';
+import type { Event, Job, WorkflowRun } from '@/db/schema.js';
+import type { TransactionalJobEnqueuer } from '@/repositories/job-queue.js';
 import { TenantScope, TenantScopedRepository } from '@/repositories/tenant-scope.js';
 
 /** What the route hands the service for a single webhook delivery. */
@@ -53,7 +54,17 @@ export interface WebhookIngestor {
 }
 
 export class WebhookRepository extends TenantScopedRepository implements WebhookIngestor {
-  constructor(scope: TenantScope) {
+  /**
+   * The queue is injected rather than constructed here so the first job is
+   * created through the same code path — and defaults — as any other job, and
+   * so ingestion depends on the *enqueue* capability, not on PostgreSQL queue
+   * mechanics. It is invoked with this transaction so the event, the run and the
+   * first job commit together or not at all.
+   */
+  constructor(
+    scope: TenantScope,
+    private readonly queue: TransactionalJobEnqueuer,
+  ) {
     super(scope);
   }
 
@@ -142,6 +153,15 @@ export class WebhookRepository extends TenantScopedRepository implements Webhook
         })
         .returning({ id: workflowRuns.id });
 
+      // The first job, in the same transaction: there is never a queued run
+      // without a job to advance it, nor a job for a run that failed to persist.
+      // A duplicate delivery never reaches here (it returned above), so exactly
+      // one first job is created per run.
+      await this.queue.enqueue(
+        { tenantId: this.tenantId, runId: run!.id, stepKey: firstStepKey },
+        tx,
+      );
+
       return { eventId, runId: run!.id, duplicate: false, workflowConfigured: true };
     });
   }
@@ -163,6 +183,16 @@ export class WebhookRepository extends TenantScopedRepository implements Webhook
       .from(workflowRuns)
       .where(this.scope.where(workflowRuns.tenantId))
       .orderBy(desc(workflowRuns.createdAt))
+      .limit(limit);
+  }
+
+  /** Recent jobs for this tenant, newest first — shows what the worker will pick up. */
+  async listJobs(limit = 50): Promise<Job[]> {
+    return this.db
+      .select()
+      .from(jobs)
+      .where(this.scope.where(jobs.tenantId))
+      .orderBy(desc(jobs.createdAt))
       .limit(limit);
   }
 }

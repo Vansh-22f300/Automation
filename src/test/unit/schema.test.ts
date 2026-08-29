@@ -17,6 +17,8 @@ import { describe, expect, it } from 'vitest';
 import {
   apiKeys,
   events,
+  jobStatus,
+  jobs,
   tenantStatus,
   tenants,
   triggerType,
@@ -57,6 +59,7 @@ const ALL_TABLES = {
   api_keys: apiKeys,
   events,
   workflow_runs: workflowRuns,
+  jobs,
 };
 const TENANT_SCOPED = {
   users,
@@ -65,6 +68,7 @@ const TENANT_SCOPED = {
   api_keys: apiKeys,
   events,
   workflow_runs: workflowRuns,
+  jobs,
 };
 
 describe('table naming', () => {
@@ -171,6 +175,7 @@ describe('enumerated columns', () => {
       'failed',
       'cancelled',
     ]);
+    expect(jobStatus.enumValues).toEqual(['pending', 'running', 'done', 'failed']);
   });
 
   it('are applied to the columns that use them, with defaults where sensible', () => {
@@ -178,10 +183,13 @@ describe('enumerated columns', () => {
     expect(column(users, 'status').getSQLType()).toBe('user_status');
     expect(column(workflows, 'status').getSQLType()).toBe('workflow_status');
     expect(column(workflowVersions, 'trigger_type').getSQLType()).toBe('trigger_type');
+    expect(column(jobs, 'status').getSQLType()).toBe('job_status');
 
     expect(column(workflows, 'status').hasDefault).toBe(true);
     // A version's trigger is a deliberate authoring decision, not a default.
     expect(column(workflowVersions, 'trigger_type').hasDefault).toBe(false);
+    // A job always starts pending.
+    expect(column(jobs, 'status').hasDefault).toBe(true);
   });
 });
 
@@ -413,5 +421,86 @@ describe('workflow_runs', () => {
       expect(t.foreignColumns).toEqual(['tenant_id', 'id']);
     }
     expect(targets.map((t) => t.table).sort()).toEqual(['events', 'workflow_versions', 'workflows']);
+  });
+
+  it('exposes (tenant_id, id) as a unique constraint so jobs can reference it', () => {
+    const unique = getTableConfig(workflowRuns).uniqueConstraints.find(
+      (u) => u.name === 'workflow_runs_tenant_id_id_key',
+    );
+
+    expect(unique).toBeDefined();
+    expect(columnNames(unique?.columns ?? [])).toEqual(['tenant_id', 'id']);
+  });
+});
+
+describe('jobs', () => {
+  it('carries the durable queue state a claim loop needs', () => {
+    const names = [...columns(jobs).keys()];
+    for (const required of [
+      'run_id',
+      'step_key',
+      'attempt',
+      'max_attempts',
+      'status',
+      'run_at',
+      'locked_by',
+      'lease_expires_at',
+      'last_error',
+    ]) {
+      expect(names, `jobs must have ${required}`).toContain(required);
+    }
+  });
+
+  it('starts pending with a zero attempt and a default ceiling', () => {
+    expect(column(jobs, 'status').hasDefault).toBe(true);
+
+    const attempt = column(jobs, 'attempt');
+    expect(attempt.getSQLType()).toBe('integer');
+    expect(attempt.notNull).toBe(true);
+    expect(attempt.hasDefault).toBe(true);
+
+    const maxAttempts = column(jobs, 'max_attempts');
+    expect(maxAttempts.getSQLType()).toBe('integer');
+    expect(maxAttempts.notNull).toBe(true);
+    expect(maxAttempts.hasDefault).toBe(true);
+
+    // Ready to run immediately unless deferred.
+    expect(column(jobs, 'run_at').hasDefault).toBe(true);
+    expect(column(jobs, 'run_at').notNull).toBe(true);
+  });
+
+  it('leaves the lease fields nullable — an unclaimed job holds no lease', () => {
+    for (const name of ['locked_by', 'lease_expires_at'] as const) {
+      const c = column(jobs, name);
+      expect(c.notNull, `${name} must be nullable`).toBe(false);
+      expect(c.hasDefault, `${name} must not have a default`).toBe(false);
+    }
+  });
+
+  it('cannot be attached to a run belonging to a different tenant', () => {
+    const foreignKeys = getTableConfig(jobs).foreignKeys;
+    expect(foreignKeys).toHaveLength(1);
+
+    const reference = foreignKeys[0]?.reference();
+    // Composite (tenant_id, run_id) → workflow_runs(tenant_id, id).
+    expect(columnNames(reference?.columns ?? [])).toEqual(['tenant_id', 'run_id']);
+    expect(getTableConfig(reference!.foreignTable).name).toBe('workflow_runs');
+    expect(columnNames(reference?.foreignColumns ?? [])).toEqual(['tenant_id', 'id']);
+  });
+
+  it('indexes the consumption and reaping paths as partial indexes', () => {
+    const indexes = getTableConfig(jobs).indexes;
+
+    const consumption = indexes.find((i) => i.config.name === 'jobs_pending_run_at_idx');
+    expect(consumption).toBeDefined();
+    expect(columnNames(consumption?.config.columns ?? [])).toEqual(['run_at']);
+    // Restricted to pending rows so the claim scan stays tight.
+    expect(consumption?.config.where).toBeDefined();
+
+    const reaping = indexes.find((i) => i.config.name === 'jobs_running_lease_expires_at_idx');
+    expect(reaping).toBeDefined();
+    expect(columnNames(reaping?.config.columns ?? [])).toEqual(['lease_expires_at']);
+    // Restricted to running rows so the reaper sweep never scans settled work.
+    expect(reaping?.config.where).toBeDefined();
   });
 });

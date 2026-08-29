@@ -16,6 +16,7 @@ import { buildApp } from '@/api/app.js';
 import { ApiKeyAuthenticator } from '@/auth/api-key-authenticator.js';
 import { DrizzleApiKeyStore } from '@/auth/api-key-store.js';
 import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
+import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 
@@ -27,6 +28,11 @@ const logger = createLogger(env, { service: 'api' });
 
 const database = createDatabase(env, logger, { service: 'api' });
 
+// The producer side of the queue. Enqueuing the first job is unscoped here (the
+// tenant is carried on each job and enforced by the composite FK); ingestion
+// passes its own transaction so event + run + job commit atomically.
+const queue = new PostgresJobQueue(database.db);
+
 const app = await buildApp({
   logger,
   authenticator: new ApiKeyAuthenticator(new DrizzleApiKeyStore(database.db)),
@@ -34,7 +40,8 @@ const app = await buildApp({
   // One tenant-scoped service per authenticated request — the repository is
   // pinned to that tenant and cannot reach across tenants.
   apiKeyServiceFor: (auth) => new ApiKeyRepository(new TenantScope(database.db, auth.tenantId)),
-  webhookIngestorFor: (auth) => new WebhookRepository(new TenantScope(database.db, auth.tenantId)),
+  webhookIngestorFor: (auth) =>
+    new WebhookRepository(new TenantScope(database.db, auth.tenantId), queue),
 });
 
 let shuttingDown = false;

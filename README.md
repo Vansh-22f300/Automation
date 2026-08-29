@@ -4,13 +4,16 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 4B of 13 — webhook ingestion (events, workflow runs, idempotency).**
+> **Status: Step 5 of 13 — job queue, worker claim loop and lease reaper.**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
-> service for authoring workflows and their immutable versioned definitions, and a
+> service for authoring workflows and their immutable versioned definitions, a
 > webhook endpoint that captures events idempotently and creates a queued workflow
-> run when a source has an active workflow. There is still no queue, no workflow
-> engine and no AI integration — a run is created but nothing executes it yet.
+> run (and its first job) atomically, and a durable `jobs` queue with a worker that
+> claims work under a lease (`FOR UPDATE SKIP LOCKED`) and a reaper that returns
+> abandoned jobs to the queue. There is still no step executor and no AI
+> integration — a job is claimed but nothing executes the step yet; the worker
+> records that boundary as a clear job failure rather than pretending work was done.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -67,7 +70,7 @@ pnpm db:migrate
 | `pnpm tenant:create "<name>"` | Create a tenant; prints its id. Bootstrap step before minting a first key. |
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
-| `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events and workflow runs (read-only dev aid to verify ingestion). |
+| `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs and jobs (read-only dev aid to verify ingestion and queueing). |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
 | `pnpm build` | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths. |
@@ -184,9 +187,29 @@ logs `api stopped cleanly`.
 pnpm dev:worker
 ```
 
-It verifies the database, logs `worker started`, then emits a `worker tick`
-heartbeat roughly once per second. This is a placeholder for the real job-claim
-loop (Step 5). Stop it with `Ctrl+C`; it logs `worker stopped cleanly`.
+It verifies the database, logs `worker_started`, then runs two long-lived loops
+against the `jobs` table:
+
+- a **claim loop** that takes one ready job at a time with `SELECT … FOR UPDATE
+  SKIP LOCKED` inside a short transaction, stamps this worker's instance id and a
+  five-minute lease on it, checks the job's run still exists, and hands it to a
+  dispatcher — logging `job_claimed`, then `job_completed` or `job_failed`;
+- a **reaper** that periodically returns jobs whose lease has expired to `pending`
+  (incrementing `attempt`), so a job held by a crashed worker is never lost —
+  logging `job_requeued` when it recovers any.
+
+Two workers can run at once without ever claiming the same job; that guarantee is
+PostgreSQL's, via `FOR UPDATE SKIP LOCKED`, not the application's.
+
+> **No step is executed yet.** The dispatcher is `UnimplementedStepDispatcher`,
+> which refuses every step; the worker records that refusal as a terminal job
+> failure (`step_execution_not_implemented`) and **never marks a job `done`**,
+> because no work is actually performed. The real executor arrives in Step 6 as a
+> drop-in `StepDispatcher`. A job whose run has vanished fails as `run_not_found`;
+> an unexpected error leaves the job `running` so the reaper recovers it.
+
+Stop it with `Ctrl+C`; it stops claiming first, drains the loops, closes the pool,
+and logs `worker_shutdown`.
 
 The two processes are independent — neither requires the other to run. Both
 refuse to start if the database is unreachable, because a process that is
@@ -245,9 +268,14 @@ src/
 │   ├── tenant-scope.ts       TenantScope + TenantScopedRepository base
 │   ├── api-key-repository.ts Tenant-scoped create/list/revoke
 │   ├── workflow-repository.ts  Tenant-scoped workflow + immutable version authoring
-│   └── webhook-repository.ts   Tenant-scoped webhook ingestion (event + run, one txn)
+│   ├── webhook-repository.ts   Tenant-scoped webhook ingestion (event + run + first job, one txn)
+│   └── job-queue.ts            PostgresJobQueue — enqueue/claim/complete/fail/requeueExpired
 ├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts, inspect-webhooks.ts (bootstrap/dev)
-├── worker/main.ts            Entrypoint 2 — background worker loop
+├── worker/
+│   ├── main.ts               Entrypoint 2 — composition root: worker + reaper wiring, shutdown
+│   ├── worker.ts             The claim → verify → dispatch → settle loop
+│   ├── reaper.ts             Periodic sweep returning expired-lease jobs to the queue
+│   └── dispatcher.ts         StepDispatcher seam + UnimplementedStepDispatcher (Step 6 fills it)
 ├── db/
 │   ├── schema.ts             Tables, enums, constraints — source of truth
 │   ├── client.ts             Pool + typed Drizzle instance + clean shutdown
@@ -259,7 +287,8 @@ src/
 │   ├── errors.ts             RetryableError / PermanentError taxonomy
 │   ├── workflow-definition.ts  Zod schema for linear noop workflow definitions
 │   ├── workflow-trigger.ts   Zod schema for webhook trigger config
-│   └── workflow-run.ts       Run-context builder (trigger facts + empty steps)
+│   ├── workflow-run.ts       Run-context builder (trigger facts + empty steps)
+│   └── queue.ts             Framework-free Queue contract + InvalidJobTransitionError
 └── test/
     ├── unit/                 No external dependencies
     └── integration/          Requires PostgreSQL; skipped without it
@@ -297,7 +326,7 @@ code rather than placeholder files.
 
 ## Data model
 
-Five tables so far. Two rules drive the shape of all of them.
+Eight tables so far. Two rules drive the shape of all of them.
 
 **Every tenant-scoped table carries `tenant_id`** — even where it is derivable by
 joining. Tenant isolation has to be expressible as a predicate on the table being
@@ -318,7 +347,8 @@ definition as a single immutable versioned value.
 | `workflows` | The stable identity of a process | Name, status. Holds no logic itself. |
 | `workflow_versions` | An immutable snapshot of the logic | `definition` jsonb, trigger config, version number. |
 | `events` | A raw external signal captured at the webhook boundary | `source`, `dedupe_key`, `payload` jsonb, `received_at`. Idempotent per `(tenant_id, source, dedupe_key)`. |
-| `workflow_runs` | One execution of a workflow, born from an event | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. Nothing executes it yet. |
+| `workflow_runs` | One execution of a workflow, born from an event | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. A worker claims its jobs, but no step executes yet. |
+| `jobs` | A unit of durable work advancing a run's step | `step_key`, `attempt`/`max_attempts`, `status` (`pending`→`running`→`done`/`failed`), `run_at`, `locked_by` + `lease_expires_at` (the lease), `last_error`. Claimed with `FOR UPDATE SKIP LOCKED`. |
 | `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
 
 Two constraints are worth calling out because they encode invariants the
@@ -346,6 +376,16 @@ combined with `INSERT … ON CONFLICT DO NOTHING`, not an application check-then
 (which races). Routing is enforced by a second partial unique index on
 `(tenant_id, trigger_config->>'source') WHERE is_active`: at most one active
 workflow per tenant per source, so a delivery resolves to exactly one version.
+
+`jobs` extends the same discipline to the queue. Its foreign key is composite,
+`(tenant_id, run_id) → workflow_runs(tenant_id, id)` (which is why `workflow_runs`
+carries an explicit `UNIQUE(tenant_id, id)`), so a job can never be attached to a
+run in another tenant. Two partial indexes keep the hot paths tight: one on
+`(run_at) WHERE status = 'pending'` for the claim scan, and one on
+`(lease_expires_at) WHERE status = 'running'` for the reaper sweep — neither ever
+scans settled work. The first job of a run is created inside the *same*
+transaction as the event and the run, so there is never a queued run without a job
+to advance it.
 
 ### Authentication and tenant isolation
 
@@ -381,7 +421,11 @@ the Drizzle model — a dropped `tenant_id`, a naive `timestamp`, or an
 `updated_at` appearing on `workflow_versions` all fail the build. For workflow
 authoring they cover definition validation (valid `noop` accepted; empty steps,
 duplicate keys, bad key format, unknown step type, malformed config all rejected)
-and trigger-config validation.
+and trigger-config validation. The worker loop is covered with an in-memory fake
+queue: an unimplemented step is failed and **never completed**, a job whose run
+has vanished is failed without dispatch, a job is completed only when the
+dispatcher reports success, an unexpected dispatcher error leaves the job
+untouched for the reaper, and a stopped worker claims nothing further.
 
 Integration tests require a real PostgreSQL server and are **skipped** without
 one. They are never simulated: no database means skipped, not passed.
@@ -398,18 +442,25 @@ the authenticator, and that SQL-level tenant scoping stops one tenant reading or
 revoking another's keys. For workflows they prove version 2 is a fresh INSERT that
 leaves version 1 unchanged, that the unique version constraint refuses a duplicate,
 that promoting a version keeps exactly one active, and that one tenant cannot read,
-version or activate another's workflow. Because they write and delete rows, they
-refuse to run unless the database name contains `test`.
+version or activate another's workflow. For the **job queue** they prove what
+mocking cannot: that `claim` moves exactly one pending row to `running` under a
+lease (oldest first, never a future `run_at`), that two workers claiming
+concurrently never receive the same job and each gets a distinct one when several
+are ready (the `SKIP LOCKED` guarantee), that `complete`/`fail` reject illegal
+transitions and a terminal job is never re-claimed, that the reaper requeues an
+expired-lease job and increments its attempt while leaving live leases alone, and
+that a tenant-scoped queue can neither claim nor mutate another tenant's jobs.
+Because they write and delete rows, they refuse to run unless the database name
+contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–4B)
+### Implemented (Steps 1–5)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
 - Structured pino logging with a `withContext` helper for `tenant_id`,
   `run_id`, `step_run_id`
-- Worker process with a heartbeat loop and clean shutdown
 - `RetryableError` / `PermanentError` taxonomy
 - PostgreSQL schema for `tenants`, `users`, `workflows`, `workflow_versions`,
   `events`, `workflow_runs`, `api_keys`, with time-ordered UUIDv7 primary keys
@@ -445,7 +496,21 @@ refuse to run unless the database name contains `test`.
   ON CONFLICT DO NOTHING`. Idempotency and "one active workflow per (tenant,
   source)" are both DB-enforced; a run pins its exact version at creation. No
   workflow for a source is a success (event kept, no run), not an error. A
-  `webhooks:inspect` CLI lists a tenant's events and runs.
+  `webhooks:inspect` CLI lists a tenant's events, runs and jobs.
+- **Job queue, worker and reaper (Step 5)** — a durable `jobs` table and a
+  framework-free `Queue` contract (`enqueue`/`claim`/`complete`/`fail`/
+  `requeueExpired`) with a PostgreSQL implementation that claims one ready job at a
+  time via `SELECT … FOR UPDATE SKIP LOCKED` in a short transaction, holds it under
+  a five-minute lease (`locked_by` + `lease_expires_at`), and rejects illegal state
+  transitions (`done`/`failed` are terminal). The worker stamps its instance id on
+  every claim, verifies the run still exists, dispatches, and settles — with
+  structured logs (`worker_started`, `job_claimed`, `job_completed`, `job_failed`,
+  `job_requeued`, `worker_shutdown`) carrying `tenant_id`/`run_id`/`job_id`/
+  `worker_id`. A reaper returns expired-lease jobs to `pending` (incrementing
+  `attempt`) with a single atomic UPDATE, safe across processes. The first job is
+  created in the same transaction as the event and run. **No step executes yet**:
+  the dispatcher refuses every step and the worker records that as a terminal
+  failure, never marking a job `done`.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -455,7 +520,6 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| Job queue (`FOR UPDATE SKIP LOCKED`), worker claim loop, lease reaper | Step 5 |
 | The step executor that runs a definition | Step 6 |
 | Claude integration behind an `LlmProvider` interface | Steps 7–8 |
 | Connectors, credential encryption, first integration (Slack) | Steps 9–10 |
@@ -464,9 +528,9 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 | Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
 | HMAC / provider signature verification on webhooks | before production webhooks |
 
-The tables later steps need — `step_runs`, `jobs`, `connections`, `audit_log` —
-are not in the schema yet, for the same reason the directories are empty: they
-arrive with the code that uses them.
+The tables later steps need — `step_runs`, `connections`, `audit_log` — are not
+in the schema yet, for the same reason the directories are empty: they arrive with
+the code that uses them.
 
 Explicitly out of scope for the MVP entirely: OAuth flows, billing, a visual
 workflow builder, Redis/Kafka, Kubernetes, microservices, vector stores or agent

@@ -29,6 +29,20 @@ import * as schema from '@/db/schema.js';
 export type AppDatabase = NodePgDatabase<typeof schema>;
 
 /**
+ * The handle passed to a `db.transaction(async (tx) => …)` callback.
+ *
+ * Derived from `AppDatabase` rather than imported, so it stays exact as the
+ * schema evolves. It shares the query surface (`insert`/`select`/`update`) with
+ * `AppDatabase`, which lets a repository accept "either the pool or an open
+ * transaction" and run the same statement in-band — the seam the queue uses to
+ * enqueue a job inside the webhook ingestion transaction.
+ */
+export type Transaction = Parameters<Parameters<AppDatabase['transaction']>[0]>[0];
+
+/** Anything that can execute a statement: the database itself or a transaction. */
+export type Executor = AppDatabase | Transaction;
+
+/**
  * How long a single connection attempt may take before failing. Short on
  * purpose: an unreachable database should fail the boot in seconds, not hang a
  * deploy for a minute.

@@ -16,6 +16,7 @@
 import { loadEnv } from '@/config/env.js';
 import { createDatabase } from '@/db/client.js';
 import { createLogger } from '@/observability/logger.js';
+import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 
@@ -32,8 +33,15 @@ const database = createDatabase(env, logger, { service: 'cli' });
 try {
   await database.verifyConnection();
 
-  const repository = new WebhookRepository(new TenantScope(database.db, tenantId));
-  const [events, runs] = await Promise.all([repository.listEvents(), repository.listRuns()]);
+  const repository = new WebhookRepository(
+    new TenantScope(database.db, tenantId),
+    new PostgresJobQueue(database.db),
+  );
+  const [events, runs, jobs] = await Promise.all([
+    repository.listEvents(),
+    repository.listRuns(),
+    repository.listJobs(),
+  ]);
 
   const lines: string[] = [];
   lines.push(`events (${events.length}), newest first:`);
@@ -47,6 +55,13 @@ try {
   for (const r of runs) {
     lines.push(
       `  ${r.id}  status=${r.status}  workflow=${r.workflowId}  version=${r.workflowVersionId}  event=${r.eventId}  step=${r.currentStepKey ?? '-'}`,
+    );
+  }
+  lines.push('');
+  lines.push(`jobs (${jobs.length}), newest first:`);
+  for (const j of jobs) {
+    lines.push(
+      `  ${j.id}  status=${j.status}  run=${j.runId}  step=${j.stepKey}  attempt=${j.attempt}/${j.maxAttempts}  locked_by=${j.lockedBy ?? '-'}`,
     );
   }
   lines.push('');

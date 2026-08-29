@@ -117,6 +117,21 @@ export const workflowRunStatus = pgEnum('workflow_run_status', [
   'cancelled',
 ]);
 
+/**
+ * The lifecycle of a single queued unit of work.
+ *
+ *   pending → running → done
+ *                     ↘ failed
+ *
+ * A job starts `pending`, is claimed into `running` under a lease, and then
+ * settles into `done` or `failed`. The transitions are one-directional and
+ * enforced by the queue: `done`/`failed` are terminal, and nothing moves a job
+ * back to `running` except a fresh claim of a `pending` row. A lease that
+ * expires while `running` is returned to `pending` by the reaper — never left
+ * dangling and never advanced to a terminal state it did not reach on its own.
+ */
+export const jobStatus = pgEnum('job_status', ['pending', 'running', 'done', 'failed']);
+
 // ---------------------------------------------------------------------------
 // tenants
 // ---------------------------------------------------------------------------
@@ -447,6 +462,111 @@ export const workflowRuns = pgTable(
     }).onDelete('cascade'),
     /** Tenant-scoped listing, newest first. */
     index('workflow_runs_tenant_id_created_at_idx').on(t.tenantId, t.createdAt.desc()),
+    /**
+     * Backs the composite foreign key that `jobs` uses to attach a queued unit
+     * of work to a run *in the same tenant*. Redundant for uniqueness (`id` is
+     * already unique) but Postgres will only reference a column set with an
+     * explicit unique constraint.
+     */
+    unique('workflow_runs_tenant_id_id_key').on(t.tenantId, t.id),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// jobs
+// ---------------------------------------------------------------------------
+
+/**
+ * A queued unit of work: "advance run R by executing step S".
+ *
+ * The jobs table is the durable, crash-safe hand-off between the API (which
+ * enqueues) and the worker (which claims and executes). Postgres *is* the queue
+ * — there is no Redis or broker — and the claim is a `SELECT … FOR UPDATE SKIP
+ * LOCKED` inside a short transaction, so many workers can poll the same table
+ * without ever handing the same job to two of them.
+ *
+ * What each column is load-bearing for:
+ *
+ * - **`status` + `run_at`** drive consumption: the claim looks for the oldest
+ *   `pending` row whose `run_at` has arrived. `run_at` in the future is how a
+ *   job is deferred (a retry backoff, later); for the first job it is simply
+ *   now.
+ * - **`locked_by` + `lease_expires_at`** are the lease. A claimed job records
+ *   which worker holds it and until when. If that worker dies, the lease
+ *   expires and the reaper returns the row to `pending` — the guarantee that no
+ *   job is lost to a crashed process. The structure (a `locked_by` and an
+ *   expiry) is deliberately the shape a heartbeat/renewal would extend later,
+ *   without a schema change.
+ * - **`attempt` / `max_attempts`** count executions. `attempt` increments as a
+ *   job is retried; `max_attempts` is stored now so the retry policy (a later
+ *   step) has somewhere to read its ceiling from. Nothing enforces the ceiling
+ *   yet — that is the retry policy's job, not the queue's.
+ * - **`last_error`** keeps the most recent structured failure for inspection,
+ *   never a raw stack destined for a client.
+ *
+ * Tenant safety is the composite foreign key: a job can only reference a run of
+ * its own tenant, so a cross-tenant attachment is unrepresentable at the
+ * database level, exactly as for `workflow_runs`.
+ */
+export const jobs = pgTable(
+  'jobs',
+  {
+    id: primaryId(),
+    /**
+     * Denormalised from the run's tenant so tenant isolation is a predicate on
+     * this table (a scoped worker can filter `WHERE tenant_id = …`) and kept
+     * honest by the composite foreign key below.
+     */
+    tenantId: uuid('tenant_id').notNull(),
+    /** The run this job advances. */
+    runId: uuid('run_id').notNull(),
+    /** Which step of the run's definition this job executes. */
+    stepKey: text('step_key').notNull(),
+    /** How many times execution has been attempted. Starts at 0. */
+    attempt: integer('attempt').notNull().default(0),
+    /** The ceiling the retry policy (a later step) will enforce. */
+    maxAttempts: integer('max_attempts').notNull().default(5),
+    status: jobStatus('status').notNull().default('pending'),
+    /** The earliest instant this job may be claimed. Now, for an immediate job. */
+    runAt: timestamp('run_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    /** The worker instance holding the lease, while `running`. Null otherwise. */
+    lockedBy: text('locked_by'),
+    /** When the current lease expires. Past-due + `running` ⇒ reclaimable. */
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true, mode: 'date' }),
+    /** The most recent structured failure. Log-safe; never a raw stack. */
+    lastError: jsonb('last_error').$type<Record<string, unknown>>(),
+    ...timestamps(),
+  },
+  (t) => [
+    /**
+     * The job's run must be in the job's tenant. A single-column FK on run_id
+     * would let a job be filed under tenant A while pointing at tenant B's run —
+     * the same silent cross-tenant corruption the composite keys elsewhere exist
+     * to make impossible.
+     */
+    foreignKey({
+      name: 'jobs_tenant_id_run_id_fkey',
+      columns: [t.tenantId, t.runId],
+      foreignColumns: [workflowRuns.tenantId, workflowRuns.id],
+    }).onDelete('cascade'),
+
+    /**
+     * The consumption path: the oldest ready `pending` job. A partial index over
+     * `run_at`, restricted to `pending` rows, keeps the claim's index scan tight
+     * regardless of how many `done`/`failed` rows have accumulated.
+     */
+    index('jobs_pending_run_at_idx')
+      .on(t.runAt)
+      .where(sql`${t.status} = 'pending'`),
+
+    /**
+     * The reaper path: `running` jobs whose lease has expired. A partial index
+     * over `lease_expires_at`, restricted to `running` rows, so the periodic
+     * "what has died?" sweep never scans settled work.
+     */
+    index('jobs_running_lease_expires_at_idx')
+      .on(t.leaseExpiresAt)
+      .where(sql`${t.status} = 'running'`),
   ],
 );
 
@@ -531,6 +651,7 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   apiKeys: many(apiKeys),
   events: many(events),
   workflowRuns: many(workflowRuns),
+  jobs: many(jobs),
 }));
 
 export const usersRelations = relations(users, ({ one }) => ({
@@ -562,7 +683,7 @@ export const eventsRelations = relations(events, ({ one, many }) => ({
   runs: many(workflowRuns),
 }));
 
-export const workflowRunsRelations = relations(workflowRuns, ({ one }) => ({
+export const workflowRunsRelations = relations(workflowRuns, ({ one, many }) => ({
   tenant: one(tenants, { fields: [workflowRuns.tenantId], references: [tenants.id] }),
   workflow: one(workflows, {
     fields: [workflowRuns.workflowId],
@@ -573,6 +694,12 @@ export const workflowRunsRelations = relations(workflowRuns, ({ one }) => ({
     references: [workflowVersions.id],
   }),
   event: one(events, { fields: [workflowRuns.eventId], references: [events.id] }),
+  jobs: many(jobs),
+}));
+
+export const jobsRelations = relations(jobs, ({ one }) => ({
+  tenant: one(tenants, { fields: [jobs.tenantId], references: [tenants.id] }),
+  run: one(workflowRuns, { fields: [jobs.runId], references: [workflowRuns.id] }),
 }));
 
 // ---------------------------------------------------------------------------
@@ -602,3 +729,6 @@ export type NewEvent = typeof events.$inferInsert;
 
 export type WorkflowRun = typeof workflowRuns.$inferSelect;
 export type NewWorkflowRun = typeof workflowRuns.$inferInsert;
+
+export type Job = typeof jobs.$inferSelect;
+export type NewJob = typeof jobs.$inferInsert;
