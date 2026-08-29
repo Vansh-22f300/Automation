@@ -132,6 +132,24 @@ export const workflowRunStatus = pgEnum('workflow_run_status', [
  */
 export const jobStatus = pgEnum('job_status', ['pending', 'running', 'done', 'failed']);
 
+/**
+ * The lifecycle of a single step execution record.
+ *
+ *   running → succeeded
+ *           ↘ failed
+ *
+ * A row is written `running` the moment the engine begins executing a step, then
+ * settled to `succeeded` (with an output) or `failed` (with a structured error).
+ * There is no terminal-to-anything transition: a retry (Step 11) appends a *new*
+ * row with a higher `attempt`, it never rewrites the old one. `waiting`/`paused`
+ * states are deliberately absent until something suspends a step mid-flight.
+ */
+export const workflowStepRunStatus = pgEnum('workflow_step_run_status', [
+  'running',
+  'succeeded',
+  'failed',
+]);
+
 // ---------------------------------------------------------------------------
 // tenants
 // ---------------------------------------------------------------------------
@@ -571,6 +589,89 @@ export const jobs = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// workflow_step_runs
+// ---------------------------------------------------------------------------
+
+/**
+ * The audit record of a single step execution — one row per attempt at one step
+ * of one run.
+ *
+ * This table is the durable, append-only history the engine writes as it drives
+ * a run forward one step at a time. It exists so that "what did this run do, in
+ * what order, with what inputs and outputs, and where did it fail" is answerable
+ * from the database alone — never reconstructed from logs. The engine never
+ * UPDATEs a settled row to a different outcome; a retry (Step 11) INSERTs a new
+ * row with a higher `attempt`.
+ *
+ * Two invariants are the database's, not the application's:
+ *
+ * 1. **Tenant safety.** The composite foreign key `(tenant_id, run_id) →
+ *    workflow_runs(tenant_id, id)` makes a step run for another tenant's run
+ *    unrepresentable — the same guarantee `jobs` has.
+ * 2. **At most one *successful* execution per (run, step, attempt).** A partial
+ *    unique index over `succeeded` rows is the database backstop against a
+ *    redelivered job (leases give at-least-once delivery) recording a second
+ *    success for the same attempt. The primary runtime guard is the engine
+ *    refusing to re-execute a step the run has already advanced past; this index
+ *    catches the pathological case the runtime guard cannot.
+ */
+export const workflowStepRuns = pgTable(
+  'workflow_step_runs',
+  {
+    id: primaryId(),
+    /** Denormalised from the run's tenant; kept honest by the composite FK below. */
+    tenantId: uuid('tenant_id').notNull(),
+    /** The run this step execution belongs to. */
+    runId: uuid('run_id').notNull(),
+    /** The step key within the run's pinned definition. */
+    stepKey: text('step_key').notNull(),
+    /** The step's type at execution time (e.g. `noop`), copied from the definition. */
+    stepType: text('step_type').notNull(),
+    /** Which attempt this record is. Matches the driving job's `attempt`; starts at 0. */
+    attempt: integer('attempt').notNull().default(0),
+    status: workflowStepRunStatus('status').notNull(),
+    /** The resolved input handed to the step handler. Null when a step takes none. */
+    input: jsonb('input').$type<Record<string, unknown>>(),
+    /** The step's output, persisted on success. Null until (and unless) succeeded. */
+    output: jsonb('output').$type<unknown>(),
+    /** A structured, log-safe error, persisted on failure. Null unless failed. */
+    error: jsonb('error').$type<Record<string, unknown>>(),
+    /** When execution began. Set at insert. */
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+    /** When execution settled (succeeded or failed). Null while running. */
+    finishedAt: timestamp('finished_at', { withTimezone: true, mode: 'date' }),
+    /** Wall-clock execution time in milliseconds. Null while running. */
+    durationMs: integer('duration_ms'),
+  },
+  (t) => [
+    /**
+     * The step run's run must be in the step run's tenant — the same composite-FK
+     * tenant guard `jobs` uses, making cross-tenant attachment impossible.
+     */
+    foreignKey({
+      name: 'workflow_step_runs_tenant_id_run_id_fkey',
+      columns: [t.tenantId, t.runId],
+      foreignColumns: [workflowRuns.tenantId, workflowRuns.id],
+    }).onDelete('cascade'),
+
+    /**
+     * At most one *successful* execution per (run, step, attempt). Partial over
+     * `succeeded` so the many running/failed rows a retry history accumulates do
+     * not collide — only a second *success* for the same attempt is forbidden.
+     * This is the database's idempotency backstop under at-least-once delivery.
+     */
+    uniqueIndex('workflow_step_runs_one_success_per_attempt_idx')
+      .on(t.runId, t.stepKey, t.attempt)
+      .where(sql`${t.status} = 'succeeded'`),
+
+    /** The audit view: a run's step history in execution order. */
+    index('workflow_step_runs_run_id_started_at_idx').on(t.runId, t.startedAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // api_keys
 // ---------------------------------------------------------------------------
 
@@ -652,6 +753,7 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   events: many(events),
   workflowRuns: many(workflowRuns),
   jobs: many(jobs),
+  stepRuns: many(workflowStepRuns),
 }));
 
 export const usersRelations = relations(users, ({ one }) => ({
@@ -695,6 +797,15 @@ export const workflowRunsRelations = relations(workflowRuns, ({ one, many }) => 
   }),
   event: one(events, { fields: [workflowRuns.eventId], references: [events.id] }),
   jobs: many(jobs),
+  stepRuns: many(workflowStepRuns),
+}));
+
+export const workflowStepRunsRelations = relations(workflowStepRuns, ({ one }) => ({
+  tenant: one(tenants, { fields: [workflowStepRuns.tenantId], references: [tenants.id] }),
+  run: one(workflowRuns, {
+    fields: [workflowStepRuns.runId],
+    references: [workflowRuns.id],
+  }),
 }));
 
 export const jobsRelations = relations(jobs, ({ one }) => ({
@@ -732,3 +843,6 @@ export type NewWorkflowRun = typeof workflowRuns.$inferInsert;
 
 export type Job = typeof jobs.$inferSelect;
 export type NewJob = typeof jobs.$inferInsert;
+
+export type WorkflowStepRun = typeof workflowStepRuns.$inferSelect;
+export type NewWorkflowStepRun = typeof workflowStepRuns.$inferInsert;

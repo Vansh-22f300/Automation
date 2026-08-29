@@ -37,10 +37,11 @@ try {
     new TenantScope(database.db, tenantId),
     new PostgresJobQueue(database.db),
   );
-  const [events, runs, jobs] = await Promise.all([
+  const [events, runs, jobs, stepRuns] = await Promise.all([
     repository.listEvents(),
     repository.listRuns(),
     repository.listJobs(),
+    repository.listStepRuns(),
   ]);
 
   const lines: string[] = [];
@@ -62,6 +63,16 @@ try {
   for (const j of jobs) {
     lines.push(
       `  ${j.id}  status=${j.status}  run=${j.runId}  step=${j.stepKey}  attempt=${j.attempt}/${j.maxAttempts}  locked_by=${j.lockedBy ?? '-'}`,
+    );
+  }
+  lines.push('');
+  lines.push(`workflow_step_runs (${stepRuns.length}), newest first:`);
+  for (const s of stepRuns) {
+    const duration = s.durationMs === null ? '-' : `${s.durationMs}ms`;
+    const output = s.output === null ? '-' : JSON.stringify(s.output);
+    const detail = s.status === 'failed' ? `error=${JSON.stringify(s.error)}` : `output=${output}`;
+    lines.push(
+      `  ${s.id}  status=${s.status}  run=${s.runId}  step=${s.stepKey}(${s.stepType})  attempt=${s.attempt}  ${duration}  ${detail}`,
     );
   }
   lines.push('');

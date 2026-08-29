@@ -16,10 +16,37 @@
  */
 
 import type { ClaimedJob } from '@/domain/queue.js';
+import type { JobError } from '@/domain/queue.js';
 
 /** Executes the step a claimed job names. Implemented for real in Step 6. */
 export interface StepDispatcher {
   dispatch(job: ClaimedJob): Promise<void>;
+}
+
+/**
+ * Raised by the real dispatcher when a step's execution *failed* — as opposed to
+ * could not be attempted. By the time this is thrown the engine has already
+ * recorded the failure durably (the step run and the workflow run are marked
+ * `failed` in their own committed transaction); the error exists only to tell the
+ * worker to settle the queue job as `failed` rather than `done`. It carries the
+ * same structured, log-safe reason that was persisted, so the queue's `last_error`
+ * matches the run's.
+ *
+ * Distinct from an *unexpected* error (a dropped connection mid-execution): those
+ * are left to propagate untyped so the worker leaves the job `running` for the
+ * reaper, rather than burning it as a terminal failure.
+ */
+export class StepFailedError extends Error {
+  readonly code = 'step_failed';
+  readonly reason: JobError;
+
+  constructor(reason: JobError) {
+    const code = typeof reason.code === 'string' ? reason.code : 'step_failed';
+    super(`step execution failed (${code})`);
+    this.name = 'StepFailedError';
+    this.reason = reason;
+    Error.captureStackTrace(this, StepFailedError);
+  }
 }
 
 /**

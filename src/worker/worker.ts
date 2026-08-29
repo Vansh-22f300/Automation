@@ -24,7 +24,7 @@
 import { withContext } from '@/observability/logger.js';
 import type { Logger } from '@/observability/logger.js';
 import type { ClaimedJob, Queue } from '@/domain/queue.js';
-import { StepExecutionNotImplementedError } from '@/worker/dispatcher.js';
+import { StepExecutionNotImplementedError, StepFailedError } from '@/worker/dispatcher.js';
 import type { StepDispatcher } from '@/worker/dispatcher.js';
 
 /** Confirms a run exists for a tenant. The worker's "is this job valid?" check. */
@@ -144,22 +144,32 @@ export class Worker {
 
     try {
       await this.dispatcher.dispatch(job);
-      // Reached only once a real dispatcher (Step 6) executes the step.
+      // The engine advanced the run by exactly one step (or recognised a stale
+      // redelivery and did nothing). Either way this job's work is done.
       await this.queue.complete(job.id);
       log.info('job_completed');
     } catch (error) {
+      if (error instanceof StepFailedError) {
+        // The step ran and failed. The engine has already recorded the step run
+        // and the workflow run as failed in their own committed transaction; all
+        // that remains is to settle the queue job as failed with the same reason.
+        // Terminal: no reaper retry (a real retry policy is Step 11).
+        await this.settleFailed(log, job, error.reason);
+        return;
+      }
       if (error instanceof StepExecutionNotImplementedError) {
-        // Expected in Step 5: the step cannot run yet. Fail it clearly and
-        // terminally — honest about the fact that no work was performed.
+        // Legacy path (the Step 5 dispatcher): the step cannot run yet. Fail it
+        // clearly and terminally — honest that no work was performed.
         await this.settleFailed(log, job, {
           code: error.code,
           message: error.message,
         });
         return;
       }
-      // Genuinely unexpected. Do not complete, do not fail: leave the job
-      // `running` so its lease expires and the reaper returns it to `pending`
-      // for a fresh attempt. Nothing is corrupted and nothing is swallowed.
+      // Genuinely unexpected (e.g. a dropped connection mid-execution). Do not
+      // complete, do not fail: leave the job `running` so its lease expires and
+      // the reaper returns it to `pending` for a fresh attempt. Nothing is
+      // corrupted and nothing is swallowed.
       log.error({ err: error }, 'job_processing_error');
     }
   }

@@ -20,7 +20,7 @@ import pino from 'pino';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ClaimedJob, EnqueueInput, JobError, Queue } from '@/domain/queue.js';
-import { StepExecutionNotImplementedError, UnimplementedStepDispatcher } from '@/worker/dispatcher.js';
+import { StepExecutionNotImplementedError, StepFailedError, UnimplementedStepDispatcher } from '@/worker/dispatcher.js';
 import type { StepDispatcher } from '@/worker/dispatcher.js';
 import { Worker } from '@/worker/worker.js';
 
@@ -143,6 +143,23 @@ describe('Worker.pollOnce', () => {
 
     expect(queue.completed).toEqual(['job-1']);
     expect(queue.failed).toEqual([]);
+    await worker.stop();
+  });
+
+  it('fails a job — never completes it — when the engine reports a step failure', async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    const reason = { code: 'step_execution_error', message: 'handler blew up' };
+    const worker = makeWorker(queue, {
+      dispatcher: { dispatch: () => Promise.reject(new StepFailedError(reason)) },
+    });
+    worker.start();
+
+    await worker.pollOnce();
+
+    expect(queue.completed).toEqual([]); // a failed step is never marked done
+    expect(queue.failed).toHaveLength(1);
+    expect(queue.failed[0]!.id).toBe('job-1');
+    expect(queue.failed[0]!.error).toEqual(reason);
     await worker.stop();
   });
 

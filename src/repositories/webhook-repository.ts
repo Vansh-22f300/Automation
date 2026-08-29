@@ -25,8 +25,8 @@ import { and, desc, eq, sql } from 'drizzle-orm';
 
 import { parseWorkflowDefinition } from '@/domain/workflow-definition.js';
 import { buildRunContext } from '@/domain/workflow-run.js';
-import { events, jobs, workflowRuns, workflowVersions } from '@/db/schema.js';
-import type { Event, Job, WorkflowRun } from '@/db/schema.js';
+import { events, jobs, workflowRuns, workflowStepRuns, workflowVersions } from '@/db/schema.js';
+import type { Event, Job, WorkflowRun, WorkflowStepRun } from '@/db/schema.js';
 import type { TransactionalJobEnqueuer } from '@/repositories/job-queue.js';
 import { TenantScope, TenantScopedRepository } from '@/repositories/tenant-scope.js';
 
@@ -193,6 +193,16 @@ export class WebhookRepository extends TenantScopedRepository implements Webhook
       .from(jobs)
       .where(this.scope.where(jobs.tenantId))
       .orderBy(desc(jobs.createdAt))
+      .limit(limit);
+  }
+
+  /** Recent step runs for this tenant, newest first — the execution audit trail. */
+  async listStepRuns(limit = 100): Promise<WorkflowStepRun[]> {
+    return this.db
+      .select()
+      .from(workflowStepRuns)
+      .where(this.scope.where(workflowStepRuns.tenantId))
+      .orderBy(desc(workflowStepRuns.startedAt))
       .limit(limit);
   }
 }

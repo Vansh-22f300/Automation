@@ -4,7 +4,7 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 5 of 13 — job queue, worker claim loop and lease reaper.**
+> **Status: Step 6 of 13 — workflow execution engine (linear `noop` workflows).**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
 > service for authoring workflows and their immutable versioned definitions, a
@@ -201,12 +201,18 @@ against the `jobs` table:
 Two workers can run at once without ever claiming the same job; that guarantee is
 PostgreSQL's, via `FOR UPDATE SKIP LOCKED`, not the application's.
 
-> **No step is executed yet.** The dispatcher is `UnimplementedStepDispatcher`,
-> which refuses every step; the worker records that refusal as a terminal job
-> failure (`step_execution_not_implemented`) and **never marks a job `done`**,
-> because no work is actually performed. The real executor arrives in Step 6 as a
-> drop-in `StepDispatcher`. A job whose run has vanished fails as `run_not_found`;
-> an unexpected error leaves the job `running` so the reaper recovers it.
+> **The worker now executes steps.** The dispatcher is the real
+> [`WorkflowExecutor`](src/repositories/execution-engine.ts): each claimed job
+> advances its run by **exactly one step**. In one transaction it records a
+> `workflow_step_runs` row, updates the run's context and status, and either
+> enqueues the single next step's job or finishes the run — atomically. A step
+> failure marks the step run and the run `failed`, enqueues nothing, and fails the
+> queue job (no retries yet — that is Step 11). A redelivered job for a run that
+> has already advanced (or finished) does no work. The engine runs the version the
+> run pinned at creation, never the currently-active one, and scopes every
+> statement to the job's tenant. Only the `noop` step type is registered so far.
+> A job whose run has vanished fails as `run_not_found`; an unexpected error leaves
+> the job `running` so the reaper recovers it.
 
 Stop it with `Ctrl+C`; it stops claiming first, drains the loops, closes the pool,
 and logs `worker_shutdown`.
@@ -269,13 +275,14 @@ src/
 │   ├── api-key-repository.ts Tenant-scoped create/list/revoke
 │   ├── workflow-repository.ts  Tenant-scoped workflow + immutable version authoring
 │   ├── webhook-repository.ts   Tenant-scoped webhook ingestion (event + run + first job, one txn)
-│   └── job-queue.ts            PostgresJobQueue — enqueue/claim/complete/fail/requeueExpired
+│   ├── job-queue.ts            PostgresJobQueue — enqueue/claim/complete/fail/requeueExpired
+│   └── execution-engine.ts     WorkflowExecutor — advances a run by one step, atomically
 ├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts, inspect-webhooks.ts (bootstrap/dev)
 ├── worker/
 │   ├── main.ts               Entrypoint 2 — composition root: worker + reaper wiring, shutdown
 │   ├── worker.ts             The claim → verify → dispatch → settle loop
 │   ├── reaper.ts             Periodic sweep returning expired-lease jobs to the queue
-│   └── dispatcher.ts         StepDispatcher seam + UnimplementedStepDispatcher (Step 6 fills it)
+│   └── dispatcher.ts         StepDispatcher seam + StepFailedError (WorkflowExecutor implements it)
 ├── db/
 │   ├── schema.ts             Tables, enums, constraints — source of truth
 │   ├── client.ts             Pool + typed Drizzle instance + clean shutdown
@@ -288,6 +295,10 @@ src/
 │   ├── workflow-definition.ts  Zod schema for linear noop workflow definitions
 │   ├── workflow-trigger.ts   Zod schema for webhook trigger config
 │   ├── workflow-run.ts       Run-context builder (trigger facts + empty steps)
+│   ├── run-state.ts          Run-status state machine (queued→running→succeeded/failed)
+│   ├── execution-context.ts  Framework-free trigger + step-output accessor
+│   ├── references.ts         No-eval {{trigger.*}} / {{steps.*.output}} resolver
+│   ├── step-handler.ts       StepHandler interface + registry (noop)
 │   └── queue.ts             Framework-free Queue contract + InvalidJobTransitionError
 └── test/
     ├── unit/                 No external dependencies
@@ -455,7 +466,7 @@ contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–5)
+### Implemented (Steps 1–6)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -463,8 +474,8 @@ contains `test`.
   `run_id`, `step_run_id`
 - `RetryableError` / `PermanentError` taxonomy
 - PostgreSQL schema for `tenants`, `users`, `workflows`, `workflow_versions`,
-  `events`, `workflow_runs`, `api_keys`, with time-ordered UUIDv7 primary keys
-  generated application-side
+  `events`, `workflow_runs`, `workflow_step_runs`, `jobs`, `api_keys`, with
+  time-ordered UUIDv7 primary keys generated application-side
 - Drizzle ORM setup, connection pool with clean shutdown, and a migration
   workflow that needs no database to generate or verify
 - Database connectivity verified at startup before the API opens its port
@@ -511,6 +522,26 @@ contains `test`.
   created in the same transaction as the event and run. **No step executes yet**:
   the dispatcher refuses every step and the worker records that as a terminal
   failure, never marking a job `done`.
+- **Workflow execution engine (Step 6)** — the real `StepDispatcher`
+  ([`WorkflowExecutor`](src/repositories/execution-engine.ts)): one claimed job
+  advances its run by **exactly one step**, never loading or running a whole
+  workflow. Everything for that step commits in a single transaction — a
+  `workflow_step_runs` audit row (`running` → `succeeded`/`failed`, with
+  `input`/`output`/`error` and `duration_ms`), the run's grown `context` and
+  status, and either the next step's job or the run's completion — so there is
+  never "step recorded but next job missing" nor the reverse. A framework-free
+  `ExecutionContext` and a no-`eval` reference resolver (`{{trigger.payload.x}}`,
+  `{{steps.first.output}}` — unknown paths fail cleanly, nothing is evaluated)
+  feed each step its input; a `StepHandler` registry keeps step internals out of
+  the worker (only `noop`, yielding `{ ok: true }`, is registered). Idempotency
+  under at-least-once delivery is two-layered: a `SELECT … FOR UPDATE` on the run
+  plus a "has this run already advanced past this step?" guard, backed by a
+  partial unique index (one success per `run_id`+`step_key`+`attempt`). The run
+  executes its **pinned** `workflow_version_id`, never the currently-active one;
+  every statement is tenant-scoped. A failure marks the step run and run `failed`
+  and enqueues nothing (no retries — Step 11). `webhooks:inspect` now also lists
+  step runs. Structured logs: `step_started`, `step_succeeded`, `step_failed`,
+  `run_advanced`, `run_succeeded`, `run_failed`.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -520,7 +551,6 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| The step executor that runs a definition | Step 6 |
 | Claude integration behind an `LlmProvider` interface | Steps 7–8 |
 | Connectors, credential encryption, first integration (Slack) | Steps 9–10 |
 | Retry policy and backoff | Step 11 |
@@ -528,7 +558,7 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 | Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
 | HMAC / provider signature verification on webhooks | before production webhooks |
 
-The tables later steps need — `step_runs`, `connections`, `audit_log` — are not
+The tables later steps need — `connections`, `audit_log` — are not
 in the schema yet, for the same reason the directories are empty: they arrive with
 the code that uses them.
 

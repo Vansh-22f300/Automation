@@ -1,19 +1,20 @@
 /**
  * Worker process entrypoint.
  *
- * Step 5 scope: a real queue consumer. This process boots, connects to
- * PostgreSQL, and runs two long-lived loops against the `jobs` table:
+ * Step 5 built the durable queue and this consumer; Step 6 gives it a real
+ * dispatcher. This process boots, connects to PostgreSQL, and runs two
+ * long-lived loops against the `jobs` table:
  *
  *   - a `Worker` that claims one pending job at a time (`FOR UPDATE SKIP
- *     LOCKED`), verifies the job's run exists, and hands it to a dispatcher;
+ *     LOCKED`), verifies the job's run exists, and hands it to the executor;
  *   - a `Reaper` that periodically returns jobs with expired leases to the
  *     queue, so a crashed worker never loses its in-flight work.
  *
- * What it deliberately does *not* do yet is execute workflow steps. The
- * dispatcher is `UnimplementedStepDispatcher`, which refuses every step; the
- * worker records that refusal as a clear, terminal job failure. No job is ever
- * marked `done` here, because no work is actually performed — the real executor
- * arrives in Step 6 as a drop-in `StepDispatcher`.
+ * The dispatcher is the `WorkflowExecutor`: it advances a run by exactly one
+ * step per job, records a `workflow_step_runs` row, updates the run's context
+ * and status, and enqueues the next step's job — all in one transaction. A job
+ * is marked `done` only after its step actually succeeded, `failed` when the
+ * step failed, and left for the reaper on an unexpected mid-execution error.
  *
  * The composition root wires the real dependencies (database, queue, dispatcher)
  * and owns process concerns: startup verification, signal handling, and a clean
@@ -26,9 +27,10 @@ import { loadEnv } from '@/config/env.js';
 import { createDatabase } from '@/db/client.js';
 import { workflowRuns } from '@/db/schema.js';
 import { newId } from '@/domain/ids.js';
+import { defaultStepHandlerRegistry } from '@/domain/step-handler.js';
 import { createLogger } from '@/observability/logger.js';
+import { WorkflowExecutor } from '@/repositories/execution-engine.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
-import { UnimplementedStepDispatcher } from '@/worker/dispatcher.js';
 import { Reaper } from '@/worker/reaper.js';
 import { Worker } from '@/worker/worker.js';
 import type { RunExistenceCheck } from '@/worker/worker.js';
@@ -60,7 +62,15 @@ const runExists: RunExistenceCheck = async (tenantId, runId) => {
 
 const worker = new Worker({
   queue,
-  dispatcher: new UnimplementedStepDispatcher(),
+  // The real execution engine: it advances a run by exactly one step per job,
+  // recording the step run, updating the run, and enqueuing the next job — all
+  // atomically. The worker stays ignorant of what a `noop` step does.
+  dispatcher: new WorkflowExecutor({
+    db: database.db,
+    queue,
+    registry: defaultStepHandlerRegistry(),
+    logger,
+  }),
   logger,
   workerId,
   pollIntervalMs: POLL_INTERVAL_MS,
