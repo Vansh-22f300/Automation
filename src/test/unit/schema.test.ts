@@ -15,6 +15,7 @@ import { getTableConfig } from 'drizzle-orm/pg-core';
 import type { PgTable } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
 import {
+  apiKeys,
   tenantStatus,
   tenants,
   triggerType,
@@ -45,8 +46,19 @@ function columnNames(entries: readonly unknown[]): string[] {
   });
 }
 
-const ALL_TABLES = { tenants, users, workflows, workflow_versions: workflowVersions };
-const TENANT_SCOPED = { users, workflows, workflow_versions: workflowVersions };
+const ALL_TABLES = {
+  tenants,
+  users,
+  workflows,
+  workflow_versions: workflowVersions,
+  api_keys: apiKeys,
+};
+const TENANT_SCOPED = {
+  users,
+  workflows,
+  workflow_versions: workflowVersions,
+  api_keys: apiKeys,
+};
 
 describe('table naming', () => {
   it('uses snake_case plural table names in the public schema', () => {
@@ -59,14 +71,16 @@ describe('table naming', () => {
 });
 
 describe('primary keys', () => {
-  it('every table has a single uuid primary key with a database-side default', () => {
+  it('every table has a single uuid primary key with an application-side default', () => {
     for (const table of Object.values(ALL_TABLES)) {
       const primaries = getTableConfig(table).columns.filter((c) => c.primary);
 
       expect(primaries).toHaveLength(1);
       expect(primaries[0]?.name).toBe('id');
       expect(primaries[0]?.getSQLType()).toBe('uuid');
-      // gen_random_uuid(); no round trip needed to obtain an id.
+      // A UUIDv7 supplied by $defaultFn (newId), not a DB-side gen_random_uuid()
+      // (which would be a v4). Still reports hasDefault, so no id is ever needed
+      // at the call site.
       expect(primaries[0]?.hasDefault).toBe(true);
     }
   });
@@ -110,9 +124,28 @@ describe('timestamps', () => {
         expect(c.getSQLType(), `${c.name} must be timezone-aware`).toBe(
           'timestamp with time zone',
         );
-        expect(c.notNull).toBe(true);
-        expect(c.hasDefault).toBe(true);
       }
+    }
+  });
+
+  it('record-lifecycle columns (created_at/updated_at) are NOT NULL with a default', () => {
+    for (const table of Object.values(ALL_TABLES)) {
+      for (const c of getTableConfig(table).columns) {
+        if (c.name !== 'created_at' && c.name !== 'updated_at') continue;
+        expect(c.notNull, `${c.name} must be NOT NULL`).toBe(true);
+        expect(c.hasDefault, `${c.name} must have a default`).toBe(true);
+      }
+    }
+  });
+
+  it('event columns (last_used_at, revoked_at) are nullable — absence is meaningful', () => {
+    // These record that something happened; null legitimately means "not yet".
+    // They must never be forced NOT NULL or given a default that would fabricate
+    // an event time.
+    for (const name of ['last_used_at', 'revoked_at'] as const) {
+      const c = column(apiKeys, name);
+      expect(c.notNull, `${name} must be nullable`).toBe(false);
+      expect(c.hasDefault, `${name} must not have a default`).toBe(false);
     }
   });
 });
@@ -245,5 +278,36 @@ describe('workflow_versions', () => {
     expect(getTableConfig(reference!.foreignTable).name).toBe('workflows');
     // Composite target: tenant and workflow must agree.
     expect(columnNames(reference?.foreignColumns ?? [])).toEqual(['tenant_id', 'id']);
+  });
+});
+
+describe('api_keys', () => {
+  it('stores a hash and a prefix, never the plaintext key', () => {
+    const names = [...columns(apiKeys).keys()];
+
+    expect(names).toContain('key_hash');
+    expect(names).toContain('prefix');
+    // No column that could hold the key itself.
+    for (const forbidden of ['key', 'plaintext', 'secret', 'token']) {
+      expect(names).not.toContain(forbidden);
+    }
+  });
+
+  it('resolves a key by a unique prefix', () => {
+    const index = getTableConfig(apiKeys).indexes.find(
+      (i) => i.config.name === 'api_keys_prefix_key',
+    );
+
+    expect(index).toBeDefined();
+    expect(index?.config.unique).toBe(true);
+    expect(columnNames(index?.config.columns ?? [])).toEqual(['prefix']);
+  });
+
+  it('supports revocation as a soft delete rather than a row removal', () => {
+    const names = [...columns(apiKeys).keys()];
+    expect(names).toContain('revoked_at');
+    // Revocation and last-use are the only mutations, each with its own column;
+    // there is no generic updated_at.
+    expect(names).not.toContain('updated_at');
   });
 });

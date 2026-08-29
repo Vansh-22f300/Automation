@@ -36,9 +36,27 @@ import {
   uuid,
 } from 'drizzle-orm/pg-core';
 
+import { newId } from '@/domain/ids.js';
+
 // ---------------------------------------------------------------------------
 // Shared column helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The primary key every table shares: a `uuid` column whose value is a
+ * **UUIDv7 generated in the application** (see `@/domain/ids`).
+ *
+ * `$defaultFn` — not `.defaultRandom()` — is the whole point. `.defaultRandom()`
+ * emits a Postgres-side `gen_random_uuid()` default, which is a *v4* (random)
+ * UUID; we deliberately do not use v4 for primary keys. `$defaultFn` instead runs
+ * `newId()` in Node whenever an insert omits the id, so the stored value is a
+ * time-ordered v7 with no dependence on the Postgres version. The column still
+ * reports `hasDefault`, so callers never have to supply an id by hand.
+ *
+ * Returned fresh per table: a Drizzle column builder is stateful and cannot be
+ * shared between table definitions.
+ */
+const primaryId = () => uuid('id').primaryKey().$defaultFn(newId);
 
 /**
  * Returned fresh per table: a Drizzle column builder is stateful and cannot be
@@ -95,7 +113,7 @@ export const triggerType = pgEnum('trigger_type', ['webhook']);
  * deleting anything — runs and audit history must survive a suspension.
  */
 export const tenants = pgTable('tenants', {
-  id: uuid('id').primaryKey().defaultRandom(),
+  id: primaryId(),
   name: text('name').notNull(),
   status: tenantStatus('status').notNull().default('active'),
   ...timestamps(),
@@ -117,7 +135,7 @@ export const tenants = pgTable('tenants', {
 export const users = pgTable(
   'users',
   {
-    id: uuid('id').primaryKey().defaultRandom(),
+    id: primaryId(),
     tenantId: uuid('tenant_id')
       .notNull()
       .references(() => tenants.id, { onDelete: 'cascade' }),
@@ -156,7 +174,7 @@ export const users = pgTable(
 export const workflows = pgTable(
   'workflows',
   {
-    id: uuid('id').primaryKey().defaultRandom(),
+    id: primaryId(),
     tenantId: uuid('tenant_id')
       .notNull()
       .references(() => tenants.id, { onDelete: 'cascade' }),
@@ -196,7 +214,7 @@ export const workflows = pgTable(
 export const workflowVersions = pgTable(
   'workflow_versions',
   {
-    id: uuid('id').primaryKey().defaultRandom(),
+    id: primaryId(),
     /**
      * Denormalised from `workflows.tenant_id` so that tenant isolation is a
      * predicate on this table. Kept honest by the composite foreign key below,
@@ -277,6 +295,72 @@ export const workflowVersions = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// api_keys
+// ---------------------------------------------------------------------------
+
+/**
+ * A tenant's API credential for the HTTP boundary.
+ *
+ * The security model is the same one every credible API-key system uses, and the
+ * columns exist to enforce it:
+ *
+ * - **The plaintext key is never stored.** Only `key_hash` — a SHA-256 of the
+ *   key's random secret — lives here. A database dump therefore cannot be
+ *   replayed as credentials. SHA-256 (not bcrypt/argon2) is the correct choice
+ *   *because the secret is 256 bits of CSPRNG output*: there is nothing to
+ *   brute-force, so a slow password hash would buy nothing and cost latency on
+ *   every request.
+ * - **`prefix`** is a short, non-secret slice of the key shown in dashboards and
+ *   logs so a human can tell keys apart, and — being unique and indexed — is what
+ *   authentication looks a candidate row up by before doing the constant-time
+ *   hash comparison. It reveals nothing usable on its own.
+ * - **`revoked_at`** is a soft delete. A revoked key stops authenticating
+ *   immediately but the row survives, so audit history ("which key acted, and
+ *   when was it turned off") is preserved. Nullable: null means live.
+ * - **`last_used_at`** supports key hygiene (spotting stale or leaked keys).
+ *   Nullable and best-effort; a never-used key has null here.
+ *
+ * There is intentionally no `updated_at`: the only mutations are revocation and
+ * the last-used touch, and each has its own dedicated, meaningful timestamp.
+ */
+export const apiKeys = pgTable(
+  'api_keys',
+  {
+    id: primaryId(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id, { onDelete: 'cascade' }),
+    /** Human label chosen at creation, e.g. "CI pipeline" or "Zapier". */
+    name: text('name').notNull(),
+    /**
+     * Non-secret public identifier: the first characters of the key's secret.
+     * Unique so authentication can resolve a single candidate row by it.
+     */
+    prefix: text('prefix').notNull(),
+    /** SHA-256 (hex) of the key's secret. Never the plaintext. */
+    keyHash: text('key_hash').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+    /** Set the first and every subsequent time the key authenticates. Best-effort. */
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true, mode: 'date' }),
+    /** Non-null once revoked; a revoked key never authenticates again. */
+    revokedAt: timestamp('revoked_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    /**
+     * The lookup path for every authenticated request: resolve a candidate by
+     * prefix, then compare the hash in constant time. Unique so the resolution is
+     * unambiguous; a (astronomically unlikely) prefix collision is retried at
+     * generation time rather than tolerated here.
+     */
+    uniqueIndex('api_keys_prefix_key').on(t.prefix),
+    /** Tenant-scoped listing, newest first, for key-management views. */
+    index('api_keys_tenant_id_created_at_idx').on(t.tenantId, t.createdAt.desc()),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Relations
 // ---------------------------------------------------------------------------
 //
@@ -288,10 +372,15 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   users: many(users),
   workflows: many(workflows),
   workflowVersions: many(workflowVersions),
+  apiKeys: many(apiKeys),
 }));
 
 export const usersRelations = relations(users, ({ one }) => ({
   tenant: one(tenants, { fields: [users.tenantId], references: [tenants.id] }),
+}));
+
+export const apiKeysRelations = relations(apiKeys, ({ one }) => ({
+  tenant: one(tenants, { fields: [apiKeys.tenantId], references: [tenants.id] }),
 }));
 
 export const workflowsRelations = relations(workflows, ({ one, many }) => ({
@@ -328,3 +417,6 @@ export type NewWorkflow = typeof workflows.$inferInsert;
 
 export type WorkflowVersion = typeof workflowVersions.$inferSelect;
 export type NewWorkflowVersion = typeof workflowVersions.$inferInsert;
+
+export type ApiKey = typeof apiKeys.$inferSelect;
+export type NewApiKey = typeof apiKeys.$inferInsert;

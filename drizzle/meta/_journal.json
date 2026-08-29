@@ -8,6 +8,13 @@
       "when": 1787757845501,
       "tag": "0000_initial_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788020222928,
+      "tag": "0001_step3_uuidv7_and_api_keys",
+      "breakpoints": true
     }
   ]
 }

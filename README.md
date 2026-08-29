@@ -4,10 +4,11 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 2 of 13 — database foundation.**
-> The project has a PostgreSQL schema, migrations and a connection pool. There is
-> still no HTTP route, no queue, no workflow engine and no AI integration. See
-> [Current status](#current-status) for exactly what does and does not exist.
+> **Status: Step 3 of 13 — API skeleton + authentication.**
+> The project has a PostgreSQL schema, migrations and a connection pool, plus a
+> Fastify API with a health endpoint and tenant API-key authentication. There is
+> still no webhook ingestion, no queue, no workflow engine and no AI integration.
+> See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
 
@@ -60,6 +61,8 @@ pnpm db:migrate
 | --- | --- |
 | `pnpm dev:api` | Run the API in watch mode (`tsx`), restarting on file changes. |
 | `pnpm dev:worker` | Run the worker in watch mode. |
+| `pnpm tenant:create "<name>"` | Create a tenant; prints its id. Bootstrap step before minting a first key. |
+| `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
 | `pnpm build` | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths. |
@@ -97,16 +100,45 @@ pnpm dev:api
 ```
 
 It verifies the database is reachable **before** opening the port, then binds to
-`HOST:PORT` (default `127.0.0.1:3000`). **No routes are registered yet**, so any
-request returns Fastify's default 404 — which is itself confirmation the server
-is serving:
+`HOST:PORT` (default `127.0.0.1:3000`).
+
+### Endpoints
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/healthz` | none | Liveness + database readiness. `200` healthy, `503` if the DB is unreachable. |
+| `POST` | `/v1/api-keys` | Bearer key | Create a key for the caller's tenant. Returns the plaintext **once**. |
+| `GET` | `/v1/api-keys` | Bearer key | List the caller's own keys (metadata only — never the key). |
+| `POST` | `/v1/api-keys/:id/revoke` | Bearer key | Revoke one of the caller's keys. `204` on success, `404` if it is not theirs. |
+
+Authentication is a bearer API key:
 
 ```bash
-curl -i http://127.0.0.1:3000/
+curl -s http://127.0.0.1:3000/healthz
+
+# Everything under /v1 requires a key:
+curl -s http://127.0.0.1:3000/v1/api-keys \
+  -H "Authorization: Bearer awk_your_key_here"
 ```
 
-Stop it with `Ctrl+C`; it drains in-flight requests, closes the pool, and logs
-`api stopped cleanly`.
+Keys are cryptographically random. Only a SHA-256 hash and a short lookup prefix
+are stored — the full key is shown exactly once, at creation, and is never
+retrievable or logged afterwards. Every failure to authenticate (missing,
+malformed, unknown, wrong or revoked key) returns the same `401` so a caller
+cannot tell them apart. There is no way to authenticate to create your *first*
+key, so the first one per tenant is minted out-of-band:
+
+```bash
+TENANT_ID=$(pnpm -s tenant:create "Acme Inc")
+pnpm apikey:create "$TENANT_ID" "bootstrap"   # prints the plaintext once
+```
+
+A conservative in-memory rate limit (100 requests/minute per IP) blunts
+credential stuffing on a single instance. It is per-process and resets on
+restart; distributed, per-tenant rate limiting with a shared store arrives later.
+
+Stop the server with `Ctrl+C`; it drains in-flight requests, closes the pool, and
+logs `api stopped cleanly`.
 
 ## Starting the worker
 
@@ -158,7 +190,23 @@ and the credential encryption key arrive with the steps that need them.
 
 ```
 src/
-├── api/server.ts             Entrypoint 1 — Fastify server
+├── api/
+│   ├── server.ts             Entrypoint 1 — process wiring: pool, auth, listen
+│   ├── app.ts                Framework composition root — buildApp(deps), no listen
+│   ├── types.ts              The shared Fastify instance type alias
+│   ├── errors.ts             HTTP error taxonomy + one error envelope
+│   ├── error-handler.ts      Central error/not-found handler
+│   ├── auth-hook.ts          HTTP → AuthContext adapter (onRequest)
+│   └── routes/               health.ts, api-keys.ts
+├── auth/
+│   ├── context.ts            Framework-free Authenticator seam + AuthContext
+│   ├── api-key.ts            Key generation, hashing, parsing, verification
+│   ├── api-key-store.ts      The one unscoped lookup (auth-only)
+│   └── api-key-authenticator.ts   Resolves a key to a tenant, or 401
+├── repositories/
+│   ├── tenant-scope.ts       TenantScope + TenantScopedRepository base
+│   └── api-key-repository.ts Tenant-scoped create/list/revoke
+├── cli/                      create-tenant.ts, create-api-key.ts (bootstrap)
 ├── worker/main.ts            Entrypoint 2 — background worker loop
 ├── db/
 │   ├── schema.ts             Tables, enums, constraints — source of truth
@@ -166,7 +214,9 @@ src/
 │   └── migrate.ts            Migration runner (also runs from dist/)
 ├── config/env.ts             Zod-validated, fail-fast environment config
 ├── observability/logger.ts   pino structured logging + correlation-ID helper
-├── domain/errors.ts          RetryableError / PermanentError taxonomy
+├── domain/
+│   ├── ids.ts                UUIDv7 id generator
+│   └── errors.ts             RetryableError / PermanentError taxonomy
 └── test/
     ├── unit/                 No external dependencies
     └── integration/          Requires PostgreSQL; skipped without it
@@ -204,7 +254,7 @@ code rather than placeholder files.
 
 ## Data model
 
-Four tables so far. Two rules drive the shape of all of them.
+Five tables so far. Two rules drive the shape of all of them.
 
 **Every tenant-scoped table carries `tenant_id`** — even where it is derivable by
 joining. Tenant isolation has to be expressible as a predicate on the table being
@@ -224,6 +274,7 @@ definition as a single immutable versioned value.
 | `users` | A human, belonging to one tenant | No auth material yet. Unique per tenant on `lower(email)`. |
 | `workflows` | The stable identity of a process | Name, status. Holds no logic itself. |
 | `workflow_versions` | An immutable snapshot of the logic | `definition` jsonb, trigger config, version number. |
+| `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
 
 Two constraints are worth calling out because they encode invariants the
 application would otherwise have to remember:
@@ -244,6 +295,24 @@ Cross-tenant corruption is the most damaging bug class in a multi-tenant system
 and the hardest to notice, so it is made unrepresentable rather than merely
 avoided.
 
+### Authentication and tenant isolation
+
+Tenant isolation is enforced in the application layer by a `TenantScope`: a small
+value that binds a database handle to exactly one tenant id. Repositories are
+constructed *from* a scope, never from a bare handle, so an instance is
+intrinsically pinned to one tenant and its queries cannot omit the tenant
+predicate. There are no generic "fetch across all tenants" helpers.
+
+The one unavoidable exception — resolving *which* tenant a presented API key
+belongs to, before any tenant is known — is confined to a single narrow
+`ApiKeyStore` used only by the authenticator, and named to make its exceptional
+nature obvious. PostgreSQL Row-Level Security will later back this with a
+database-enforced guarantee; until then this pattern is the boundary, and it is
+proven end-to-end by the tenant-isolation tests. The authentication mechanism
+itself sits behind a framework-free `Authenticator` seam that yields
+`request.auth.tenantId`, so it can be swapped for sessions, OAuth or RBAC later
+without touching route code.
+
 ## Testing
 
 ```bash
@@ -251,10 +320,13 @@ pnpm test
 ```
 
 Unit tests need nothing external. They cover configuration validation, the error
-taxonomy, connection-pool wiring and credential redaction, and they assert the
-schema's structural invariants directly against the Drizzle model — a dropped
-`tenant_id`, a naive `timestamp`, or an `updated_at` appearing on
-`workflow_versions` all fail the build.
+taxonomy, connection-pool wiring and credential redaction, the API-key
+cryptography, the authenticator's failure modes, and the whole HTTP boundary
+(driven by `app.inject` with in-memory fakes: health up/down, every 401 path, the
+key lifecycle, route-level tenant isolation, and the plaintext never being logged
+or listed). They also assert the schema's structural invariants directly against
+the Drizzle model — a dropped `tenant_id`, a naive `timestamp`, or an
+`updated_at` appearing on `workflow_versions` all fail the build.
 
 Integration tests require a real PostgreSQL server and are **skipped** without
 one. They are never simulated: no database means skipped, not passed.
@@ -265,25 +337,41 @@ TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ai_workforce_tes
 
 They apply the migration and then exercise what only a real server can prove: the
 partial unique index, the composite foreign key, case-insensitive email
-uniqueness, jsonb round-tripping and cascade deletes. Because they write and
-delete rows, they refuse to run unless the database name contains `test`.
+uniqueness, jsonb round-tripping, cascade deletes, and — for `api_keys` — that
+the plaintext is absent from every column, that a real key round-trips through
+the authenticator, and that SQL-level tenant scoping stops one tenant reading or
+revoking another's keys. Because they write and delete rows, they refuse to run
+unless the database name contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–2)
+### Implemented (Steps 1–3)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
 - Structured pino logging with a `withContext` helper for `tenant_id`,
   `run_id`, `step_run_id`
-- Fastify server that boots and shuts down cleanly on `SIGTERM`/`SIGINT`
 - Worker process with a heartbeat loop and clean shutdown
 - `RetryableError` / `PermanentError` taxonomy
-- PostgreSQL schema for `tenants`, `users`, `workflows`, `workflow_versions`
+- PostgreSQL schema for `tenants`, `users`, `workflows`, `workflow_versions`,
+  `api_keys`, with time-ordered UUIDv7 primary keys generated application-side
 - Drizzle ORM setup, connection pool with clean shutdown, and a migration
   workflow that needs no database to generate or verify
-- Database connectivity verified at startup by both processes, before the API
-  opens its port
+- Database connectivity verified at startup before the API opens its port
+- **Fastify API** with clean shutdown on `SIGTERM`/`SIGINT`:
+  - `GET /healthz` — liveness + database readiness (`select 1`), leaking no
+    connection detail
+  - **Tenant API-key authentication** — cryptographically random keys, SHA-256
+    hash + short prefix stored (never the plaintext), constant-time verification,
+    revocation, and a framework-free `Authenticator` seam yielding
+    `request.auth.tenantId`
+  - **Tenant isolation** via `TenantScope`, with the single unscoped auth lookup
+    quarantined; tests prove one tenant cannot read or revoke another's keys
+  - Minimal key-management endpoints (`/v1/api-keys`), key returned once
+  - One consistent error envelope (`401/403/404/400/429/500`) with a request id
+    correlated into the logs, never exposing internals
+  - Conservative in-memory rate limiting (no Redis)
+- Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
 ### Not implemented yet — intentionally
@@ -292,7 +380,6 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| API-key authentication, tenant resolution, `/healthz` | Step 3 |
 | Webhook ingestion, event persistence, idempotency | Step 4 |
 | Job queue (`FOR UPDATE SKIP LOCKED`), worker claim loop, lease reaper | Step 5 |
 | Workflow definition schema and the step executor | Step 6 |
@@ -300,12 +387,11 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 | Connectors, credential encryption, first integration (Slack) | Steps 9–10 |
 | Retry policy and backoff | Step 11 |
 | Run inspection endpoints and log redaction | Step 12 |
-| Isolation tests, rate limiting, CI | Step 13 |
+| Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
 
-The tables those steps need — `api_keys`, `events`, `workflow_runs`,
-`step_runs`, `jobs`, `connections`, `audit_log` — are not in the schema yet, for
-the same reason the directories are empty: they arrive with the code that uses
-them.
+The tables those steps need — `events`, `workflow_runs`, `step_runs`, `jobs`,
+`connections`, `audit_log` — are not in the schema yet, for the same reason the
+directories are empty: they arrive with the code that uses them.
 
 Explicitly out of scope for the MVP entirely: OAuth flows, billing, a visual
 workflow builder, Redis/Kafka, Kubernetes, microservices, vector stores or agent
