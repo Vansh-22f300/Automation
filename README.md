@@ -4,10 +4,11 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 3 of 13 — API skeleton + authentication.**
-> The project has a PostgreSQL schema, migrations and a connection pool, plus a
-> Fastify API with a health endpoint and tenant API-key authentication. There is
-> still no webhook ingestion, no queue, no workflow engine and no AI integration.
+> **Status: Step 4A of 13 — workflow authoring (definition, versions, tenant-scoped service).**
+> The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
+> API with a health endpoint and tenant API-key authentication, and a tenant-scoped
+> service for authoring workflows and their immutable, versioned definitions. There
+> is still no webhook ingestion, no queue, no workflow engine and no AI integration.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -63,6 +64,7 @@ pnpm db:migrate
 | `pnpm dev:worker` | Run the worker in watch mode. |
 | `pnpm tenant:create "<name>"` | Create a tenant; prints its id. Bootstrap step before minting a first key. |
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
+| `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
 | `pnpm build` | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths. |
@@ -205,8 +207,9 @@ src/
 │   └── api-key-authenticator.ts   Resolves a key to a tenant, or 401
 ├── repositories/
 │   ├── tenant-scope.ts       TenantScope + TenantScopedRepository base
-│   └── api-key-repository.ts Tenant-scoped create/list/revoke
-├── cli/                      create-tenant.ts, create-api-key.ts (bootstrap)
+│   ├── api-key-repository.ts Tenant-scoped create/list/revoke
+│   └── workflow-repository.ts  Tenant-scoped workflow + immutable version authoring
+├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts (bootstrap)
 ├── worker/main.ts            Entrypoint 2 — background worker loop
 ├── db/
 │   ├── schema.ts             Tables, enums, constraints — source of truth
@@ -216,7 +219,9 @@ src/
 ├── observability/logger.ts   pino structured logging + correlation-ID helper
 ├── domain/
 │   ├── ids.ts                UUIDv7 id generator
-│   └── errors.ts             RetryableError / PermanentError taxonomy
+│   ├── errors.ts             RetryableError / PermanentError taxonomy
+│   ├── workflow-definition.ts  Zod schema for linear noop workflow definitions
+│   └── workflow-trigger.ts   Zod schema for webhook trigger config
 └── test/
     ├── unit/                 No external dependencies
     └── integration/          Requires PostgreSQL; skipped without it
@@ -326,7 +331,10 @@ cryptography, the authenticator's failure modes, and the whole HTTP boundary
 key lifecycle, route-level tenant isolation, and the plaintext never being logged
 or listed). They also assert the schema's structural invariants directly against
 the Drizzle model — a dropped `tenant_id`, a naive `timestamp`, or an
-`updated_at` appearing on `workflow_versions` all fail the build.
+`updated_at` appearing on `workflow_versions` all fail the build. For workflow
+authoring they cover definition validation (valid `noop` accepted; empty steps,
+duplicate keys, bad key format, unknown step type, malformed config all rejected)
+and trigger-config validation.
 
 Integration tests require a real PostgreSQL server and are **skipped** without
 one. They are never simulated: no database means skipped, not passed.
@@ -340,12 +348,15 @@ partial unique index, the composite foreign key, case-insensitive email
 uniqueness, jsonb round-tripping, cascade deletes, and — for `api_keys` — that
 the plaintext is absent from every column, that a real key round-trips through
 the authenticator, and that SQL-level tenant scoping stops one tenant reading or
-revoking another's keys. Because they write and delete rows, they refuse to run
-unless the database name contains `test`.
+revoking another's keys. For workflows they prove version 2 is a fresh INSERT that
+leaves version 1 unchanged, that the unique version constraint refuses a duplicate,
+that promoting a version keeps exactly one active, and that one tenant cannot read,
+version or activate another's workflow. Because they write and delete rows, they
+refuse to run unless the database name contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–3)
+### Implemented (Steps 1–4A)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -371,6 +382,14 @@ unless the database name contains `test`.
   - One consistent error envelope (`401/403/404/400/429/500`) with a request id
     correlated into the logs, never exposing internals
   - Conservative in-memory rate limiting (no Redis)
+- **Workflow authoring (Step 4A)** — a Zod-validated workflow definition
+  (linear `noop` steps: unique valid keys, at least one step, no unknown step
+  types or config) and a `webhook` trigger config, both framework-free and
+  reusable; a tenant-scoped `WorkflowRepository` that creates a workflow with its
+  active version 1, appends immutable new versions (fresh INSERT, version 1 never
+  updated), numbers versions monotonically with a `FOR UPDATE` lock plus the DB
+  unique constraint as backstop, and promotes a version inside one transaction so
+  "at most one active" always holds
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -380,9 +399,9 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| Webhook ingestion, event persistence, idempotency | Step 4 |
+| Webhook ingestion, event persistence, idempotency | Step 4B |
 | Job queue (`FOR UPDATE SKIP LOCKED`), worker claim loop, lease reaper | Step 5 |
-| Workflow definition schema and the step executor | Step 6 |
+| The step executor that runs a definition | Step 6 |
 | Claude integration behind an `LlmProvider` interface | Steps 7–8 |
 | Connectors, credential encryption, first integration (Slack) | Steps 9–10 |
 | Retry policy and backoff | Step 11 |

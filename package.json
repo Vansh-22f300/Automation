@@ -24,7 +24,8 @@
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "tenant:create": "tsx --env-file-if-exists=.env src/cli/create-tenant.ts",
-    "apikey:create": "tsx --env-file-if-exists=.env src/cli/create-api-key.ts"
+    "apikey:create": "tsx --env-file-if-exists=.env src/cli/create-api-key.ts",
+    "workflow:create": "tsx --env-file-if-exists=.env src/cli/create-workflow.ts"
   },
   "dependencies": {
     "@fastify/rate-limit": "^11.2.0",
