@@ -25,8 +25,8 @@ import { and, desc, eq, sql } from 'drizzle-orm';
 
 import { parseWorkflowDefinition } from '@/domain/workflow-definition.js';
 import { buildRunContext } from '@/domain/workflow-run.js';
-import { events, jobs, workflowRuns, workflowStepRuns, workflowVersions } from '@/db/schema.js';
-import type { Event, Job, WorkflowRun, WorkflowStepRun } from '@/db/schema.js';
+import { events, jobs, llmUsage, workflowRuns, workflowStepRuns, workflowVersions } from '@/db/schema.js';
+import type { Event, Job, LlmUsage, WorkflowRun, WorkflowStepRun } from '@/db/schema.js';
 import type { TransactionalJobEnqueuer } from '@/repositories/job-queue.js';
 import { TenantScope, TenantScopedRepository } from '@/repositories/tenant-scope.js';
 
@@ -203,6 +203,16 @@ export class WebhookRepository extends TenantScopedRepository implements Webhook
       .from(workflowStepRuns)
       .where(this.scope.where(workflowStepRuns.tenantId))
       .orderBy(desc(workflowStepRuns.startedAt))
+      .limit(limit);
+  }
+
+  /** Recent LLM usage records for this tenant, newest first — model/token/latency. */
+  async listLlmUsage(limit = 100): Promise<LlmUsage[]> {
+    return this.db
+      .select()
+      .from(llmUsage)
+      .where(this.scope.where(llmUsage.tenantId))
+      .orderBy(desc(llmUsage.createdAt))
       .limit(limit);
   }
 }

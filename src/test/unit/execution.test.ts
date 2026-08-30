@@ -120,12 +120,13 @@ describe('step-handler registry', () => {
   it('resolves noop and produces a deterministic output', async () => {
     const registry = defaultStepHandlerRegistry();
     const handler = registry.get('noop');
-    const output = await handler.execute({
+    const result = await handler.execute({
       step: { key: 'first', type: 'noop', config: {} },
       context: new ExecutionContext(baseContext()),
       input: {},
     });
-    expect(output).toEqual({ ok: true });
+    expect(result.output).toEqual({ ok: true });
+    expect(result.usage).toBeUndefined();
     expect(handler).toBeInstanceOf(NoopStepHandler);
   });
 

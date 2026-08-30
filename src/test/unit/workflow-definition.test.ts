@@ -74,7 +74,7 @@ describe('workflowDefinitionSchema', () => {
     expect(
       workflowDefinitionSchema.safeParse({
         version: DEFINITION_SCHEMA_VERSION,
-        steps: [{ key: 'first', type: 'llm', config: {} }],
+        steps: [{ key: 'first', type: 'action', config: {} }],
       }).success,
     ).toBe(false);
   });
@@ -103,6 +103,138 @@ describe('workflowDefinitionSchema', () => {
       workflowDefinitionSchema.safeParse({
         version: 2,
         steps: [{ key: 'first', type: 'noop', config: {} }],
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('workflowDefinitionSchema — llm steps', () => {
+  /** A minimal, valid llm step config. */
+  const validLlmConfig = {
+    system: 'You are a classifier.',
+    input: '{{trigger.payload.text}}',
+    output_schema: {
+      type: 'object',
+      properties: {
+        category: { type: 'enum', values: ['spam', 'ham'] },
+        confidence: { type: 'number' },
+      },
+      required: ['category'],
+    },
+  };
+
+  it('accepts a valid llm step', () => {
+    const parsed = parseWorkflowDefinition({
+      version: DEFINITION_SCHEMA_VERSION,
+      steps: [{ key: 'classify', type: 'llm', config: validLlmConfig }],
+    });
+    expect(parsed.steps[0]!.type).toBe('llm');
+    // max_output_tokens defaults when omitted.
+    const config = parsed.steps[0]!.config as { max_output_tokens: number };
+    expect(config.max_output_tokens).toBe(1024);
+  });
+
+  it('accepts an optional model override', () => {
+    const parsed = parseWorkflowDefinition({
+      version: DEFINITION_SCHEMA_VERSION,
+      steps: [
+        { key: 'classify', type: 'llm', config: { ...validLlmConfig, model: 'claude-x' } },
+      ],
+    });
+    const config = parsed.steps[0]!.config as { model?: string };
+    expect(config.model).toBe('claude-x');
+  });
+
+  it('rejects an llm step missing required config fields', () => {
+    expect(
+      workflowDefinitionSchema.safeParse({
+        version: DEFINITION_SCHEMA_VERSION,
+        steps: [{ key: 'classify', type: 'llm', config: {} }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects unknown keys in llm config', () => {
+    expect(
+      workflowDefinitionSchema.safeParse({
+        version: DEFINITION_SCHEMA_VERSION,
+        steps: [
+          { key: 'classify', type: 'llm', config: { ...validLlmConfig, temperature: 0.7 } },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects a template reference in the system instruction', () => {
+    // The system instruction must be static/trusted; references belong only in `input`.
+    expect(
+      workflowDefinitionSchema.safeParse({
+        version: DEFINITION_SCHEMA_VERSION,
+        steps: [
+          {
+            key: 'classify',
+            type: 'llm',
+            config: { ...validLlmConfig, system: 'You are {{trigger.payload.role}}.' },
+          },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects an invalid output schema (missing root type)', () => {
+    expect(
+      workflowDefinitionSchema.safeParse({
+        version: DEFINITION_SCHEMA_VERSION,
+        steps: [
+          {
+            key: 'classify',
+            type: 'llm',
+            config: { ...validLlmConfig, output_schema: { properties: {} } },
+          },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects an unsupported output-schema construct', () => {
+    expect(
+      workflowDefinitionSchema.safeParse({
+        version: DEFINITION_SCHEMA_VERSION,
+        steps: [
+          {
+            key: 'classify',
+            type: 'llm',
+            config: {
+              ...validLlmConfig,
+              output_schema: {
+                type: 'object',
+                properties: { ref: { $ref: '#/definitions/thing' } },
+              },
+            },
+          },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects a required name absent from properties', () => {
+    expect(
+      workflowDefinitionSchema.safeParse({
+        version: DEFINITION_SCHEMA_VERSION,
+        steps: [
+          {
+            key: 'classify',
+            type: 'llm',
+            config: {
+              ...validLlmConfig,
+              output_schema: {
+                type: 'object',
+                properties: { a: { type: 'string' } },
+                required: ['a', 'missing'],
+              },
+            },
+          },
+        ],
       }).success,
     ).toBe(false);
   });

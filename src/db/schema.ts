@@ -672,6 +672,66 @@ export const workflowStepRuns = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// llm_usage
+// ---------------------------------------------------------------------------
+
+/**
+ * Token/latency accounting for a single successful `llm` step execution.
+ *
+ * Kept in its own table rather than as columns on `workflow_step_runs` because
+ * usage is specific to steps that call a model — most steps have none — and
+ * because cost reporting (a later concern) wants to aggregate this dimension
+ * independently of the step-run audit trail. One row per metered step run.
+ *
+ * The engine writes this row inside the same transaction that settles the step
+ * run, so usage and result commit together. The **provider never writes here** —
+ * it returns usage to the caller; persistence is the engine's job. No prompt,
+ * output or credential is stored: only counts, the model and the provider name.
+ *
+ * Tenant safety is the composite foreign key `(tenant_id, run_id) →
+ * workflow_runs(tenant_id, id)`, as elsewhere; `step_run_id` ties the row to the
+ * exact execution and is unique so a redelivered step cannot double-count.
+ */
+export const llmUsage = pgTable(
+  'llm_usage',
+  {
+    id: primaryId(),
+    /** Denormalised from the run's tenant; kept honest by the composite FK below. */
+    tenantId: uuid('tenant_id').notNull(),
+    /** The run this usage belongs to. */
+    runId: uuid('run_id').notNull(),
+    /** The exact step execution that incurred it. One usage row per step run. */
+    stepRunId: uuid('step_run_id')
+      .notNull()
+      .references(() => workflowStepRuns.id, { onDelete: 'cascade' }),
+    /** Stable provider identifier, e.g. `claude`. */
+    provider: text('provider').notNull(),
+    /** The model that actually served the request, as the provider reported it. */
+    model: text('model').notNull(),
+    inputTokens: integer('input_tokens').notNull(),
+    outputTokens: integer('output_tokens').notNull(),
+    totalTokens: integer('total_tokens').notNull(),
+    /** Wall-clock latency of the model call in milliseconds. */
+    latencyMs: integer('latency_ms').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    /** The usage row's run must be in the usage row's tenant. */
+    foreignKey({
+      name: 'llm_usage_tenant_id_run_id_fkey',
+      columns: [t.tenantId, t.runId],
+      foreignColumns: [workflowRuns.tenantId, workflowRuns.id],
+    }).onDelete('cascade'),
+    /** At most one usage row per step execution — the idempotency backstop. */
+    unique('llm_usage_step_run_id_key').on(t.stepRunId),
+    /** Tenant/run lookup for inspecting a run's usage. */
+    index('llm_usage_tenant_id_run_id_idx').on(t.tenantId, t.runId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // api_keys
 // ---------------------------------------------------------------------------
 
@@ -754,6 +814,7 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   workflowRuns: many(workflowRuns),
   jobs: many(jobs),
   stepRuns: many(workflowStepRuns),
+  llmUsage: many(llmUsage),
 }));
 
 export const usersRelations = relations(users, ({ one }) => ({
@@ -798,13 +859,24 @@ export const workflowRunsRelations = relations(workflowRuns, ({ one, many }) => 
   event: one(events, { fields: [workflowRuns.eventId], references: [events.id] }),
   jobs: many(jobs),
   stepRuns: many(workflowStepRuns),
+  llmUsage: many(llmUsage),
 }));
 
-export const workflowStepRunsRelations = relations(workflowStepRuns, ({ one }) => ({
+export const workflowStepRunsRelations = relations(workflowStepRuns, ({ one, many }) => ({
   tenant: one(tenants, { fields: [workflowStepRuns.tenantId], references: [tenants.id] }),
   run: one(workflowRuns, {
     fields: [workflowStepRuns.runId],
     references: [workflowRuns.id],
+  }),
+  usage: many(llmUsage),
+}));
+
+export const llmUsageRelations = relations(llmUsage, ({ one }) => ({
+  tenant: one(tenants, { fields: [llmUsage.tenantId], references: [tenants.id] }),
+  run: one(workflowRuns, { fields: [llmUsage.runId], references: [workflowRuns.id] }),
+  stepRun: one(workflowStepRuns, {
+    fields: [llmUsage.stepRunId],
+    references: [workflowStepRuns.id],
   }),
 }));
 
@@ -846,3 +918,6 @@ export type NewJob = typeof jobs.$inferInsert;
 
 export type WorkflowStepRun = typeof workflowStepRuns.$inferSelect;
 export type NewWorkflowStepRun = typeof workflowStepRuns.$inferInsert;
+
+export type LlmUsage = typeof llmUsage.$inferSelect;
+export type NewLlmUsage = typeof llmUsage.$inferInsert;
