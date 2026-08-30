@@ -86,6 +86,7 @@ pnpm db:migrate
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
 | `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs, jobs, step runs and `llm_usage` (read-only dev aid to verify ingestion, queueing and execution). |
+| `pnpm runs:inspect <tenantId> <runId> [--detail]` | Assemble one safe, tenant-scoped view of a single run — run/workflow/version, event, ordered step runs, jobs, per-round `llm_usage`, reconstructed tool activity and usage totals. Summaries (byte size + secret-scrubbed preview) by default; `--detail` attaches the raw values, still secret-scrubbed. Shares the **exact** assembler and redaction layer as `GET /v1/runs/:runId`. |
 | `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY`). Never prints the decrypted secret or the key. To keep a token out of shell history, omit the trailing JSON and pass it via the `CONNECTION_CREDENTIAL_JSON` env var instead. |
 | `pnpm connections list <tenantId>` | List a tenant's connections — metadata only (id, provider/name, status, last-used), never the secret. |
 | `pnpm connections disable <tenantId> <connectionId>` | Disable a connection so it can no longer be resolved for a tool run. |
@@ -140,6 +141,7 @@ It verifies the database is reachable **before** opening the port, then binds to
 | `GET` | `/v1/api-keys` | Bearer key | List the caller's own keys (metadata only — never the key). |
 | `POST` | `/v1/api-keys/:id/revoke` | Bearer key | Revoke one of the caller's keys. `204` on success, `404` if it is not theirs. |
 | `POST` | `/v1/webhooks/:source` | Bearer key | Ingest a webhook. Captures the event idempotently and, if `:source` has an active workflow, creates a queued run. |
+| `GET` | `/v1/runs/:runId` | Bearer key | Inspect one of the caller's own runs — the same safe, summarized view the CLI renders. `404` (identical shape) if the run does not exist **or** belongs to another tenant. |
 
 #### Webhook ingestion (`POST /v1/webhooks/:source`)
 
@@ -172,6 +174,52 @@ activating a newer version never changes runs already in flight.
 > so per-provider signature verification can be added at this boundary without a
 > rewrite. **Provider webhooks must not be enabled in production before that
 > lands.**
+
+#### Inspecting a run (`GET /v1/runs/:runId`)
+
+Returns one coherent, tenant-scoped view of a run: its identity and status, the
+workflow and pinned version, the triggering event, step runs in execution order,
+the jobs behind them, per-round `llm_usage`, reconstructed tool activity, and
+usage totals.
+
+```bash
+curl -s http://127.0.0.1:3000/v1/runs/<runId> \
+  -H "Authorization: Bearer awk_your_key_here"
+```
+
+The tenant is always derived from the API key (`request.auth.tenantId`) — the URL
+carries only the run id, and no `tenantId` is ever accepted from the path, query
+or body. A run that belongs to another tenant is indistinguishable from one that
+never existed: **both return the exact same `404`** (`{ code: "not_found" }`), so
+the endpoint cannot be used to probe for the existence of other tenants' runs.
+
+The API is deliberately **summary-only**: it never exposes raw context, payloads,
+step inputs/outputs, `locked_by`, `lease_expires_at`, or trigger secrets. Instead
+each value is reported as a `ValueSummary` — its true byte size plus a capped,
+secret-scrubbed preview — and a live worker lease is collapsed to a single
+`leased` boolean. Stored errors are reduced to `{ code, message, retryable? }`.
+There is intentionally **no `?detail=` query parameter** on the API yet; the raw
+(still secret-scrubbed) values are available only through the CLI's `--detail`
+flag, which an operator runs against the database directly.
+
+Both surfaces call the same `RunInspectionRepository` and the same pure
+`assembleRunInspection` assembler ([`run-inspection.ts`](src/domain/run-inspection.ts)),
+so the CLI and the endpoint cannot drift: the shaping and redaction live in exactly
+one place. Redaction ([`redaction.ts`](src/domain/redaction.ts)) is a
+**best-effort safety net, not a DLP system** — it scrubs high-confidence secret
+shapes (bearer/Slack/API-key/long-hex tokens and secret-named JSON keys), caps
+preview size, and bounds scrub depth.
+
+> **Tool activity is reconstructed, not persisted.** There is no `tool_executions`
+> table; a step's tool use is inferred from its `llm_usage` round count (more than
+> one round ⇒ tools were used, `toolRounds = rounds − 1`). The exact tool names and
+> arguments are not surfaced. A dedicated tool-execution/idempotency ledger is
+> deferred (see below).
+
+> **Designed but not built: `GET /v1/runs` (list).** A paginated, filterable list
+> of runs was scoped and deliberately left out of Step 12 to keep the surface
+> minimal — there is no list, search, pagination, filtering, or any
+> mutation/cancellation endpoint, and no frontend. Only the single-run read exists.
 
 Authentication is a bearer API key:
 
@@ -781,9 +829,28 @@ usage, a redelivered `llm` job calls the provider only once (idempotency), and o
 tenant's run cannot touch another's. Because they write and delete rows, they
 refuse to run unless the database name contains `test`.
 
+For **run inspection (Step 12)** the pure assembler and redaction policy are
+covered without a database: dates map to ISO strings, values are summarized by
+default and only attached (secret-scrubbed) in detail mode, the three job counters
+(`attempt`/`retry_count`/`max_attempts`) stay distinct, `leased` is true only for a
+running job with an unexpired lease (and the worker id is never exposed), `llm_usage`
+is attributed to step keys and ordered, tool activity is reconstructed from round
+counts, and a stored error is reduced to its safe shape; the redaction unit tests
+pin the secret patterns, the value-summary size/cap/boundary behaviour, and the
+non-mutating bounded deep scrub. The `GET /v1/runs/:runId` boundary is driven by
+`app.inject` over a fixture built from the **real** assembler with secrets planted:
+an authenticated own-run returns `200` with byte-for-byte the shared DTO, a missing
+key `401`, and another tenant's run and a nonexistent run both return an **identical**
+`404` — with the planted secrets, `locked_by` and `lease_expires_at` all absent from
+the body and a `requestId` present in the error envelope. The integration suite
+proves the same against real rows: one run assembles coherently under the tenant
+predicate, step ordering and usage attribution hold, secrets are scrubbed in both
+summary and detail mode, a cross-tenant or nonexistent run returns `null`, and
+`leased` reflects a live lease.
+
 ## Current status
 
-### Implemented (Steps 1–11)
+### Implemented (Steps 1–12)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration

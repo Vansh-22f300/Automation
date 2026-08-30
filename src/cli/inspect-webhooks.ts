@@ -16,6 +16,7 @@
 import { loadEnv } from '@/config/env.js';
 import { createDatabase } from '@/db/client.js';
 import { createLogger } from '@/observability/logger.js';
+import { summarizeValue, toSafeError } from '@/domain/redaction.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
@@ -62,16 +63,30 @@ try {
   lines.push('');
   lines.push(`jobs (${jobs.length}), newest first:`);
   for (const j of jobs) {
+    // `locked_by` is an internal worker id, not operator-facing — collapse it to a
+    // liveness boolean rather than printing it. `last_error` is mapped to the safe
+    // error shape so no stack or detail can leak through this dev aid.
+    const leased = j.status === 'running' && j.lockedBy !== null;
+    const lastError = toSafeError(j.lastError);
+    const errPart = lastError === null ? '' : `  last_error=${lastError.code}: ${lastError.message}`;
     lines.push(
-      `  ${j.id}  status=${j.status}  run=${j.runId}  step=${j.stepKey}  attempt=${j.attempt}/${j.maxAttempts}  locked_by=${j.lockedBy ?? '-'}`,
+      `  ${j.id}  status=${j.status}  run=${j.runId}  step=${j.stepKey}  attempt=${j.attempt}/${j.maxAttempts}  leased=${leased}${errPart}`,
     );
   }
   lines.push('');
   lines.push(`workflow_step_runs (${stepRuns.length}), newest first:`);
   for (const s of stepRuns) {
     const duration = s.durationMs === null ? '-' : `${s.durationMs}ms`;
-    const output = s.output === null ? '-' : JSON.stringify(s.output);
-    const detail = s.status === 'failed' ? `error=${JSON.stringify(s.error)}` : `output=${output}`;
+    // Never print raw output/error: summarize the output (size + redacted preview)
+    // and map the error to the safe shape.
+    let detail: string;
+    if (s.status === 'failed') {
+      const safe = toSafeError(s.error);
+      detail = safe === null ? 'error=-' : `error=${safe.code}: ${safe.message}`;
+    } else {
+      const summary = summarizeValue(s.output ?? null);
+      detail = `output=${summary.preview} (${summary.bytes}b)`;
+    }
     lines.push(
       `  ${s.id}  status=${s.status}  run=${s.runId}  step=${s.stepKey}(${s.stepType})  attempt=${s.attempt}  ${duration}  ${detail}`,
     );

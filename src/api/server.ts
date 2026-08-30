@@ -17,6 +17,7 @@ import { ApiKeyAuthenticator } from '@/auth/api-key-authenticator.js';
 import { DrizzleApiKeyStore } from '@/auth/api-key-store.js';
 import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
+import { RunInspectionRepository } from '@/repositories/run-inspection-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 
@@ -42,6 +43,10 @@ const app = await buildApp({
   apiKeyServiceFor: (auth) => new ApiKeyRepository(new TenantScope(database.db, auth.tenantId)),
   webhookIngestorFor: (auth) =>
     new WebhookRepository(new TenantScope(database.db, auth.tenantId), queue),
+  // Read-only, tenant-scoped run inspection. Same repository (and therefore the
+  // same DTO + redaction) the CLI uses — the API adds no query or shaping logic.
+  runInspectionFor: (auth) =>
+    new RunInspectionRepository(new TenantScope(database.db, auth.tenantId)),
 });
 
 let shuttingDown = false;

@@ -8,25 +8,29 @@
  * transaction is covered by the integration suite; here we prove the boundary.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash } from "node:crypto";
 
-import pino from 'pino';
-import { afterEach, describe, expect, it } from 'vitest';
+import pino from "pino";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { buildApp } from '@/api/app.js';
-import { UnauthorizedError } from '@/api/errors.js';
-import type { ApiServer } from '@/api/types.js';
-import type { AuthContext, Authenticator } from '@/auth/context.js';
-import { newId } from '@/domain/ids.js';
-import type { IngestInput, IngestResult, WebhookIngestor } from '@/repositories/webhook-repository.js';
+import { buildApp } from "@/api/app.js";
+import { UnauthorizedError } from "@/api/errors.js";
+import type { ApiServer } from "@/api/types.js";
+import type { AuthContext, Authenticator } from "@/auth/context.js";
+import { newId } from "@/domain/ids.js";
+import type {
+  IngestInput,
+  IngestResult,
+  WebhookIngestor,
+} from "@/repositories/webhook-repository.js";
 
-const VALID_KEY = 'valid-key';
-const TENANT = 'tenant-1';
+const VALID_KEY = "valid-key";
+const TENANT = "tenant-1";
 
 const authenticator: Authenticator = {
   authenticate: async (credential: string): Promise<AuthContext> => {
     if (credential !== VALID_KEY) throw new UnauthorizedError();
-    return { tenantId: TENANT, apiKeyId: 'key-1' };
+    return { tenantId: TENANT, apiKeyId: "key-1" };
   },
 };
 
@@ -47,7 +51,7 @@ class RecordingIngestor implements WebhookIngestor {
 }
 
 function silentLogger(): pino.Logger {
-  return pino({ level: 'silent' });
+  return pino({ level: "silent" });
 }
 
 interface Harness {
@@ -62,9 +66,13 @@ async function makeApp(): Promise<Harness> {
     authenticator,
     checkDatabase: async () => undefined,
     apiKeyServiceFor: () => {
-      throw new Error('not used');
+      throw new Error("not used");
     },
     webhookIngestorFor: () => ingestor,
+    // Minimal run-inspection reader factory for the routes that expect it.
+    runInspectionFor: () => ({
+      getRun: async () => null,
+    }),
   });
   return { app, ingestor };
 }
@@ -79,123 +87,133 @@ afterEach(async () => {
   }
 });
 
-describe('POST /v1/webhooks/:source — authentication', () => {
-  it('rejects a missing API key with 401', async () => {
+describe("POST /v1/webhooks/:source — authentication", () => {
+  it("rejects a missing API key with 401", async () => {
     current = await makeApp();
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
+      method: "POST",
+      url: "/v1/webhooks/test",
       payload: { a: 1 },
     });
     expect(res.statusCode).toBe(401);
     expect(current.ingestor.calls).toHaveLength(0);
   });
 
-  it('rejects an invalid API key with 401', async () => {
+  it("rejects an invalid API key with 401", async () => {
     current = await makeApp();
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
-      headers: bearer('nope'),
+      method: "POST",
+      url: "/v1/webhooks/test",
+      headers: bearer("nope"),
       payload: { a: 1 },
     });
     expect(res.statusCode).toBe(401);
   });
 });
 
-describe('POST /v1/webhooks/:source — responses', () => {
-  it('returns 202 queued when a workflow matched', async () => {
+describe("POST /v1/webhooks/:source — responses", () => {
+  it("returns 202 queued when a workflow matched", async () => {
     current = await makeApp();
     current.ingestor.next = {
-      eventId: 'ev-1',
-      runId: 'run-1',
+      eventId: "ev-1",
+      runId: "run-1",
       duplicate: false,
       workflowConfigured: true,
     };
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
-      headers: bearer(VALID_KEY),
-      payload: { a: 1 },
-    });
-    expect(res.statusCode).toBe(202);
-    expect(res.json()).toEqual({ event_id: 'ev-1', run_id: 'run-1', status: 'queued' });
-  });
-
-  it('returns 202 accepted/not_configured when no workflow matched', async () => {
-    current = await makeApp();
-    current.ingestor.next = {
-      eventId: 'ev-2',
-      runId: null,
-      duplicate: false,
-      workflowConfigured: false,
-    };
-    const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
+      method: "POST",
+      url: "/v1/webhooks/test",
       headers: bearer(VALID_KEY),
       payload: { a: 1 },
     });
     expect(res.statusCode).toBe(202);
     expect(res.json()).toEqual({
-      event_id: 'ev-2',
-      run_id: null,
-      status: 'accepted',
-      workflow: 'not_configured',
+      event_id: "ev-1",
+      run_id: "run-1",
+      status: "queued",
     });
   });
 
-  it('returns 200 duplicate for a repeated delivery', async () => {
+  it("returns 202 accepted/not_configured when no workflow matched", async () => {
     current = await makeApp();
     current.ingestor.next = {
-      eventId: 'ev-3',
-      runId: 'run-3',
+      eventId: "ev-2",
+      runId: null,
+      duplicate: false,
+      workflowConfigured: false,
+    };
+    const res = await current.app.inject({
+      method: "POST",
+      url: "/v1/webhooks/test",
+      headers: bearer(VALID_KEY),
+      payload: { a: 1 },
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual({
+      event_id: "ev-2",
+      run_id: null,
+      status: "accepted",
+      workflow: "not_configured",
+    });
+  });
+
+  it("returns 200 duplicate for a repeated delivery", async () => {
+    current = await makeApp();
+    current.ingestor.next = {
+      eventId: "ev-3",
+      runId: "run-3",
       duplicate: true,
       workflowConfigured: true,
     };
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
+      method: "POST",
+      url: "/v1/webhooks/test",
       headers: bearer(VALID_KEY),
       payload: { a: 1 },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ event_id: 'ev-3', run_id: 'run-3', status: 'duplicate' });
+    expect(res.json()).toEqual({
+      event_id: "ev-3",
+      run_id: "run-3",
+      status: "duplicate",
+    });
   });
 });
 
-describe('POST /v1/webhooks/:source — dedupe key derivation', () => {
-  it('uses X-Event-ID as the dedupe key when provided', async () => {
+describe("POST /v1/webhooks/:source — dedupe key derivation", () => {
+  it("uses X-Event-ID as the dedupe key when provided", async () => {
     current = await makeApp();
     await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
-      headers: { ...bearer(VALID_KEY), 'x-event-id': 'evt-abc' },
+      method: "POST",
+      url: "/v1/webhooks/test",
+      headers: { ...bearer(VALID_KEY), "x-event-id": "evt-abc" },
       payload: { a: 1 },
     });
-    expect(current.ingestor.calls[0]!.dedupeKey).toBe('evt-abc');
+    expect(current.ingestor.calls[0]!.dedupeKey).toBe("evt-abc");
   });
 
-  it('falls back to a SHA-256 of the raw body when no X-Event-ID', async () => {
+  it("falls back to a SHA-256 of the raw body when no X-Event-ID", async () => {
     current = await makeApp();
     const body = JSON.stringify({ a: 1, b: 2 });
     await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
-      headers: { ...bearer(VALID_KEY), 'content-type': 'application/json' },
+      method: "POST",
+      url: "/v1/webhooks/test",
+      headers: { ...bearer(VALID_KEY), "content-type": "application/json" },
       payload: body,
     });
-    const expected = createHash('sha256').update(Buffer.from(body)).digest('hex');
+    const expected = createHash("sha256")
+      .update(Buffer.from(body))
+      .digest("hex");
     expect(current.ingestor.calls[0]!.dedupeKey).toBe(expected);
   });
 
-  it('derives the same key for identical raw bodies and different keys for different bodies', async () => {
+  it("derives the same key for identical raw bodies and different keys for different bodies", async () => {
     current = await makeApp();
     const send = (payload: string) =>
       current!.app.inject({
-        method: 'POST',
-        url: '/v1/webhooks/test',
-        headers: { ...bearer(VALID_KEY), 'content-type': 'application/json' },
+        method: "POST",
+        url: "/v1/webhooks/test",
+        headers: { ...bearer(VALID_KEY), "content-type": "application/json" },
         payload,
       });
     await send('{"a":1}');
@@ -206,25 +224,25 @@ describe('POST /v1/webhooks/:source — dedupe key derivation', () => {
     expect(k1).not.toBe(k3);
   });
 
-  it('passes the parsed payload and validated source through', async () => {
+  it("passes the parsed payload and validated source through", async () => {
     current = await makeApp();
     await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/github',
+      method: "POST",
+      url: "/v1/webhooks/github",
       headers: bearer(VALID_KEY),
-      payload: { hello: 'world' },
+      payload: { hello: "world" },
     });
-    expect(current.ingestor.calls[0]!.source).toBe('github');
-    expect(current.ingestor.calls[0]!.payload).toEqual({ hello: 'world' });
+    expect(current.ingestor.calls[0]!.source).toBe("github");
+    expect(current.ingestor.calls[0]!.payload).toEqual({ hello: "world" });
   });
 });
 
-describe('POST /v1/webhooks/:source — validation and limits', () => {
-  it('rejects an invalid source with 400', async () => {
+describe("POST /v1/webhooks/:source — validation and limits", () => {
+  it("rejects an invalid source with 400", async () => {
     current = await makeApp();
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/Bad_Source!',
+      method: "POST",
+      url: "/v1/webhooks/Bad_Source!",
       headers: bearer(VALID_KEY),
       payload: { a: 1 },
     });
@@ -232,36 +250,36 @@ describe('POST /v1/webhooks/:source — validation and limits', () => {
     expect(current.ingestor.calls).toHaveLength(0);
   });
 
-  it('rejects malformed JSON with 400', async () => {
+  it("rejects malformed JSON with 400", async () => {
     current = await makeApp();
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
-      headers: { ...bearer(VALID_KEY), 'content-type': 'application/json' },
-      payload: '{ not valid json',
+      method: "POST",
+      url: "/v1/webhooks/test",
+      headers: { ...bearer(VALID_KEY), "content-type": "application/json" },
+      payload: "{ not valid json",
     });
     expect(res.statusCode).toBe(400);
     expect(current.ingestor.calls).toHaveLength(0);
   });
 
-  it('rejects an empty body with 400', async () => {
+  it("rejects an empty body with 400", async () => {
     current = await makeApp();
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
-      headers: { ...bearer(VALID_KEY), 'content-type': 'application/json' },
-      payload: '',
+      method: "POST",
+      url: "/v1/webhooks/test",
+      headers: { ...bearer(VALID_KEY), "content-type": "application/json" },
+      payload: "",
     });
     expect(res.statusCode).toBe(400);
   });
 
-  it('rejects an oversized body (over the 1 MiB limit)', async () => {
+  it("rejects an oversized body (over the 1 MiB limit)", async () => {
     current = await makeApp();
-    const big = JSON.stringify({ blob: 'x'.repeat(1_100_000) });
+    const big = JSON.stringify({ blob: "x".repeat(1_100_000) });
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/webhooks/test',
-      headers: { ...bearer(VALID_KEY), 'content-type': 'application/json' },
+      method: "POST",
+      url: "/v1/webhooks/test",
+      headers: { ...bearer(VALID_KEY), "content-type": "application/json" },
       payload: big,
     });
     expect(res.statusCode).toBe(413);

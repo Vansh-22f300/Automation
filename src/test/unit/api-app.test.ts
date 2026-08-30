@@ -18,20 +18,20 @@
  *   - unknown routes and errors all use the same `{ error: {...} }` envelope
  */
 
-import pino from 'pino';
-import { afterEach, describe, expect, it } from 'vitest';
+import pino from "pino";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { buildApp } from '@/api/app.js';
-import { UnauthorizedError } from '@/api/errors.js';
-import type { ApiServer } from '@/api/types.js';
-import type { AuthContext, Authenticator } from '@/auth/context.js';
-import { generateApiKey } from '@/auth/api-key.js';
-import { newId } from '@/domain/ids.js';
+import { buildApp } from "@/api/app.js";
+import { UnauthorizedError } from "@/api/errors.js";
+import type { ApiServer } from "@/api/types.js";
+import type { AuthContext, Authenticator } from "@/auth/context.js";
+import { generateApiKey } from "@/auth/api-key.js";
+import { newId } from "@/domain/ids.js";
 import type {
   ApiKeySummary,
   ApiKeyService,
   CreatedApiKey,
-} from '@/repositories/api-key-repository.js';
+} from "@/repositories/api-key-repository.js";
 
 interface StoredKey {
   id: string;
@@ -59,7 +59,8 @@ class FakeBackend {
       const context = this.credentials.get(credential);
       if (context === undefined) throw new UnauthorizedError();
       const row = this.keys.find((k) => k.id === context.apiKeyId);
-      if (row === undefined || row.revokedAt !== null) throw new UnauthorizedError();
+      if (row === undefined || row.revokedAt !== null)
+        throw new UnauthorizedError();
       return context;
     },
   };
@@ -89,7 +90,10 @@ class FakeBackend {
           revokedAt: null,
         };
         this.keys.push(row);
-        this.credentials.set(generated.plaintext, { tenantId, apiKeyId: row.id });
+        this.credentials.set(generated.plaintext, {
+          tenantId,
+          apiKeyId: row.id,
+        });
         return {
           id: row.id,
           name: row.name,
@@ -102,10 +106,12 @@ class FakeBackend {
         this.keys.filter((k) => k.tenantId === tenantId).map(summary),
       revoke: async (id: string): Promise<void> => {
         // Tenant-scoped: only this tenant's rows are even visible.
-        const row = this.keys.find((k) => k.id === id && k.tenantId === tenantId);
+        const row = this.keys.find(
+          (k) => k.id === id && k.tenantId === tenantId,
+        );
         if (row === undefined) {
-          const { NotFoundError } = await import('@/api/errors.js');
-          throw new NotFoundError('API key not found');
+          const { NotFoundError } = await import("@/api/errors.js");
+          throw new NotFoundError("API key not found");
         }
         row.revokedAt = new Date();
       },
@@ -117,7 +123,7 @@ class FakeBackend {
 function captureLogger(): { logger: pino.Logger; lines: string[] } {
   const lines: string[] = [];
   const logger = pino(
-    { level: 'trace' },
+    { level: "trace" },
     { write: (chunk: string) => void lines.push(chunk) },
   );
   return { logger, lines };
@@ -139,7 +145,8 @@ async function makeApp(): Promise<Harness> {
     logger,
     authenticator: backend.authenticator,
     checkDatabase: async () => {
-      if (!dbHealthy.value) throw new Error('connection refused to 10.0.0.9:5432');
+      if (!dbHealthy.value)
+        throw new Error("connection refused to 10.0.0.9:5432");
     },
     apiKeyServiceFor: backend.serviceFor,
     // Not exercised here; the webhook route has its own suite. A no-op ingestor
@@ -151,6 +158,10 @@ async function makeApp(): Promise<Harness> {
         duplicate: false,
         workflowConfigured: false,
       }),
+    }),
+    // Minimal run-inspection reader factory for the routes that expect it.
+    runInspectionFor: () => ({
+      getRun: async () => null,
     }),
   });
 
@@ -172,118 +183,126 @@ afterEach(async () => {
 });
 
 /** Mint a working credential for a tenant, the way the out-of-band CLI would. */
-async function bootstrapKey(backend: FakeBackend, tenantId: string): Promise<string> {
-  const created = await backend.serviceFor({ tenantId, apiKeyId: 'bootstrap' }).create('bootstrap');
+async function bootstrapKey(
+  backend: FakeBackend,
+  tenantId: string,
+): Promise<string> {
+  const created = await backend
+    .serviceFor({ tenantId, apiKeyId: "bootstrap" })
+    .create("bootstrap");
   return created.plaintext;
 }
 
-describe('GET /healthz', () => {
-  it('reports 200 and ok when the database check passes', async () => {
+describe("GET /healthz", () => {
+  it("reports 200 and ok when the database check passes", async () => {
     current = await makeApp();
-    const res = await current.app.inject({ method: 'GET', url: '/healthz' });
+    const res = await current.app.inject({ method: "GET", url: "/healthz" });
 
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({
-      status: 'ok',
-      checks: { process: 'ok', database: 'ok' },
+      status: "ok",
+      checks: { process: "ok", database: "ok" },
       uptimeSeconds: expect.any(Number),
     });
   });
 
-  it('reports 503 and degraded when the database check fails', async () => {
+  it("reports 503 and degraded when the database check fails", async () => {
     current = await makeApp();
     current.dbHealthy.value = false;
 
-    const res = await current.app.inject({ method: 'GET', url: '/healthz' });
+    const res = await current.app.inject({ method: "GET", url: "/healthz" });
 
     expect(res.statusCode).toBe(503);
     expect(res.json()).toMatchObject({
-      status: 'degraded',
-      checks: { process: 'ok', database: 'down' },
+      status: "degraded",
+      checks: { process: "ok", database: "down" },
     });
   });
 
-  it('leaks no connection detail even when the database is down', async () => {
+  it("leaks no connection detail even when the database is down", async () => {
     current = await makeApp();
     current.dbHealthy.value = false;
 
-    const res = await current.app.inject({ method: 'GET', url: '/healthz' });
+    const res = await current.app.inject({ method: "GET", url: "/healthz" });
     const body = res.body;
 
-    expect(body).not.toContain('5432');
-    expect(body).not.toContain('connection refused');
-    expect(body).not.toContain('10.0.0.9');
+    expect(body).not.toContain("5432");
+    expect(body).not.toContain("connection refused");
+    expect(body).not.toContain("10.0.0.9");
   });
 
-  it('requires no credential', async () => {
+  it("requires no credential", async () => {
     current = await makeApp();
-    const res = await current.app.inject({ method: 'GET', url: '/healthz' });
+    const res = await current.app.inject({ method: "GET", url: "/healthz" });
     expect(res.statusCode).toBe(200);
   });
 });
 
-describe('authentication failures', () => {
-  it('rejects a missing Authorization header with 401', async () => {
+describe("authentication failures", () => {
+  it("rejects a missing Authorization header with 401", async () => {
     current = await makeApp();
-    const res = await current.app.inject({ method: 'GET', url: '/v1/api-keys' });
+    const res = await current.app.inject({
+      method: "GET",
+      url: "/v1/api-keys",
+    });
 
     expect(res.statusCode).toBe(401);
     expect(res.json()).toEqual({
       error: {
-        code: 'unauthorized',
+        code: "unauthorized",
         message: expect.any(String),
         requestId: expect.any(String),
       },
     });
   });
 
-  it('rejects a non-Bearer Authorization header with 401', async () => {
+  it("rejects a non-Bearer Authorization header with 401", async () => {
     current = await makeApp();
     const res = await current.app.inject({
-      method: 'GET',
-      url: '/v1/api-keys',
-      headers: { authorization: 'Basic abc123' },
+      method: "GET",
+      url: "/v1/api-keys",
+      headers: { authorization: "Basic abc123" },
     });
     expect(res.statusCode).toBe(401);
   });
 
-  it('rejects an empty Bearer credential with 401', async () => {
+  it("rejects an empty Bearer credential with 401", async () => {
     current = await makeApp();
     const res = await current.app.inject({
-      method: 'GET',
-      url: '/v1/api-keys',
-      headers: { authorization: 'Bearer ' },
+      method: "GET",
+      url: "/v1/api-keys",
+      headers: { authorization: "Bearer " },
     });
     expect(res.statusCode).toBe(401);
   });
 
-  it('rejects an unknown credential with 401', async () => {
+  it("rejects an unknown credential with 401", async () => {
     current = await makeApp();
     const res = await current.app.inject({
-      method: 'GET',
-      url: '/v1/api-keys',
+      method: "GET",
+      url: "/v1/api-keys",
       headers: bearer(generateApiKey().plaintext),
     });
     expect(res.statusCode).toBe(401);
   });
 });
 
-describe('API-key lifecycle', () => {
-  it('creates a key, returning the plaintext exactly once', async () => {
+describe("API-key lifecycle", () => {
+  it("creates a key, returning the plaintext exactly once", async () => {
     current = await makeApp();
-    const auth = await bootstrapKey(current.backend, 'tenant-a');
+    const auth = await bootstrapKey(current.backend, "tenant-a");
 
     const created = await current.app.inject({
-      method: 'POST',
-      url: '/v1/api-keys',
+      method: "POST",
+      url: "/v1/api-keys",
       headers: bearer(auth),
-      payload: { name: 'CI' },
+      payload: { name: "CI" },
     });
 
     expect(created.statusCode).toBe(201);
     const body = created.json();
     expect(body).toMatchObject({
-      name: 'CI',
+      name: "CI",
       key: expect.stringMatching(/^awk_/),
       warning: expect.any(String),
     });
@@ -291,56 +310,56 @@ describe('API-key lifecycle', () => {
 
     // The plaintext is nowhere in the listing — only metadata.
     const listed = await current.app.inject({
-      method: 'GET',
-      url: '/v1/api-keys',
+      method: "GET",
+      url: "/v1/api-keys",
       headers: bearer(auth),
     });
     expect(listed.statusCode).toBe(200);
     expect(listed.body).not.toContain(issued);
     for (const summary of listed.json().apiKeys) {
-      expect(summary).not.toHaveProperty('key');
-      expect(summary).not.toHaveProperty('keyHash');
-      expect(summary).not.toHaveProperty('plaintext');
+      expect(summary).not.toHaveProperty("key");
+      expect(summary).not.toHaveProperty("keyHash");
+      expect(summary).not.toHaveProperty("plaintext");
     }
   });
 
-  it('rejects a create with an empty name as 400 in the envelope', async () => {
+  it("rejects a create with an empty name as 400 in the envelope", async () => {
     current = await makeApp();
-    const auth = await bootstrapKey(current.backend, 'tenant-a');
+    const auth = await bootstrapKey(current.backend, "tenant-a");
 
     const res = await current.app.inject({
-      method: 'POST',
-      url: '/v1/api-keys',
+      method: "POST",
+      url: "/v1/api-keys",
       headers: bearer(auth),
-      payload: { name: '   ' },
+      payload: { name: "   " },
     });
 
     expect(res.statusCode).toBe(400);
-    expect(res.json().error.code).toBe('bad_request');
+    expect(res.json().error.code).toBe("bad_request");
   });
 
-  it('revokes a key so it can no longer authenticate', async () => {
+  it("revokes a key so it can no longer authenticate", async () => {
     current = await makeApp();
-    const auth = await bootstrapKey(current.backend, 'tenant-a');
+    const auth = await bootstrapKey(current.backend, "tenant-a");
 
     const created = await current.app.inject({
-      method: 'POST',
-      url: '/v1/api-keys',
+      method: "POST",
+      url: "/v1/api-keys",
       headers: bearer(auth),
-      payload: { name: 'to-be-revoked' },
+      payload: { name: "to-be-revoked" },
     });
     const { id, key } = created.json();
 
     // The freshly created key authenticates.
     const before = await current.app.inject({
-      method: 'GET',
-      url: '/v1/api-keys',
+      method: "GET",
+      url: "/v1/api-keys",
       headers: bearer(key),
     });
     expect(before.statusCode).toBe(200);
 
     const revoked = await current.app.inject({
-      method: 'POST',
+      method: "POST",
       url: `/v1/api-keys/${id}/revoke`,
       headers: bearer(auth),
     });
@@ -348,105 +367,116 @@ describe('API-key lifecycle', () => {
 
     // The same key is now refused.
     const after = await current.app.inject({
-      method: 'GET',
-      url: '/v1/api-keys',
+      method: "GET",
+      url: "/v1/api-keys",
       headers: bearer(key),
     });
     expect(after.statusCode).toBe(401);
   });
 
-  it('never logs the plaintext key', async () => {
+  it("never logs the plaintext key", async () => {
     current = await makeApp();
-    const auth = await bootstrapKey(current.backend, 'tenant-a');
+    const auth = await bootstrapKey(current.backend, "tenant-a");
 
     const created = await current.app.inject({
-      method: 'POST',
-      url: '/v1/api-keys',
+      method: "POST",
+      url: "/v1/api-keys",
       headers: bearer(auth),
-      payload: { name: 'secret-check' },
+      payload: { name: "secret-check" },
     });
     const issued: string = created.json().key;
 
     // Provoke more log traffic: a successful list and a failed auth.
-    await current.app.inject({ method: 'GET', url: '/v1/api-keys', headers: bearer(auth) });
-    await current.app.inject({ method: 'GET', url: '/v1/api-keys', headers: bearer(issued) });
+    await current.app.inject({
+      method: "GET",
+      url: "/v1/api-keys",
+      headers: bearer(auth),
+    });
+    await current.app.inject({
+      method: "GET",
+      url: "/v1/api-keys",
+      headers: bearer(issued),
+    });
 
-    const allLogs = current.lines.join('\n');
+    const allLogs = current.lines.join("\n");
     expect(allLogs.length).toBeGreaterThan(0);
     expect(allLogs).not.toContain(issued);
     // Nor the secret half on its own.
-    expect(allLogs).not.toContain(issued.slice('awk_'.length));
+    expect(allLogs).not.toContain(issued.slice("awk_".length));
   });
 });
 
-describe('tenant isolation at the route boundary', () => {
-  it('does not show tenant A the keys of tenant B', async () => {
+describe("tenant isolation at the route boundary", () => {
+  it("does not show tenant A the keys of tenant B", async () => {
     current = await makeApp();
-    const authA = await bootstrapKey(current.backend, 'tenant-a');
-    const authB = await bootstrapKey(current.backend, 'tenant-b');
+    const authA = await bootstrapKey(current.backend, "tenant-a");
+    const authB = await bootstrapKey(current.backend, "tenant-b");
 
     await current.app.inject({
-      method: 'POST',
-      url: '/v1/api-keys',
+      method: "POST",
+      url: "/v1/api-keys",
       headers: bearer(authB),
-      payload: { name: 'tenant-b-only' },
+      payload: { name: "tenant-b-only" },
     });
 
     const listA = await current.app.inject({
-      method: 'GET',
-      url: '/v1/api-keys',
+      method: "GET",
+      url: "/v1/api-keys",
       headers: bearer(authA),
     });
     const names = listA.json().apiKeys.map((k: ApiKeySummary) => k.name);
-    expect(names).not.toContain('tenant-b-only');
+    expect(names).not.toContain("tenant-b-only");
   });
 
-  it('gives tenant A a 404 when revoking tenant B a key id', async () => {
+  it("gives tenant A a 404 when revoking tenant B a key id", async () => {
     current = await makeApp();
-    const authA = await bootstrapKey(current.backend, 'tenant-a');
-    const authB = await bootstrapKey(current.backend, 'tenant-b');
+    const authA = await bootstrapKey(current.backend, "tenant-a");
+    const authB = await bootstrapKey(current.backend, "tenant-b");
 
     const bKey = await current.app.inject({
-      method: 'POST',
-      url: '/v1/api-keys',
+      method: "POST",
+      url: "/v1/api-keys",
       headers: bearer(authB),
-      payload: { name: 'b-key' },
+      payload: { name: "b-key" },
     });
     const bId = bKey.json().id;
 
     const res = await current.app.inject({
-      method: 'POST',
+      method: "POST",
       url: `/v1/api-keys/${bId}/revoke`,
       headers: bearer(authA),
     });
 
     // Indistinguishable from a genuinely missing key: B's existence is not leaked.
     expect(res.statusCode).toBe(404);
-    expect(res.json().error.code).toBe('not_found');
+    expect(res.json().error.code).toBe("not_found");
   });
 });
 
-describe('error envelope', () => {
-  it('returns the standard envelope with a request id for an unknown route', async () => {
+describe("error envelope", () => {
+  it("returns the standard envelope with a request id for an unknown route", async () => {
     current = await makeApp();
-    const auth = await bootstrapKey(current.backend, 'tenant-a');
+    const auth = await bootstrapKey(current.backend, "tenant-a");
 
     const res = await current.app.inject({
-      method: 'GET',
-      url: '/v1/does-not-exist',
+      method: "GET",
+      url: "/v1/does-not-exist",
       headers: bearer(auth),
     });
 
     expect(res.statusCode).toBe(404);
     const body = res.json();
-    expect(body.error.code).toBe('not_found');
-    expect(typeof body.error.requestId).toBe('string');
+    expect(body.error.code).toBe("not_found");
+    expect(typeof body.error.requestId).toBe("string");
     expect(body.error.requestId.length).toBeGreaterThan(0);
   });
 
-  it('correlates the error response request id with the request log', async () => {
+  it("correlates the error response request id with the request log", async () => {
     current = await makeApp();
-    const res = await current.app.inject({ method: 'GET', url: '/v1/api-keys' });
+    const res = await current.app.inject({
+      method: "GET",
+      url: "/v1/api-keys",
+    });
 
     const requestId: string = res.json().error.requestId;
     expect(requestId.length).toBeGreaterThan(0);
@@ -456,13 +486,10 @@ describe('error envelope', () => {
     expect(logged).toBe(true);
   });
 
-  it('gives each request a distinct id', async () => {
+  it("gives each request a distinct id", async () => {
     current = await makeApp();
-    const a = await current.app.inject({ method: 'GET', url: '/v1/api-keys' });
-    const b = await current.app.inject({ method: 'GET', url: '/v1/api-keys' });
+    const a = await current.app.inject({ method: "GET", url: "/v1/api-keys" });
+    const b = await current.app.inject({ method: "GET", url: "/v1/api-keys" });
     expect(a.json().error.requestId).not.toBe(b.json().error.requestId);
   });
 });
-
-
-
