@@ -34,6 +34,8 @@ import type { JobError, ClaimedJob } from '@/domain/queue.js';
 import { resolveInput } from '@/domain/references.js';
 import { assertRunTransition } from '@/domain/run-state.js';
 import type { RunStatus } from '@/domain/run-state.js';
+import { createRetryPolicy } from '@/domain/retry-policy.js';
+import type { RetryPolicy } from '@/domain/retry-policy.js';
 import type { StepHandlerRegistry } from '@/domain/step-handler.js';
 import { parseWorkflowDefinition } from '@/domain/workflow-definition.js';
 import type { WorkflowDefinition } from '@/domain/workflow-definition.js';
@@ -41,7 +43,7 @@ import type { RunContext } from '@/domain/workflow-run.js';
 import type { TransactionalJobEnqueuer } from '@/repositories/job-queue.js';
 import { withContext } from '@/observability/logger.js';
 import type { Logger } from '@/observability/logger.js';
-import { StepFailedError } from '@/worker/dispatcher.js';
+import { StepFailedError, StepRetryError } from '@/worker/dispatcher.js';
 import type { StepDispatcher } from '@/worker/dispatcher.js';
 
 export interface WorkflowExecutorOptions {
@@ -50,12 +52,20 @@ export interface WorkflowExecutorOptions {
   readonly queue: TransactionalJobEnqueuer;
   readonly registry: StepHandlerRegistry;
   readonly logger: Logger;
+  /**
+   * The business retry policy — how long to defer a retryable failure. Injectable
+   * so tests can pin the jittered delay; defaults to the production curve.
+   */
+  readonly retryPolicy?: RetryPolicy;
+  /** The clock used to compute a retry's `run_at`. Injectable for deterministic tests. */
+  readonly now?: () => Date;
 }
 
 /** The result of processing one job, deciding how the worker settles the queue. */
 type Outcome =
   | { readonly settle: 'complete'; readonly detail: string }
-  | { readonly settle: 'fail'; readonly reason: JobError };
+  | { readonly settle: 'fail'; readonly reason: JobError }
+  | { readonly settle: 'retry'; readonly reason: JobError; readonly runAt: Date };
 
 /** Reduce any thrown value to a structured, log-safe failure reason. No stacks. */
 function toJobError(error: unknown): JobError {
@@ -78,12 +88,16 @@ export class WorkflowExecutor implements StepDispatcher {
   private readonly queue: TransactionalJobEnqueuer;
   private readonly registry: StepHandlerRegistry;
   private readonly logger: Logger;
+  private readonly retryPolicy: RetryPolicy;
+  private readonly now: () => Date;
 
   constructor(options: WorkflowExecutorOptions) {
     this.db = options.db;
     this.queue = options.queue;
     this.registry = options.registry;
     this.logger = options.logger;
+    this.retryPolicy = options.retryPolicy ?? createRetryPolicy();
+    this.now = options.now ?? (() => new Date());
   }
 
   async dispatch(job: ClaimedJob): Promise<void> {
@@ -94,6 +108,12 @@ export class WorkflowExecutor implements StepDispatcher {
       // the committed transaction). Signal the worker to fail the queue job with
       // the same reason, rather than complete it.
       throw new StepFailedError(outcome.reason);
+    }
+    if (outcome.settle === 'retry') {
+      // The attempt is recorded (step run `failed`) but the run stays `running`.
+      // Signal the worker to move the queue job back to `pending` with the
+      // computed future `run_at`, rather than settle it terminally.
+      throw new StepRetryError(outcome.reason, outcome.runAt);
     }
     // 'complete': the worker marks the job done. Nothing more to do here.
   }
@@ -123,6 +143,7 @@ export class WorkflowExecutor implements StepDispatcher {
       job_id: job.id,
       step_key: job.stepKey,
       attempt: job.attempt,
+      retry_count: job.retryCount,
       worker_id: job.lockedBy,
     });
 
@@ -195,6 +216,13 @@ export class WorkflowExecutor implements StepDispatcher {
     // guarantee the run is non-terminal, so this cannot illegally jump states.
     assertRunTransition(run.status as RunStatus, 'running');
 
+    // The audit ordinal for this execution's `workflow_step_runs` row. It sums
+    // both counters so every physical execution — whether reached by crash
+    // recovery (`attempt`) or business retry (`retry_count`) — gets a distinct,
+    // monotonic number, keeping the "one success per (run, step, attempt)" index
+    // meaningful across the full retry history.
+    const stepRunAttempt = job.attempt + job.retryCount;
+
     const context = new ExecutionContext(run.context as unknown as RunContext);
     const startedAt = new Date();
 
@@ -210,7 +238,7 @@ export class WorkflowExecutor implements StepDispatcher {
         runId: job.runId,
         stepKey: step.key,
         stepType: step.type,
-        attempt: job.attempt,
+        attempt: stepRunAttempt,
         status: 'failed',
         error: reason,
         startedAt,
@@ -230,7 +258,7 @@ export class WorkflowExecutor implements StepDispatcher {
         runId: job.runId,
         stepKey: step.key,
         stepType: step.type,
-        attempt: job.attempt,
+        attempt: stepRunAttempt,
         status: 'running',
         input,
         startedAt,
@@ -253,8 +281,8 @@ export class WorkflowExecutor implements StepDispatcher {
         stepRunId,
       });
     } catch (error) {
-      // A business failure: the step ran and failed deterministically. Record it
-      // and mark the run failed — committed with this transaction.
+      // A step failure. Record the attempt durably (the step run row becomes
+      // `failed`) regardless of what happens next.
       const reason = toJobError(error);
       const finishedAt = new Date();
       await tx
@@ -266,6 +294,37 @@ export class WorkflowExecutor implements StepDispatcher {
           durationMs: finishedAt.getTime() - startedAt.getTime(),
         })
         .where(eq(workflowStepRuns.id, stepRunId));
+
+      // Retry decision: a *retryable* failure with remaining business budget is
+      // deferred, not failed. The run stays `running` (we do NOT call
+      // markRunFailed), and the queue job is moved back to `pending` with a
+      // future `run_at` computed from the retry policy. Everything else — an
+      // unretryable failure, or a retryable one whose budget is exhausted — is a
+      // terminal failure of the run.
+      if (reason.retryable === true && job.retryCount < job.maxAttempts) {
+        const delayMs = this.retryPolicy.backoffMs(job.retryCount);
+        const runAt = new Date(this.now().getTime() + delayMs);
+        stepLog.warn(
+          {
+            reason: reason.code,
+            retry_count: job.retryCount,
+            max_attempts: job.maxAttempts,
+            delay_ms: Math.round(delayMs),
+            next_run_at: runAt.toISOString(),
+          },
+          'step_retry_scheduled',
+        );
+        return { settle: 'retry', reason, runAt };
+      }
+
+      if (reason.retryable === true) {
+        // Retryable, but the budget is spent: this is now a terminal failure.
+        stepLog.warn(
+          { reason: reason.code, retry_count: job.retryCount, max_attempts: job.maxAttempts },
+          'step_retry_exhausted',
+        );
+      }
+
       await this.markRunFailed(tx, job, run, context.snapshot(), reason);
       stepLog.warn({ reason: reason.code }, 'step_failed');
       stepLog.error({ reason: reason.code }, 'run_failed');

@@ -440,6 +440,7 @@ describe('jobs', () => {
       'run_id',
       'step_key',
       'attempt',
+      'retry_count',
       'max_attempts',
       'status',
       'run_at',
@@ -463,6 +464,12 @@ describe('jobs', () => {
     expect(maxAttempts.getSQLType()).toBe('integer');
     expect(maxAttempts.notNull).toBe(true);
     expect(maxAttempts.hasDefault).toBe(true);
+
+    // The business retry counter, independent of `attempt` (crash recovery).
+    const retryCount = column(jobs, 'retry_count');
+    expect(retryCount.getSQLType()).toBe('integer');
+    expect(retryCount.notNull).toBe(true);
+    expect(retryCount.hasDefault).toBe(true);
 
     // Ready to run immediately unless deferred.
     expect(column(jobs, 'run_at').hasDefault).toBe(true);

@@ -135,6 +135,7 @@ export class PostgresJobQueue implements Queue, TransactionalJobEnqueuer {
         runId: claimed.runId,
         stepKey: claimed.stepKey,
         attempt: claimed.attempt,
+        retryCount: claimed.retryCount,
         maxAttempts: claimed.maxAttempts,
         lockedBy: workerId,
         leaseExpiresAt,
@@ -160,6 +161,29 @@ export class PostgresJobQueue implements Queue, TransactionalJobEnqueuer {
       .returning({ id: jobs.id });
 
     if (updated.length === 0) throw new InvalidJobTransitionError(jobId, 'failed');
+  }
+
+  async retry(jobId: string, error: JobError, runAt: Date): Promise<void> {
+    // running → pending, deferred until `runAt`, business retry counter bumped,
+    // lease cleared. The `status = 'running'` guard makes this a no-op on a lost
+    // race (e.g. the reaper requeued the row first): the UPDATE matches nothing
+    // and we surface an illegal transition rather than silently double-scheduling.
+    // `attempt` is deliberately untouched — that counter belongs to crash
+    // recovery, not business retries.
+    const updated = await this.db
+      .update(jobs)
+      .set({
+        status: 'pending',
+        lastError: error,
+        runAt,
+        retryCount: sql`${jobs.retryCount} + 1`,
+        lockedBy: null,
+        leaseExpiresAt: null,
+      })
+      .where(and(eq(jobs.id, jobId), eq(jobs.status, 'running'), ...this.tenantScoped()))
+      .returning({ id: jobs.id });
+
+    if (updated.length === 0) throw new InvalidJobTransitionError(jobId, 'retried');
   }
 
   async requeueExpired(): Promise<number> {

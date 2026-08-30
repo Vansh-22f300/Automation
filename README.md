@@ -25,8 +25,10 @@ an LLM, calling external tools, and keeping a durable audit trail of every step.
 > tool executor with the trusted connection bound entirely on the platform side.
 > **OAuth is not implemented** (the Slack app is installed manually in development
 > and its bot token stored as an encrypted connection), there is still only one
-> connector, **no retries/backoff** (Step 11), and no autonomous multi-step agent
-> loop beyond the bounded per-step tool rounds.
+> connector, and no autonomous multi-step agent loop beyond the bounded per-step
+> tool rounds. **Durable business retries with equal-jitter backoff now exist**
+> (Step 11), though external side effects remain **at-least-once** — a crash or
+> retry after a tool has already acted can repeat that action.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -212,10 +214,11 @@ against the `jobs` table:
 - a **claim loop** that takes one ready job at a time with `SELECT … FOR UPDATE
   SKIP LOCKED` inside a short transaction, stamps this worker's instance id and a
   five-minute lease on it, checks the job's run still exists, and hands it to a
-  dispatcher — logging `job_claimed`, then `job_completed` or `job_failed`;
+  dispatcher — logging `job_claimed`, then `job_completed`, `job_failed`, or
+  `job_retry_scheduled` when a retryable step failure defers the job;
 - a **reaper** that periodically returns jobs whose lease has expired to `pending`
-  (incrementing `attempt`), so a job held by a crashed worker is never lost —
-  logging `job_requeued` when it recovers any.
+  (incrementing `attempt`, **never** the business `retry_count`), so a job held by
+  a crashed worker is never lost — logging `job_requeued` when it recovers any.
 
 Two workers can run at once without ever claiming the same job; that guarantee is
 PostgreSQL's, via `FOR UPDATE SKIP LOCKED`, not the application's.
@@ -226,7 +229,9 @@ PostgreSQL's, via `FOR UPDATE SKIP LOCKED`, not the application's.
 > `workflow_step_runs` row, updates the run's context and status, and either
 > enqueues the single next step's job or finishes the run — atomically. A step
 > failure marks the step run and the run `failed`, enqueues nothing, and fails the
-> queue job (no retries yet — that is Step 11). A redelivered job for a run that
+> queue job; a **retryable** failure with business budget remaining instead records
+> the failed attempt and defers the same job (Step 11 — see [Current status](#current-status)).
+> A redelivered job for a run that
 > has already advanced (or finished) does no work. The engine runs the version the
 > run pinned at creation, never the currently-active one, and scopes every
 > statement to the job's tenant. Two step types are registered: `noop` and `llm`
@@ -646,7 +651,7 @@ definition as a single immutable versioned value.
 | `workflow_versions` | An immutable snapshot of the logic | `definition` jsonb, trigger config, version number. |
 | `events` | A raw external signal captured at the webhook boundary | `source`, `dedupe_key`, `payload` jsonb, `received_at`. Idempotent per `(tenant_id, source, dedupe_key)`. |
 | `workflow_runs` | One execution of a workflow, born from an event | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. Advanced one step per job by the execution engine. |
-| `jobs` | A unit of durable work advancing a run's step | `step_key`, `attempt`/`max_attempts`, `status` (`pending`→`running`→`done`/`failed`), `run_at`, `locked_by` + `lease_expires_at` (the lease), `last_error`. Claimed with `FOR UPDATE SKIP LOCKED`. |
+| `jobs` | A unit of durable work advancing a run's step | `step_key`, `attempt` (crash/lease recovery) / `retry_count` (business retries) / `max_attempts` (business budget), `status` (`pending`→`running`→`done`/`failed`), `run_at` (a retry's future defer lives here), `locked_by` + `lease_expires_at` (the lease), `last_error`. Claimed with `FOR UPDATE SKIP LOCKED`. |
 | `workflow_step_runs` | One executed step of a run | Records the step's `status`, `output` jsonb and error, one row per step the engine advances. Composite tenant-safe FK to its run. |
 | `llm_usage` | Token/latency accounting for one provider round of an `llm` step | `provider`, `model`, `round`, `input_tokens`/`output_tokens`/`total_tokens`, `latency_ms`. Written atomically with the step-run settle; `UNIQUE(step_run_id, round)`. A no-tools step meters one round; a tool-calling step meters one row per request→execute round. Metadata only — never the prompt, output or credential. |
 | `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
@@ -758,7 +763,16 @@ concurrently never receive the same job and each gets a distinct one when severa
 are ready (the `SKIP LOCKED` guarantee), that `complete`/`fail` reject illegal
 transitions and a terminal job is never re-claimed, that the reaper requeues an
 expired-lease job and increments its attempt while leaving live leases alone, and
-that a tenant-scoped queue can neither claim nor mutate another tenant's jobs.
+that a tenant-scoped queue can neither claim nor mutate another tenant's jobs. For
+**retries** (Step 11) they prove — in pure unit tests for the equal-jitter policy,
+and against real PostgreSQL for the queue and engine — that `retry` moves a running
+job back to `pending` with a future `run_at` while bumping `retry_count` (never
+`attempt`), that a deferred job is unclaimable until its `run_at` elapses, that
+crash recovery via the reaper never spends the business budget, that the retry vs.
+reaper race is safe (whoever loses the guarded UPDATE does nothing), that the engine
+schedules a retry (leaving the run non-terminal) then exhausts the budget into a
+terminal failure across the right number of attempts, and that a `PermanentError`
+never retries.
 For the **`llm` step end-to-end** they drive the real execution engine with a fake
 provider against PostgreSQL: an `llm` step succeeds and writes exactly one
 `llm_usage` row, `llm` composes with `noop` steps in a run, the pinned version is
@@ -769,7 +783,7 @@ refuse to run unless the database name contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–10)
+### Implemented (Steps 1–11)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -951,6 +965,32 @@ refuse to run unless the database name contains `test`.
   Slack); an optional, credential-gated `pnpm llm:tool-smoke` confirms the real
   Claude→Slack path. **No retries** (Step 11), one connector, no OAuth, no MCP, and
   no autonomous agent loop beyond a step's bounded rounds.
+- **Retries, backoff & failure recovery (Step 11)** — a step failure is no longer
+  automatically terminal. The engine distinguishes two independent counters and one
+  budget on `jobs`: `attempt` (crash/lease recovery, owned by the reaper),
+  `retry_count` (business retries), and `max_attempts` (the business budget). When a
+  handler raises a **`RetryableError`** and `retry_count < max_attempts`, the engine
+  records the failed `workflow_step_runs` attempt, leaves the run **non-terminal and
+  untouched** (never marked `failed`), and the worker moves the same queue job back
+  to `pending` with a future `run_at` — so the deferral is **fully durable** (no
+  `sleep`/`setTimeout`/in-memory loop; the wait lives on the row and is enforced by
+  claim's `run_at <= now()` predicate). The delay is **equal-jitter** exponential
+  backoff (`raw = min(baseMs·factor^retry_count, maxDelayMs)`, `delay = raw/2 +
+  rand·raw/2`; defaults 1s base, ×2, 5min cap, budget 5), pure and injectable
+  ([`retry-policy.ts`](src/domain/retry-policy.ts)). A **`PermanentError`**, or a
+  retryable one whose budget is spent, fails the run terminally on that attempt.
+  Crucially the two counters never cross-contaminate: the reaper's crash recovery
+  bumps only `attempt` (never spending business budget), and a business retry bumps
+  only `retry_count` — the `workflow_step_runs` audit ordinal is their sum, keeping
+  the "one success per (run, step, attempt)" index valid across the whole retry
+  history. The retry vs. reaper race is safe (a guarded `WHERE status = 'running'`
+  UPDATE: whoever loses matches no row and does nothing). Provider SDK retries stay
+  disabled (`maxRetries: 0`) — retry policy belongs to this durable queue/worker
+  layer, not the vendor client. **Known limitation:** external side effects are
+  **at-least-once** — the tool-execution idempotency ledger is deferred, so a crash
+  or retry after a tool (e.g. a Slack post) has already acted can repeat that action;
+  `SlackConnector` adds no idempotency key in this step. New logs: `step_retry_scheduled`,
+  `step_retry_exhausted`, `job_retry_scheduled`. Migration `0009` adds `jobs.retry_count`.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -995,26 +1035,28 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 | Area | Arrives in |
 | --- | --- |
 | Additional connectors (Gmail, GitHub, …), OAuth onboarding | later steps / not scheduled |
-| Retry policy and backoff | Step 11 |
 | Run inspection endpoints and log redaction | Step 12 |
 | Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
+| Tool-execution idempotency ledger (exactly-once external effects) | deferred — external effects are at-least-once until then |
 | HMAC / provider signature verification on webhooks | before production webhooks |
 | Agent loops, autonomous multi-step agents, MCP, RAG / embeddings, prompt caching, streaming, model training / fine-tuning, any frontend | not scheduled |
 
 The tool / connector foundation (Step 9A), the first concrete connector — **Slack**
-(Step 9B) — and **tool calling wired into Claude** (Step 10) now exist: the
-`connections` table, credential encryption, the tool registry and executor, a
-`send_slack_message` tool over `chat.postMessage`, and an `llm` step that can offer
-those tools to the model and execute the ones it requests. What does **not** exist
-yet: any other provider, OAuth onboarding, retries/backoff (Step 11), and any
-autonomous agent loop beyond a single step's bounded tool rounds. A generic
+(Step 9B) — **tool calling wired into Claude** (Step 10), and **durable business
+retries with equal-jitter backoff** (Step 11) now exist: the `connections` table,
+credential encryption, the tool registry and executor, a `send_slack_message` tool
+over `chat.postMessage`, an `llm` step that can offer those tools to the model and
+execute the ones it requests, and a retry/backoff layer that defers retryable
+failures durably on the job row. What does **not** exist yet: any other provider,
+OAuth onboarding, a tool-execution idempotency ledger (so external effects are
+**at-least-once** — a retry after a tool acted can repeat it), and any autonomous
+agent loop beyond a single step's bounded tool rounds. A generic
 `audit_log` table is deliberately still absent — the structured, metadata-only
 execution record and logging stand in until the code that proves an audit schema
 necessary arrives.
 
-**Up next is Step 11** — a retry policy and backoff for the retryable failures the
-taxonomy already classifies but never acts on. Run-inspection endpoints (Step 12)
-and production hardening (Step 13) follow. Each step is implemented, verified and
+**Up next is Step 12** — run-inspection endpoints and log redaction, followed by
+production hardening (Step 13). Each step is implemented, verified and
 paused for review before the next begins.
 
 Explicitly out of scope for the MVP entirely: OAuth flows, billing, a visual

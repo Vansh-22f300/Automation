@@ -524,10 +524,14 @@ export const workflowRuns = pgTable(
  *   job is lost to a crashed process. The structure (a `locked_by` and an
  *   expiry) is deliberately the shape a heartbeat/renewal would extend later,
  *   without a schema change.
- * - **`attempt` / `max_attempts`** count executions. `attempt` increments as a
- *   job is retried; `max_attempts` is stored now so the retry policy (a later
- *   step) has somewhere to read its ceiling from. Nothing enforces the ceiling
- *   yet — that is the retry policy's job, not the queue's.
+ * - **`attempt` / `retry_count` / `max_attempts`** are two independent counters
+ *   and one budget. `attempt` is lease/crash recovery — the reaper increments it
+ *   when it returns an expired-lease job to `pending`. `retry_count` is business
+ *   retries — the worker increments it (via the queue's `retry`) when a step
+ *   fails with a *retryable* error and budget remains. `max_attempts` is the
+ *   business retry budget: a job is retried while `retry_count < max_attempts`.
+ *   Keeping the two counters separate means a crashed worker never consumes a
+ *   step's retry budget, and a flaky step never looks like a crash.
  * - **`last_error`** keeps the most recent structured failure for inspection,
  *   never a raw stack destined for a client.
  *
@@ -549,9 +553,22 @@ export const jobs = pgTable(
     runId: uuid('run_id').notNull(),
     /** Which step of the run's definition this job executes. */
     stepKey: text('step_key').notNull(),
-    /** How many times execution has been attempted. Starts at 0. */
+    /**
+     * Lease/crash-recovery count: how many times the reaper has returned this
+     * job to `pending` after its worker died holding the lease. Starts at 0.
+     * NOT the business retry count — a crash is not the step's fault, so this
+     * never consumes the retry budget.
+     */
     attempt: integer('attempt').notNull().default(0),
-    /** The ceiling the retry policy (a later step) will enforce. */
+    /**
+     * Business retry count: how many times a *retryable* step failure has
+     * deferred this job for another attempt. Starts at 0 and is compared against
+     * `max_attempts` to decide whether budget remains. Distinct from `attempt`
+     * so infrastructure crashes and classified transient failures never
+     * cross-contaminate.
+     */
+    retryCount: integer('retry_count').notNull().default(0),
+    /** The business retry budget: a job may be retried while `retry_count < max_attempts`. */
     maxAttempts: integer('max_attempts').notNull().default(5),
     status: jobStatus('status').notNull().default('pending'),
     /** The earliest instant this job may be claimed. Now, for an immediate job. */

@@ -27,6 +27,12 @@ export interface ClaimedJob {
   readonly stepKey: string;
   /** The attempt number this claim represents (0 for a job's first execution). */
   readonly attempt: number;
+  /**
+   * How many business retries this job has already consumed (0 before its first
+   * retryable failure). Compared against `maxAttempts` to decide whether budget
+   * remains. Distinct from `attempt`, which counts lease/crash recovery.
+   */
+  readonly retryCount: number;
   readonly maxAttempts: number;
   /** The worker instance that now holds the lease — this worker. */
   readonly lockedBy: string;
@@ -77,6 +83,17 @@ export interface Queue {
    * not `running`. Terminal: a failed job is not re-claimed automatically.
    */
   fail(jobId: string, error: JobError): Promise<void>;
+
+  /**
+   * Move a `running` job back to `pending` for a *business* retry: record
+   * `error`, defer the job until `runAt`, increment `retry_count`, and clear the
+   * lease. Rejects if the job is not `running`. This is how a retryable step
+   * failure with remaining budget is scheduled durably — the deferral lives on
+   * the row, enforced by `claim`'s `run_at <= now()` predicate, so a crash
+   * during the wait loses nothing. Does NOT touch `attempt` (crash recovery is
+   * the reaper's counter, not this one).
+   */
+  retry(jobId: string, error: JobError, runAt: Date): Promise<void>;
 
   /**
    * Return every `running` job whose lease has expired to `pending`, clearing

@@ -114,6 +114,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres job queue integration
       expect(job).toBeDefined();
       expect(job!.status).toBe('pending');
       expect(job!.attempt).toBe(0);
+      expect(job!.retryCount).toBe(0);
       expect(job!.maxAttempts).toBe(5);
       expect(job!.lockedBy).toBeNull();
       expect(job!.leaseExpiresAt).toBeNull();
@@ -241,6 +242,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres job queue integration
       const job = await jobById(id);
       expect(job!.status).toBe('pending');
       expect(job!.attempt).toBe(1);
+      // Crash recovery must NOT consume the business retry budget.
+      expect(job!.retryCount).toBe(0);
       expect(job!.lockedBy).toBeNull();
       expect(job!.leaseExpiresAt).toBeNull();
     });
@@ -252,6 +255,111 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres job queue integration
 
       await expect(q.requeueExpired()).resolves.toBe(0);
       expect((await jobById(id))!.status).toBe('running');
+    });
+  });
+
+  describe('retry (business retries)', () => {
+    it('moves a running job back to pending with a future run_at, bumping retry_count and not attempt', async () => {
+      const q = queueFor();
+      const { id } = await q.enqueue({ tenantId: tenantA, runId: runA, stepKey: 'first' });
+      await q.claim('worker-1');
+
+      const runAt = new Date(Date.now() + 60_000);
+      await q.retry(id, { code: 'llm_rate_limited', message: 'slow down', retryable: true }, runAt);
+
+      const job = await jobById(id);
+      expect(job!.status).toBe('pending');
+      expect(job!.retryCount).toBe(1);
+      expect(job!.attempt).toBe(0); // business retry never touches crash-recovery count
+      expect(job!.lastError).toEqual({ code: 'llm_rate_limited', message: 'slow down', retryable: true });
+      expect(job!.lockedBy).toBeNull();
+      expect(job!.leaseExpiresAt).toBeNull();
+      expect(job!.runAt.getTime()).toBeGreaterThan(Date.now() + 30_000);
+    });
+
+    it('defers the retried job until its run_at, then makes it claimable', async () => {
+      const q = queueFor();
+      const { id } = await q.enqueue({ tenantId: tenantA, runId: runA, stepKey: 'first' });
+      await q.claim('worker-1');
+
+      // Retry comfortably into the future: not claimable now.
+      await q.retry(id, { code: 'llm_timeout', retryable: true }, new Date(Date.now() + 60_000));
+      await expect(queueFor().claim('worker-2')).resolves.toBeNull();
+
+      // Once run_at has elapsed (simulated by moving it into the past), the same
+      // job is claimable again, still carrying its bumped retry_count. claim gates
+      // only on run_at <= now, so this proves the deferral is purely durable.
+      await handle.db.update(jobs).set({ runAt: new Date(Date.now() - 1) }).where(eq(jobs.id, id));
+      const reclaimed = await queueFor().claim('worker-2');
+      expect(reclaimed!.id).toBe(id);
+      expect(reclaimed!.retryCount).toBe(1);
+    });
+
+    it('only retries a running job — pending or terminal jobs are rejected', async () => {
+      const q = queueFor();
+      const { id } = await q.enqueue({ tenantId: tenantA, runId: runA, stepKey: 'first' });
+
+      // pending → retry is illegal (never claimed).
+      await expect(q.retry(id, { code: 'x' }, new Date())).rejects.toBeInstanceOf(
+        InvalidJobTransitionError,
+      );
+
+      await q.claim('worker-1');
+      await q.complete(id);
+      // done → retry is illegal.
+      await expect(q.retry(id, { code: 'x' }, new Date())).rejects.toBeInstanceOf(
+        InvalidJobTransitionError,
+      );
+    });
+
+    it('accumulates retry_count across successive business retries, independent of attempt', async () => {
+      const q = queueFor();
+      const { id } = await q.enqueue({ tenantId: tenantA, runId: runA, stepKey: 'first' });
+
+      // Two claim→retry cycles; run_at in the past so it is immediately re-claimable.
+      for (let i = 0; i < 2; i += 1) {
+        const claimed = await queueFor().claim('worker-1');
+        expect(claimed!.id).toBe(id);
+        await q.retry(id, { code: 'llm_rate_limited', retryable: true }, new Date(Date.now() - 1));
+      }
+
+      const job = await jobById(id);
+      expect(job!.retryCount).toBe(2);
+      expect(job!.attempt).toBe(0);
+    });
+
+    it('a tenant-scoped queue cannot retry another tenant’s job', async () => {
+      const { id } = await queueFor().enqueue({ tenantId: tenantA, runId: runA, stepKey: 'first' });
+      await queueFor().claim('worker-1'); // running
+
+      await expect(
+        queueFor(tenantB).retry(id, { code: 'x' }, new Date(Date.now() + 1_000)),
+      ).rejects.toBeInstanceOf(InvalidJobTransitionError);
+      expect((await jobById(id))!.status).toBe('running');
+      expect((await jobById(id))!.retryCount).toBe(0);
+    });
+
+    it('is safe against a reaper race: once the reaper requeues the job, retry is rejected and nothing double-counts', async () => {
+      // A 1ms lease so the reaper reclaims the job almost immediately.
+      const shortLease = new PostgresJobQueue(handle.db, { leaseDurationMs: 1 });
+      const { id } = await shortLease.enqueue({ tenantId: tenantA, runId: runA, stepKey: 'first' });
+      await shortLease.claim('worker-dead');
+
+      await sleep(20);
+      // The reaper wins the race: running → pending, attempt incremented.
+      expect(await queueFor().requeueExpired()).toBeGreaterThanOrEqual(1);
+
+      // The worker (which was mid-dispatch) now tries to schedule a business retry.
+      // The job is no longer `running`, so the guarded UPDATE matches nothing.
+      await expect(
+        queueFor().retry(id, { code: 'llm_timeout', retryable: true }, new Date(Date.now() + 1_000)),
+      ).rejects.toBeInstanceOf(InvalidJobTransitionError);
+
+      // The reaper's recovery stands; the business retry did not also apply.
+      const job = await jobById(id);
+      expect(job!.status).toBe('pending');
+      expect(job!.attempt).toBe(1);
+      expect(job!.retryCount).toBe(0);
     });
   });
 

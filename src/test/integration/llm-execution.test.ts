@@ -288,6 +288,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('llm workflow step integration'
       runId,
       stepKey: 'classify',
       attempt: 0,
+      retryCount: 0,
       maxAttempts: 5,
       lockedBy: 'worker-test',
       leaseExpiresAt: new Date(Date.now() + 60_000),

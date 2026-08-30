@@ -26,8 +26,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { parseEnv } from '@/config/env.js';
 import type { DatabaseHandle } from '@/db/client.js';
 import { events, jobs, tenants, workflowRuns, workflowStepRuns } from '@/db/schema.js';
-import { PermanentError } from '@/domain/errors.js';
+import { PermanentError, RetryableError } from '@/domain/errors.js';
 import type { ClaimedJob } from '@/domain/queue.js';
+import type { RetryPolicy } from '@/domain/retry-policy.js';
+import { DEFAULT_RETRY_POLICY } from '@/domain/retry-policy.js';
 import { StepHandlerRegistry, defaultStepHandlerRegistry } from '@/domain/step-handler.js';
 import { createLogger } from '@/observability/logger.js';
 import { WorkflowExecutor } from '@/repositories/execution-engine.js';
@@ -35,7 +37,7 @@ import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
-import { StepFailedError } from '@/worker/dispatcher.js';
+import { StepFailedError, StepRetryError } from '@/worker/dispatcher.js';
 
 import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
 
@@ -57,6 +59,19 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
 
   const executorWith = (registry: StepHandlerRegistry) =>
     new WorkflowExecutor({ db: handle.db, queue: new PostgresJobQueue(handle.db), registry, logger: silent() });
+
+  // An executor whose retry backoff is zero, so a retried job's `run_at` is "now"
+  // and it is immediately re-claimable — letting a test drive several business
+  // retries deterministically without waiting out a real backoff.
+  const immediateRetryPolicy: RetryPolicy = { config: DEFAULT_RETRY_POLICY, backoffMs: () => 0 };
+  const executorRetrying = (registry: StepHandlerRegistry) =>
+    new WorkflowExecutor({
+      db: handle.db,
+      queue: new PostgresJobQueue(handle.db),
+      registry,
+      logger: silent(),
+      retryPolicy: immediateRetryPolicy,
+    });
 
   const runById = async (runId: string) => {
     const [row] = await handle.db.select().from(workflowRuns).where(eq(workflowRuns.id, runId));
@@ -95,7 +110,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
    * Mirror the worker's settlement for exactly one job: claim, dispatch, then
    * complete on success or fail on a StepFailedError. Returns how it settled.
    */
-  const processOne = async (executor: WorkflowExecutor): Promise<'done' | 'failed' | 'empty'> => {
+  const processOne = async (executor: WorkflowExecutor): Promise<'done' | 'failed' | 'retried' | 'empty'> => {
     const job = await queue().claim('worker-test');
     if (job === null) return 'empty';
     try {
@@ -107,6 +122,10 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
         await queue().fail(job.id, error.reason);
         return 'failed';
       }
+      if (error instanceof StepRetryError) {
+        await queue().retry(job.id, error.reason, error.runAt);
+        return 'retried';
+      }
       throw error;
     }
   };
@@ -115,6 +134,15 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
     const registry = new StepHandlerRegistry();
     registry.register('noop', {
       execute: () => Promise.reject(new PermanentError('step_blew_up', 'deliberate handler failure')),
+    });
+    return registry;
+  };
+
+  /** A registry whose handler always fails *retryably* — the retry path's fixture. */
+  const retryableRegistry = (): StepHandlerRegistry => {
+    const registry = new StepHandlerRegistry();
+    registry.register('noop', {
+      execute: () => Promise.reject(new RetryableError('llm_rate_limited', 'slow down')),
     });
     return registry;
   };
@@ -263,6 +291,81 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
     });
   });
 
+  describe('retry behaviour (Step 11: durable business retries)', () => {
+    it('a retryable failure schedules a retry, leaves the run running, and marks no failure', async () => {
+      const { runId } = await seed(tenantA, 'retry-once', 'first', 'second');
+
+      // A retryable handler failure with budget remaining → the job is retried.
+      expect(await processOne(executorRetrying(retryableRegistry()))).toBe('retried');
+
+      // The run is NOT failed. The retry path records the failed attempt but never
+      // touches the run row, so a first-attempt run is simply left as it was — still
+      // non-terminal (`queued`), on the same step, unfinished, no error — ready for
+      // the deferred attempt to resume it.
+      const run = await runById(runId);
+      expect(run!.status).toBe('queued');
+      expect(run!.currentStepKey).toBe('first');
+      expect(run!.finishedAt).toBeNull();
+      expect(run!.error).toBeNull();
+
+      // The attempt is recorded as a failed step run (append-only history).
+      const stepRuns = await stepRunsFor(runId);
+      expect(stepRuns).toHaveLength(1);
+      expect(stepRuns[0]!.status).toBe('failed');
+      expect(stepRuns[0]!.error).toMatchObject({ code: 'llm_rate_limited', retryable: true });
+
+      // The job went back to pending with a bumped business retry count, and no
+      // *extra* job was enqueued — it is the same job, deferred.
+      const [job] = await handle.db.select().from(jobs).where(eq(jobs.runId, runId));
+      expect(job!.status).toBe('pending');
+      expect(job!.retryCount).toBe(1);
+      expect(job!.attempt).toBe(0);
+      expect(await pendingJobsFor(runId)).toHaveLength(1);
+    });
+
+    it('exhausts the business budget and then fails the run terminally', async () => {
+      const { runId } = await seed(tenantA, 'retry-exhaust', 'first');
+      // Shrink the budget to keep the loop short: two retries, then terminal.
+      await handle.db.update(jobs).set({ maxAttempts: 2 }).where(eq(jobs.runId, runId));
+
+      const executor = executorRetrying(retryableRegistry());
+      // retry_count 0 < 2 → retried; 1 < 2 → retried; 2 < 2 is false → failed.
+      expect(await processOne(executor)).toBe('retried');
+      expect(await processOne(executor)).toBe('retried');
+      expect(await processOne(executor)).toBe('failed');
+
+      const run = await runById(runId);
+      expect(run!.status).toBe('failed');
+      expect(run!.error).toMatchObject({ code: 'llm_rate_limited' });
+
+      const [job] = await handle.db.select().from(jobs).where(eq(jobs.runId, runId));
+      expect(job!.status).toBe('failed');
+      expect(job!.retryCount).toBe(2);
+
+      // Three physical executions, each its own failed step run with a distinct,
+      // monotonic attempt ordinal (attempt + retry_count = 0, 1, 2).
+      const stepRuns = await stepRunsFor(runId);
+      expect(stepRuns).toHaveLength(3);
+      expect(stepRuns.every((s) => s.status === 'failed')).toBe(true);
+      expect(stepRuns.map((s) => s.attempt).sort()).toEqual([0, 1, 2]);
+    });
+
+    it('never retries a permanent failure — terminal on the first attempt', async () => {
+      const { runId } = await seed(tenantA, 'retry-permanent', 'first');
+
+      // A permanent failure, even through the retrying executor, fails at once.
+      expect(await processOne(executorRetrying(throwingRegistry()))).toBe('failed');
+
+      const run = await runById(runId);
+      expect(run!.status).toBe('failed');
+
+      const [job] = await handle.db.select().from(jobs).where(eq(jobs.runId, runId));
+      expect(job!.status).toBe('failed');
+      expect(job!.retryCount).toBe(0); // budget untouched: retrying could not help
+      expect(await stepRunsFor(runId)).toHaveLength(1);
+    });
+  });
+
   describe('idempotency under at-least-once redelivery', () => {
     it('a redelivered job for an already-advanced run does no work', async () => {
       const { runId } = await seed(tenantA, 'redeliver', 'first', 'second');
@@ -283,6 +386,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
         runId,
         stepKey: 'first',
         attempt: 0,
+        retryCount: 0,
         maxAttempts: 5,
         lockedBy: 'worker-test',
         leaseExpiresAt: new Date(Date.now() + 60_000),
@@ -306,6 +410,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
         runId,
         stepKey: 'first',
         attempt: 0,
+        retryCount: 0,
         maxAttempts: 5,
         lockedBy: 'worker-test',
         leaseExpiresAt: new Date(Date.now() + 60_000),

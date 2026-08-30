@@ -64,6 +64,13 @@
       "when": 1788097538325,
       "tag": "0008_special_zeigeist",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788102537833,
+      "tag": "0009_kind_bullseye",
+      "breakpoints": true
     }
   ]
 }

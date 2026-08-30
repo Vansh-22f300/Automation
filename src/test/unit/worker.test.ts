@@ -20,7 +20,7 @@ import pino from 'pino';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ClaimedJob, EnqueueInput, JobError, Queue } from '@/domain/queue.js';
-import { StepExecutionNotImplementedError, StepFailedError, UnimplementedStepDispatcher } from '@/worker/dispatcher.js';
+import { StepExecutionNotImplementedError, StepFailedError, StepRetryError, UnimplementedStepDispatcher } from '@/worker/dispatcher.js';
 import type { StepDispatcher } from '@/worker/dispatcher.js';
 import { Worker } from '@/worker/worker.js';
 
@@ -32,6 +32,7 @@ const claimedJob = (overrides: Partial<ClaimedJob> = {}): ClaimedJob => ({
   runId: 'run-1',
   stepKey: 'first',
   attempt: 0,
+  retryCount: 0,
   maxAttempts: 5,
   lockedBy: 'worker-test',
   leaseExpiresAt: new Date(Date.now() + 60_000),
@@ -43,6 +44,7 @@ class FakeQueue implements Queue {
   private readonly pending: ClaimedJob[];
   readonly completed: string[] = [];
   readonly failed: Array<{ id: string; error: JobError }> = [];
+  readonly retried: Array<{ id: string; error: JobError; runAt: Date }> = [];
   claimedBy: string[] = [];
 
   constructor(pending: ClaimedJob[] = []) {
@@ -65,6 +67,11 @@ class FakeQueue implements Queue {
 
   fail(jobId: string, error: JobError): Promise<void> {
     this.failed.push({ id: jobId, error });
+    return Promise.resolve();
+  }
+
+  retry(jobId: string, error: JobError, runAt: Date): Promise<void> {
+    this.retried.push({ id: jobId, error, runAt });
     return Promise.resolve();
   }
 
@@ -160,6 +167,27 @@ describe('Worker.pollOnce', () => {
     expect(queue.failed).toHaveLength(1);
     expect(queue.failed[0]!.id).toBe('job-1');
     expect(queue.failed[0]!.error).toEqual(reason);
+    await worker.stop();
+  });
+
+  it('retries a job — never completes or fails it — when the engine signals a retry', async () => {
+    const queue = new FakeQueue([claimedJob({ retryCount: 1 })]);
+    const reason = { code: 'llm_rate_limited', message: 'slow down', retryable: true };
+    const runAt = new Date(Date.now() + 4_000);
+    const worker = makeWorker(queue, {
+      dispatcher: { dispatch: () => Promise.reject(new StepRetryError(reason, runAt)) },
+    });
+    worker.start();
+
+    await worker.pollOnce();
+
+    // A retried job is neither completed nor failed — it goes back to pending.
+    expect(queue.completed).toEqual([]);
+    expect(queue.failed).toEqual([]);
+    expect(queue.retried).toHaveLength(1);
+    expect(queue.retried[0]!.id).toBe('job-1');
+    expect(queue.retried[0]!.error).toEqual(reason);
+    expect(queue.retried[0]!.runAt).toEqual(runAt);
     await worker.stop();
   });
 

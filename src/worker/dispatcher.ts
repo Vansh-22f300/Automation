@@ -50,6 +50,35 @@ export class StepFailedError extends Error {
 }
 
 /**
+ * Raised by the real dispatcher when a step failed with a *retryable* error and
+ * business retry budget remains. Like `StepFailedError`, the engine has already
+ * committed the durable record of this attempt (the `workflow_step_runs` row is
+ * `failed`) — but crucially it did NOT mark the workflow run failed: the run
+ * stays `running` so the deferred re-execution resumes it. The error tells the
+ * worker to move the queue job `running → pending` with a future `run_at` (via
+ * `queue.retry`) instead of settling it terminally.
+ *
+ * It carries the same structured reason that was persisted, plus the computed
+ * `runAt` — the instant before which the job must not be re-claimed. The engine
+ * owns the timing (it consulted the retry policy); the worker only executes the
+ * transition.
+ */
+export class StepRetryError extends Error {
+  readonly code = 'step_retry';
+  readonly reason: JobError;
+  readonly runAt: Date;
+
+  constructor(reason: JobError, runAt: Date) {
+    const code = typeof reason.code === 'string' ? reason.code : 'step_retry';
+    super(`step execution failed retryably (${code}); scheduled for retry`);
+    this.name = 'StepRetryError';
+    this.reason = reason;
+    this.runAt = runAt;
+    Error.captureStackTrace(this, StepRetryError);
+  }
+}
+
+/**
  * Raised by a dispatcher that cannot execute steps yet. The worker recognises
  * this exact type and records it as a job failure with a clear reason, distinct
  * from an unexpected crash.

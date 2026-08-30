@@ -32,6 +32,7 @@ import { isAppError } from '@/domain/errors.js';
 import { newId } from '@/domain/ids.js';
 import type { LlmProvider } from '@/domain/llm.js';
 import { defaultStepHandlerRegistry } from '@/domain/step-handler.js';
+import { createRetryPolicy } from '@/domain/retry-policy.js';
 import { createClaudeProvider } from '@/llm/claude-provider.js';
 import { createLogger } from '@/observability/logger.js';
 import { ConnectionRepository } from '@/repositories/connection-repository.js';
@@ -47,6 +48,12 @@ import type { RunExistenceCheck } from '@/worker/worker.js';
 const POLL_INTERVAL_MS = 1_000;
 /** How often the reaper sweeps for expired leases. */
 const REAPER_INTERVAL_MS = 30_000;
+
+// The durable business-retry policy. A retryable step failure is deferred by an
+// equal-jitter backoff and re-claimed after its `run_at`; crash recovery (the
+// reaper's `attempt` counter) is deliberately separate and does not consume this
+// budget. Constructed once and shared with the executor.
+const retryPolicy = createRetryPolicy();
 
 const env = loadEnv();
 const logger = createLogger(env, { service: 'worker' });
@@ -108,6 +115,7 @@ const worker = new Worker({
       resolverFactory,
     }),
     logger,
+    retryPolicy,
   }),
   logger,
   workerId,

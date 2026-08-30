@@ -24,7 +24,7 @@
 import { withContext } from '@/observability/logger.js';
 import type { Logger } from '@/observability/logger.js';
 import type { ClaimedJob, Queue } from '@/domain/queue.js';
-import { StepExecutionNotImplementedError, StepFailedError } from '@/worker/dispatcher.js';
+import { StepExecutionNotImplementedError, StepFailedError, StepRetryError } from '@/worker/dispatcher.js';
 import type { StepDispatcher } from '@/worker/dispatcher.js';
 
 /** Confirms a run exists for a tenant. The worker's "is this job valid?" check. */
@@ -127,7 +127,7 @@ export class Worker {
     const log = withContext(this.logger, {
       tenant_id: job.tenantId,
       run_id: job.runId,
-    }).child({ job_id: job.id, step_key: job.stepKey, attempt: job.attempt });
+    }).child({ job_id: job.id, step_key: job.stepKey, attempt: job.attempt, retry_count: job.retryCount });
 
     log.info('job_claimed');
 
@@ -150,11 +150,20 @@ export class Worker {
       log.info('job_completed');
     } catch (error) {
       if (error instanceof StepFailedError) {
-        // The step ran and failed. The engine has already recorded the step run
-        // and the workflow run as failed in their own committed transaction; all
-        // that remains is to settle the queue job as failed with the same reason.
-        // Terminal: no reaper retry (a real retry policy is Step 11).
+        // The step ran and failed terminally. The engine has already recorded the
+        // step run and the workflow run as failed in their own committed
+        // transaction; all that remains is to settle the queue job as failed with
+        // the same reason. No retry: either the failure was unretryable or its
+        // business budget is exhausted (the engine made that call).
         await this.settleFailed(log, job, error.reason);
+        return;
+      }
+      if (error instanceof StepRetryError) {
+        // The step failed retryably with budget remaining. The engine left the run
+        // `running` and recorded this attempt; move the queue job back to
+        // `pending` with the computed future `run_at` so it is re-executed after
+        // the backoff. Durable: the deferral lives on the row, not in memory.
+        await this.settleRetry(log, job, error.reason, error.runAt);
         return;
       }
       if (error instanceof StepExecutionNotImplementedError) {
@@ -186,6 +195,26 @@ export class Worker {
       // The job could not be moved to failed (a lost lease, a race). Surface it;
       // the reaper will reclaim the row if its lease lapses.
       log.error({ err: failError }, 'job_fail_transition_failed');
+    }
+  }
+
+  private async settleRetry(
+    log: Logger,
+    job: ClaimedJob,
+    reason: Record<string, unknown>,
+    runAt: Date,
+  ): Promise<void> {
+    try {
+      await this.queue.retry(job.id, reason, runAt);
+      log.warn(
+        { reason: reason.code, retry_count: job.retryCount, next_run_at: runAt.toISOString() },
+        'job_retry_scheduled',
+      );
+    } catch (retryError) {
+      // The job could not be moved back to pending (a lost lease, or the reaper
+      // requeued it first). Surface it; the reaper will reclaim the row if its
+      // lease lapses, so the retry is not lost — only its precise timing.
+      log.error({ err: retryError }, 'job_retry_transition_failed');
     }
   }
 }
