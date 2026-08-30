@@ -243,7 +243,15 @@ export class WorkflowExecutor implements StepDispatcher {
 
     let result;
     try {
-      result = await this.registry.get(step.type).execute({ step, context, input, logger: stepLog });
+      result = await this.registry.get(step.type).execute({
+        step,
+        context,
+        input,
+        logger: stepLog,
+        tenantId: job.tenantId,
+        runId: job.runId,
+        stepRunId,
+      });
     } catch (error) {
       // A business failure: the step ran and failed deterministically. Record it
       // and mark the run failed — committed with this transaction.
@@ -279,20 +287,24 @@ export class WorkflowExecutor implements StepDispatcher {
       .where(eq(workflowStepRuns.id, stepRunId));
 
     // If the step metered LLM usage, persist it atomically with the step result.
-    // The provider never writes to the database; the engine owns persistence.
-    if (result.usage !== undefined) {
-      const usage = result.usage;
-      await tx.insert(llmUsage).values({
-        tenantId: job.tenantId,
-        runId: job.runId,
-        stepRunId,
-        provider: usage.provider,
-        model: usage.model,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        totalTokens: usage.totalTokens,
-        latencyMs: usage.latencyMs,
-      });
+    // The provider never writes to the database; the engine owns persistence. A
+    // tool-calling step meters several rounds, so usage is an array — one row per
+    // round, tagged with its 1-based round index.
+    if (result.usage !== undefined && result.usage.length > 0) {
+      await tx.insert(llmUsage).values(
+        result.usage.map((usage, index) => ({
+          tenantId: job.tenantId,
+          runId: job.runId,
+          stepRunId,
+          round: index + 1,
+          provider: usage.provider,
+          model: usage.model,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+          latencyMs: usage.latencyMs,
+        })),
+      );
     }
 
     context.setStepOutput(step.key, output);

@@ -30,6 +30,9 @@ import type {
   LlmProvider,
   LlmStructuredCompletion,
   LlmStructuredRequest,
+  LlmToolCall,
+  LlmToolTurn,
+  LlmToolTurnRequest,
 } from '@/domain/llm.js';
 
 export interface FakeLlmProviderOptions {
@@ -49,7 +52,20 @@ export interface FakeLlmProviderOptions {
   readonly latencyMs?: number;
   /** If set, every call rejects with this error instead of returning. */
   readonly failWith?: Error;
+  /**
+   * A scripted sequence of `converse` turns, consumed one per call. A `tool_use`
+   * entry makes the fake request tools; a `final` entry ends the loop (its `data`
+   * defaults to `structuredData` and is schema-validated like a real provider).
+   * When the queue is exhausted, the fake returns a `final` turn from
+   * `structuredData` — so a test that scripts nothing still gets a single answer.
+   */
+  readonly converseTurns?: readonly FakeConverseTurn[];
 }
+
+/** A scripted `converse` outcome for {@link FakeLlmProvider}. */
+export type FakeConverseTurn =
+  | { readonly kind: 'tool_use'; readonly toolCalls: readonly LlmToolCall[] }
+  | { readonly kind: 'final'; readonly data?: unknown };
 
 export class FakeLlmProvider implements LlmProvider {
   readonly name: string;
@@ -61,11 +77,16 @@ export class FakeLlmProvider implements LlmProvider {
   completeCalls = 0;
   /** The most recent structured request, for trust-boundary assertions. */
   lastStructuredRequest: LlmStructuredRequest<unknown> | undefined;
+  /** How many times `converse` was invoked — the tool-loop probe. */
+  converseCalls = 0;
+  /** Every `converse` request in order, for trust-boundary and message-shape assertions. */
+  converseRequests: LlmToolTurnRequest[] = [];
 
   private readonly structuredData: unknown;
   private readonly usage: { inputTokens: number; outputTokens: number; totalTokens: number };
   private readonly latencyMs: number;
   private readonly failWith: Error | undefined;
+  private readonly converseTurns: FakeConverseTurn[];
 
   constructor(options: FakeLlmProviderOptions = {}) {
     this.name = options.name ?? 'fake';
@@ -74,6 +95,7 @@ export class FakeLlmProvider implements LlmProvider {
     this.usage = options.usage ?? { inputTokens: 11, outputTokens: 7, totalTokens: 18 };
     this.latencyMs = options.latencyMs ?? 5;
     this.failWith = options.failWith;
+    this.converseTurns = [...(options.converseTurns ?? [])];
   }
 
   complete(request: LlmCompletionRequest): Promise<LlmCompletion> {
@@ -112,5 +134,35 @@ export class FakeLlmProvider implements LlmProvider {
       latencyMs: this.latencyMs,
       provider: this.name,
     });
+  }
+
+  converse(request: LlmToolTurnRequest): Promise<LlmToolTurn> {
+    this.converseCalls += 1;
+    this.converseRequests.push(request);
+
+    if (this.failWith !== undefined) return Promise.reject(this.failWith);
+
+    const model = request.model ?? this.defaultModel;
+    const common = { model, usage: this.usage, latencyMs: this.latencyMs, provider: this.name };
+
+    // Consume the next scripted turn; default to a final answer when none remain.
+    const scripted = this.converseTurns.shift() ?? { kind: 'final' as const };
+
+    if (scripted.kind === 'tool_use') {
+      return Promise.resolve({ kind: 'tool_use', toolCalls: scripted.toolCalls, ...common });
+    }
+
+    // A final turn validates its data against the caller's schema, exactly as a real
+    // structured-output provider does — malformed data never reaches context.
+    const data = scripted.data ?? this.structuredData;
+    const parsed = request.schema.safeParse(data);
+    if (!parsed.success) {
+      return Promise.reject(
+        new PermanentError('llm_structured_output_invalid', 'fake structured output failed schema validation', {
+          details: { issues: parsed.error.issues },
+        }),
+      );
+    }
+    return Promise.resolve({ kind: 'final', data: parsed.data, ...common });
   }
 }

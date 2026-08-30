@@ -20,19 +20,27 @@ import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { parseEnv } from '@/config/env.js';
+import {
+  SEND_SLACK_MESSAGE_TOOL,
+  SLACK_PROVIDER,
+  createSlackToolRegistry,
+} from '@/connectors/slack/index.js';
 import type { DatabaseHandle } from '@/db/client.js';
-import { events, jobs, llmUsage, tenants, workflowRuns, workflowStepRuns } from '@/db/schema.js';
+import { connections, events, jobs, llmUsage, tenants, workflowRuns, workflowStepRuns } from '@/db/schema.js';
 import type { ClaimedJob } from '@/domain/queue.js';
 import { LlmStepHandler, NoopStepHandler, StepHandlerRegistry } from '@/domain/step-handler.js';
 import { createLogger } from '@/observability/logger.js';
+import { ConnectionRepository } from '@/repositories/connection-repository.js';
 import { WorkflowExecutor } from '@/repositories/execution-engine.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
+import { CredentialCipher, generateCredentialKey, parseCredentialKey } from '@/security/credential-cipher.js';
 import { StepFailedError } from '@/worker/dispatcher.js';
 
 import { FakeLlmProvider } from '../support/fake-llm-provider.js';
+import { FakeSlackTransport } from '../support/fake-slack-transport.js';
 import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
 
 /** A classifier llm step: reads trigger text, emits { category }. */
@@ -147,6 +155,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('llm workflow step integration'
     await handle.db.delete(jobs);
     await handle.db.delete(workflowRuns);
     await handle.db.delete(events);
+    await handle.db.delete(connections);
   });
 
   it('runs a single llm step to success, storing structured output and usage', async () => {
@@ -307,5 +316,67 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('llm workflow step integration'
     expect(runB!.status).toBe('queued');
     expect(await stepRunsFor(b.runId)).toHaveLength(0);
     expect(await usageFor(b.runId)).toHaveLength(0);
+  });
+
+  it('runs a tool-calling llm step end to end: Slack tool executes, per-round usage persists', async () => {
+    // A cipher with a real key so the encrypted bot token round-trips through the DB.
+    const cipher = new CredentialCipher(parseCredentialKey(generateCredentialKey()));
+    const connectionsRepo = new ConnectionRepository(new TenantScope(handle.db, tenantA), cipher);
+    const connection = await connectionsRepo.create({
+      provider: SLACK_PROVIDER,
+      name: 'workspace',
+      credential: { botToken: 'xoxb-integration-secret' },
+    });
+
+    const transport = new FakeSlackTransport();
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        {
+          kind: 'tool_use',
+          toolCalls: [{ id: 'c1', name: SEND_SLACK_MESSAGE_TOOL, arguments: { channel: 'C123TEST', text: 'ping' } }],
+        },
+        { kind: 'final' },
+      ],
+    });
+
+    // A registry whose llm handler is wired with the Slack tool + a real tenant-scoped resolver.
+    const registry = new StepHandlerRegistry()
+      .register('noop', new NoopStepHandler())
+      .register(
+        'llm',
+        new LlmStepHandler(provider, {
+          toolRegistry: createSlackToolRegistry({ transport }),
+          resolverFactory: (tenantId: string) => new ConnectionRepository(new TenantScope(handle.db, tenantId), cipher),
+        }),
+      );
+
+    const stepDef = {
+      ...llmStepDef('notify'),
+      config: {
+        ...llmStepDef('notify').config,
+        tools: [{ name: SEND_SLACK_MESSAGE_TOOL, connection_id: connection.id }],
+      },
+    };
+    const { runId } = await seed(tenantA, 'llm-tool', [stepDef]);
+
+    expect(await processOne(executorWith(registry))).toBe('done');
+
+    // The Slack tool actually ran, with the trusted decrypted token.
+    expect(transport.calls).toBe(1);
+    expect(transport.lastToken).toBe('xoxb-integration-secret');
+    expect(provider.converseCalls).toBe(2);
+
+    const run = await runById(runId);
+    expect(run!.status).toBe('succeeded');
+    const context = run!.context as { steps: Record<string, { output: unknown }> };
+    expect(context.steps.notify!.output).toEqual({ category: 'spam' });
+
+    // One usage row per provider round, tagged 1 and 2.
+    const usage = await usageFor(runId);
+    expect(usage).toHaveLength(2);
+    expect(usage.map((u) => u.round).sort()).toEqual([1, 2]);
+    const stepRuns = await stepRunsFor(runId);
+    expect(usage.every((u) => u.stepRunId === stepRuns[0]!.id)).toBe(true);
   });
 });

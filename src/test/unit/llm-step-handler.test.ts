@@ -17,6 +17,12 @@
 
 import { describe, expect, it } from 'vitest';
 
+import {
+  SEND_SLACK_MESSAGE_TOOL,
+  SLACK_PROVIDER,
+  createSlackToolRegistry,
+} from '@/connectors/slack/index.js';
+import type { AuthorizedConnection, ConnectionRef, ConnectionResolver } from '@/domain/connection.js';
 import { PermanentError } from '@/domain/errors.js';
 import { ExecutionContext } from '@/domain/execution-context.js';
 import { LlmStepHandler } from '@/domain/step-handler.js';
@@ -25,6 +31,7 @@ import { parseWorkflowDefinition } from '@/domain/workflow-definition.js';
 import type { RunContext } from '@/domain/workflow-run.js';
 
 import { FakeLlmProvider } from '../support/fake-llm-provider.js';
+import { FakeSlackTransport } from '../support/fake-slack-transport.js';
 
 /** Build a real, validated llm step (defaults applied) via the definition schema. */
 const llmStep = (overrides: Record<string, unknown> = {}): WorkflowStep => {
@@ -82,14 +89,16 @@ describe('LlmStepHandler', () => {
     expect(request.maxOutputTokens).toBe(1024);
 
     expect(result.output).toEqual({ category: 'spam' });
-    expect(result.usage).toEqual({
-      provider: 'fake',
-      model: 'fake-model-1',
-      inputTokens: 11,
-      outputTokens: 7,
-      totalTokens: 18,
-      latencyMs: 5,
-    });
+    expect(result.usage).toEqual([
+      {
+        provider: 'fake',
+        model: 'fake-model-1',
+        inputTokens: 11,
+        outputTokens: 7,
+        totalTokens: 18,
+        latencyMs: 5,
+      },
+    ]);
   });
 
   it('forwards a step-level model override, else uses the provider default', async () => {
@@ -153,5 +162,253 @@ describe('LlmStepHandler', () => {
       }),
     ).rejects.toBeInstanceOf(PermanentError);
     expect(provider.completeStructuredCalls).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool-calling path
+// ---------------------------------------------------------------------------
+
+/** A trusted, valid connection id — the kind that lives in workflow config, not model args. */
+const CONNECTION_ID = '018f0000-0000-7000-8000-000000000001';
+
+/** The trusted Slack connection the resolver hands back — its token must never reach the model. */
+function authorizedSlack(): AuthorizedConnection {
+  return {
+    metadata: {
+      id: CONNECTION_ID,
+      provider: SLACK_PROVIDER,
+      name: 'workspace',
+      status: 'active',
+      metadata: {},
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      updatedAt: new Date('2026-01-01T00:00:00Z'),
+      lastUsedAt: null,
+    },
+    credential: { botToken: 'xoxb-trusted-secret' },
+  };
+}
+
+/** Records the ref it was asked to resolve so a test can prove it came from config. */
+class FakeConnectionResolver implements ConnectionResolver {
+  calls = 0;
+  lastRef: ConnectionRef | undefined;
+  constructor(
+    private readonly connection: AuthorizedConnection = authorizedSlack(),
+    private readonly error?: Error,
+  ) {}
+  resolveForTool(ref: ConnectionRef): Promise<AuthorizedConnection> {
+    this.calls += 1;
+    this.lastRef = ref;
+    if (this.error !== undefined) return Promise.reject(this.error);
+    return Promise.resolve(this.connection);
+  }
+}
+
+/** An llm step that offers the Slack tool, bound to the trusted connection id. */
+const toolStep = (overrides: Record<string, unknown> = {}): WorkflowStep =>
+  llmStep({ tools: [{ name: SEND_SLACK_MESSAGE_TOOL, connection_id: CONNECTION_ID }], ...overrides });
+
+/** A model tool-call requesting the Slack send with model-supplied arguments. */
+const slackCall = (args: { channel: string; text: string }) => ({
+  id: 'call-1',
+  name: SEND_SLACK_MESSAGE_TOOL,
+  arguments: args,
+});
+
+describe('LlmStepHandler (tools)', () => {
+  it('runs the bounded loop: model requests the tool, platform executes it, model finalizes', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        { kind: 'tool_use', toolCalls: [slackCall({ channel: 'C123TEST', text: 'ping' })] },
+        { kind: 'final' },
+      ],
+    });
+    const transport = new FakeSlackTransport();
+    const resolver = new FakeConnectionResolver();
+    const handler = new LlmStepHandler(provider, {
+      toolRegistry: createSlackToolRegistry({ transport }),
+      resolverFactory: () => resolver,
+    });
+
+    const result = await handler.execute({
+      step: toolStep(),
+      context: new ExecutionContext(baseContext()),
+      input: { input: 'please notify the channel' },
+      tenantId: 'tenant-1',
+      runId: 'run-1',
+      stepRunId: 'sr-1',
+    });
+
+    // Two provider rounds (tool_use then final), and the tool ran exactly once.
+    expect(provider.converseCalls).toBe(2);
+    expect(transport.calls).toBe(1);
+    expect(result.output).toEqual({ category: 'spam' });
+    // One usage row per round.
+    expect(result.usage).toHaveLength(2);
+    // Never fell back to the no-tools structured path.
+    expect(provider.completeStructuredCalls).toBe(0);
+  });
+
+  it('binds the trusted connection from config, never the model, and never leaks the token', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'ham' },
+      converseTurns: [
+        { kind: 'tool_use', toolCalls: [slackCall({ channel: 'C123TEST', text: 'hi' })] },
+        { kind: 'final' },
+      ],
+    });
+    const transport = new FakeSlackTransport();
+    const resolver = new FakeConnectionResolver();
+    const handler = new LlmStepHandler(provider, {
+      toolRegistry: createSlackToolRegistry({ transport }),
+      resolverFactory: () => resolver,
+    });
+
+    await handler.execute({
+      step: toolStep(),
+      context: new ExecutionContext(baseContext()),
+      input: { input: 'notify' },
+      tenantId: 'tenant-1',
+    });
+
+    // The connection ref came from trusted config with the provider sourced from the
+    // registry — the model never supplied it.
+    expect(resolver.lastRef).toEqual({ provider: SLACK_PROVIDER, connectionId: CONNECTION_ID });
+    // The trusted bot token reached the transport and nowhere else.
+    expect(transport.lastToken).toBe('xoxb-trusted-secret');
+
+    // The model was offered only name/description/inputSchema — no connection, tenant, or credential.
+    const offered = provider.converseRequests[0]!.tools;
+    expect(offered).toHaveLength(1);
+    expect(Object.keys(offered[0]!).sort()).toEqual(['description', 'inputSchema', 'name']);
+    expect(JSON.stringify(offered)).not.toContain(CONNECTION_ID);
+    expect(JSON.stringify(offered)).not.toContain('xoxb');
+
+    // The result fed back to the model is normalized, non-secret data only.
+    const feedback = provider.converseRequests[1]!.messages.find((m) => m.role === 'tool');
+    expect(feedback).toBeDefined();
+    const fed = JSON.stringify(feedback);
+    expect(fed).toContain('C123TEST');
+    expect(fed).not.toContain('xoxb');
+    expect(fed).not.toContain('botToken');
+  });
+
+  it('fails cleanly when a step declares tools but no tool deps are configured', async () => {
+    const provider = new FakeLlmProvider({ structuredData: { category: 'spam' } });
+    const handler = new LlmStepHandler(provider); // no tool deps
+
+    await expect(
+      handler.execute({
+        step: toolStep(),
+        context: new ExecutionContext(baseContext()),
+        input: { input: 'x' },
+        tenantId: 'tenant-1',
+      }),
+    ).rejects.toMatchObject({ code: 'llm_tools_not_configured' });
+    expect(provider.converseCalls).toBe(0);
+  });
+
+  it('fails cleanly when a tool step runs without a tenant to scope connections', async () => {
+    const provider = new FakeLlmProvider({ structuredData: { category: 'spam' } });
+    const handler = new LlmStepHandler(provider, {
+      toolRegistry: createSlackToolRegistry({ transport: new FakeSlackTransport() }),
+      resolverFactory: () => new FakeConnectionResolver(),
+    });
+
+    await expect(
+      handler.execute({
+        step: toolStep(),
+        context: new ExecutionContext(baseContext()),
+        input: { input: 'x' },
+        // no tenantId
+      }),
+    ).rejects.toMatchObject({ code: 'llm_tools_not_configured' });
+    expect(provider.converseCalls).toBe(0);
+  });
+
+  it('refuses a tool the model was not offered, feeding back a safe unknown_tool error', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        { kind: 'tool_use', toolCalls: [{ id: 'c1', name: 'delete_everything', arguments: {} }] },
+        { kind: 'final' },
+      ],
+    });
+    const transport = new FakeSlackTransport();
+    const handler = new LlmStepHandler(provider, {
+      toolRegistry: createSlackToolRegistry({ transport }),
+      resolverFactory: () => new FakeConnectionResolver(),
+    });
+
+    const result = await handler.execute({
+      step: toolStep(),
+      context: new ExecutionContext(baseContext()),
+      input: { input: 'x' },
+      tenantId: 'tenant-1',
+    });
+
+    // The un-offered tool never reached the executor/transport.
+    expect(transport.calls).toBe(0);
+    expect(result.output).toEqual({ category: 'spam' });
+    const feedback = provider.converseRequests[1]!.messages.find((m) => m.role === 'tool');
+    expect(JSON.stringify(feedback)).toContain('unknown_tool');
+  });
+
+  it('fails with llm_tool_rounds_exceeded when the model never finalizes', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        { kind: 'tool_use', toolCalls: [slackCall({ channel: 'C123TEST', text: 'a' })] },
+        { kind: 'tool_use', toolCalls: [slackCall({ channel: 'C123TEST', text: 'b' })] },
+      ],
+    });
+    const handler = new LlmStepHandler(provider, {
+      toolRegistry: createSlackToolRegistry({ transport: new FakeSlackTransport() }),
+      resolverFactory: () => new FakeConnectionResolver(),
+    });
+
+    await expect(
+      handler.execute({
+        step: toolStep({ max_tool_rounds: 2 }),
+        context: new ExecutionContext(baseContext()),
+        input: { input: 'x' },
+        tenantId: 'tenant-1',
+      }),
+    ).rejects.toMatchObject({ code: 'llm_tool_rounds_exceeded' });
+    expect(provider.converseCalls).toBe(2);
+  });
+
+  it('normalizes a tool failure into a safe {code,message} fed back to the model', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        { kind: 'tool_use', toolCalls: [slackCall({ channel: 'C_BAD', text: 'x' })] },
+        { kind: 'final' },
+      ],
+    });
+    // Slack replies ok:false with a deterministic error.
+    const transport = new FakeSlackTransport({
+      response: { status: 200, body: { ok: false, error: 'channel_not_found' } },
+    });
+    const handler = new LlmStepHandler(provider, {
+      toolRegistry: createSlackToolRegistry({ transport }),
+      resolverFactory: () => new FakeConnectionResolver(),
+    });
+
+    const result = await handler.execute({
+      step: toolStep(),
+      context: new ExecutionContext(baseContext()),
+      input: { input: 'x' },
+      tenantId: 'tenant-1',
+    });
+
+    // The step still completes (the model recovered); the error was surfaced safely.
+    expect(result.output).toEqual({ category: 'spam' });
+    const feedback = provider.converseRequests[1]!.messages.find((m) => m.role === 'tool');
+    const fed = JSON.stringify(feedback);
+    expect(fed).toContain('channel_not_found');
+    expect(fed).not.toContain('xoxb');
   });
 });

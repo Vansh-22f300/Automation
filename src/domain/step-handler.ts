@@ -14,10 +14,20 @@
  */
 
 import { PermanentError } from '@/domain/errors.js';
+import type { ConnectionRef, ConnectionResolver } from '@/domain/connection.js';
 import type { ExecutionContext } from '@/domain/execution-context.js';
-import type { LlmProvider } from '@/domain/llm.js';
+import type {
+  LlmProvider,
+  LlmToolCall,
+  LlmToolDefinition,
+  LlmToolMessage,
+  LlmToolResult,
+  LlmToolTurn,
+} from '@/domain/llm.js';
 import { compileOutputSchema } from '@/domain/output-schema.js';
-import type { StepType, WorkflowStep } from '@/domain/workflow-definition.js';
+import { ToolExecutor } from '@/domain/tool-executor.js';
+import type { ToolRegistry } from '@/domain/tool-registry.js';
+import type { LlmStepConfig, StepType, WorkflowStep } from '@/domain/workflow-definition.js';
 import type { Logger } from '@/observability/logger.js';
 
 /** What a handler is asked to execute: the step's definition and the run context. */
@@ -32,6 +42,15 @@ export interface StepExecution {
    * its own structured events (metadata only — never prompts, outputs or secrets).
    */
   readonly logger?: Logger;
+  /**
+   * Correlation/scoping ids the engine knows. Optional so `noop` and existing
+   * handler tests need not supply them; the `llm` handler requires `tenantId`
+   * ONLY when the step declares tools (a tenant-scoped resolver is needed to
+   * decrypt the trusted connection).
+   */
+  readonly tenantId?: string;
+  readonly runId?: string;
+  readonly stepRunId?: string;
 }
 
 /** Normalized token/latency accounting a handler may report for persistence. */
@@ -47,11 +66,13 @@ export interface StepUsage {
 /**
  * The result of executing one step: the output to record and add to the run
  * context, plus optional usage the engine persists (e.g. an `llm` step's token
- * accounting). A step that meters nothing simply omits `usage`.
+ * accounting). Usage is an ARRAY: an `llm` step with tools makes several provider
+ * calls (one per round), each metered separately. A step that meters nothing
+ * simply omits `usage`; the no-tools `llm` path returns a one-element array.
  */
 export interface StepResult {
   readonly output: unknown;
-  readonly usage?: StepUsage;
+  readonly usage?: readonly StepUsage[];
 }
 
 /**
@@ -95,8 +116,29 @@ export class NoopStepHandler implements StepHandler {
  * persists both. A malformed result surfaces from the provider as a
  * `PermanentError` — this handler does not fall back to parsing free text.
  */
+/**
+ * Optional tool dependencies for the `llm` handler. Present in production (wired
+ * from the worker), absent in the no-tools tests. When a step declares `tools`
+ * but these are absent, the step fails cleanly with `llm_tools_not_configured`.
+ */
+export interface LlmToolDeps {
+  /** The catalogue of platform-registered tools — the source of truth for names. */
+  readonly toolRegistry?: ToolRegistry;
+  /** Builds a tenant-scoped connection resolver for the run's tenant. */
+  readonly resolverFactory?: (tenantId: string) => ConnectionResolver;
+}
+
 export class LlmStepHandler implements StepHandler {
-  constructor(private readonly provider: LlmProvider) {}
+  private readonly toolRegistry: ToolRegistry | undefined;
+  private readonly resolverFactory: ((tenantId: string) => ConnectionResolver) | undefined;
+
+  constructor(
+    private readonly provider: LlmProvider,
+    deps: LlmToolDeps = {},
+  ) {
+    this.toolRegistry = deps.toolRegistry;
+    this.resolverFactory = deps.resolverFactory;
+  }
 
   async execute(execution: StepExecution): Promise<StepResult> {
     const { step } = execution;
@@ -117,6 +159,12 @@ export class LlmStepHandler implements StepHandler {
     const schema = compileOutputSchema(config.output_schema);
     const model = config.model ?? this.provider.defaultModel;
     const logger = execution.logger;
+
+    // Tools declared → the bounded tool-calling loop. Otherwise the original,
+    // simpler structured-completion path (unchanged behaviour, single call).
+    if (config.tools !== undefined && config.tools.length > 0) {
+      return this.executeWithTools({ execution, config, userContent, schema, model });
+    }
 
     logger?.info({ provider: this.provider.name, model }, 'llm_step_started');
 
@@ -143,14 +191,16 @@ export class LlmStepHandler implements StepHandler {
 
       return {
         output: completion.data,
-        usage: {
-          provider: completion.provider,
-          model: completion.model,
-          inputTokens: completion.usage.inputTokens,
-          outputTokens: completion.usage.outputTokens,
-          totalTokens: completion.usage.totalTokens,
-          latencyMs: completion.latencyMs,
-        },
+        usage: [
+          {
+            provider: completion.provider,
+            model: completion.model,
+            inputTokens: completion.usage.inputTokens,
+            outputTokens: completion.usage.outputTokens,
+            totalTokens: completion.usage.totalTokens,
+            latencyMs: completion.latencyMs,
+          },
+        ],
       };
     } catch (error) {
       // Metadata-only failure log; the engine records the structured error too.
@@ -158,6 +208,171 @@ export class LlmStepHandler implements StepHandler {
       logger?.warn({ provider: this.provider.name, model, err_code: code }, 'llm_step_failed');
       throw error;
     }
+  }
+
+  /**
+   * The bounded tool-calling path. It offers the model ONLY the model-facing view of
+   * each declared tool — `{name, description, inputSchema}` — and holds the trusted
+   * `connection_id` binding entirely on the platform side, keyed by tool name. When
+   * the model requests a tool, the handler executes it through the {@link ToolExecutor}
+   * (which enforces the full security order), passing the trusted `connectionRef` as a
+   * separate argument the model never sees. Only the connector's normalized, non-secret
+   * output — or a safe `{code, message}` — is fed back to the model. The loop is bounded
+   * by `max_tool_rounds`; each provider round is metered as its own usage row.
+   */
+  private async executeWithTools(params: {
+    execution: StepExecution;
+    config: LlmStepConfig;
+    userContent: string;
+    schema: ReturnType<typeof compileOutputSchema>;
+    model: string;
+  }): Promise<StepResult> {
+    const { execution, config, userContent, schema, model } = params;
+    const logger = execution.logger;
+
+    // Tool wiring must be present, and a tenant is required to build the
+    // tenant-scoped connection resolver. Absent → the step fails cleanly.
+    if (this.toolRegistry === undefined || this.resolverFactory === undefined) {
+      throw new PermanentError(
+        'llm_tools_not_configured',
+        'llm step declares tools but the handler has no tool registry / connection resolver configured',
+      );
+    }
+    const tenantId = execution.tenantId;
+    if (tenantId === undefined) {
+      throw new PermanentError(
+        'llm_tools_not_configured',
+        'llm step declares tools but no tenantId was supplied to resolve connections',
+      );
+    }
+
+    const registry = this.toolRegistry;
+    const resolver = this.resolverFactory(tenantId);
+    const toolExecutor = new ToolExecutor(registry, resolver);
+
+    // Two maps, built once. `toolDefs` is the ONLY thing the model sees. `refByName`
+    // holds the trusted connection binding; its provider is sourced from the REGISTRY
+    // (never from config), and `connection_id` comes from the trusted step config —
+    // never from a model argument. An unknown tool name fails here (unknown_tool).
+    const toolDefs: LlmToolDefinition[] = [];
+    const refByName = new Map<string, ConnectionRef>();
+    for (const binding of config.tools ?? []) {
+      const tool = registry.resolve(binding.name);
+      toolDefs.push({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema });
+      refByName.set(tool.name, { provider: tool.provider, connectionId: binding.connection_id });
+    }
+
+    const usage: StepUsage[] = [];
+    const messages: LlmToolMessage[] = [{ role: 'user', content: userContent }];
+    const maxRounds = config.max_tool_rounds;
+
+    logger?.info(
+      { provider: this.provider.name, model, tool_count: toolDefs.length, max_tool_rounds: maxRounds },
+      'llm_step_started',
+    );
+    // TOOL_LOOP_PLACEHOLDER
+    for (let round = 1; round <= maxRounds; round += 1) {
+      let turn: LlmToolTurn;
+      try {
+        turn = await this.provider.converse({
+          system: config.system,
+          messages,
+          tools: toolDefs,
+          schema,
+          maxOutputTokens: config.max_output_tokens,
+          ...(config.model !== undefined ? { model: config.model } : {}),
+        });
+      } catch (error) {
+        const code = error instanceof PermanentError ? error.code : 'llm_error';
+        logger?.warn({ provider: this.provider.name, model, round, err_code: code }, 'llm_step_failed');
+        throw error;
+      }
+
+      // Meter every round, whether it asked for tools or produced the final answer.
+      usage.push({
+        provider: turn.provider,
+        model: turn.model,
+        inputTokens: turn.usage.inputTokens,
+        outputTokens: turn.usage.outputTokens,
+        totalTokens: turn.usage.totalTokens,
+        latencyMs: turn.latencyMs,
+      });
+
+      if (turn.kind === 'final') {
+        logger?.info(
+          { provider: turn.provider, model: turn.model, rounds: round, total_rounds: round },
+          'llm_step_succeeded',
+        );
+        return { output: turn.data, usage };
+      }
+
+      // The model requested tools. Record the request turn, then execute each call
+      // sequentially and feed back ONLY safe, normalized results.
+      messages.push({ role: 'assistant', toolCalls: turn.toolCalls });
+      const results: LlmToolResult[] = [];
+      for (const call of turn.toolCalls) {
+        results.push(await this.runToolCall({ call, refByName, toolExecutor, tenantId, execution, round }));
+      }
+      messages.push({ role: 'tool', results });
+    }
+
+    // The loop bound was reached without a final answer — refuse deterministically.
+    logger?.warn({ provider: this.provider.name, model, max_tool_rounds: maxRounds }, 'llm_step_failed');
+    throw new PermanentError(
+      'llm_tool_rounds_exceeded',
+      `llm step did not produce a final answer within ${maxRounds} tool round(s)`,
+      { details: { maxRounds } },
+    );
+  }
+
+  /**
+   * Execute one model-requested tool call and normalize it into a model-safe
+   * {@link LlmToolResult}. A tool the model was not offered is refused as `unknown_tool`
+   * without ever reaching the executor. Success carries the connector's non-secret
+   * output; failure carries only the classified `{code, message}` — never a credential,
+   * connection metadata, tenant id, or internal error object.
+   */
+  private async runToolCall(params: {
+    call: LlmToolCall;
+    refByName: Map<string, ConnectionRef>;
+    toolExecutor: ToolExecutor;
+    tenantId: string;
+    execution: StepExecution;
+    round: number;
+  }): Promise<LlmToolResult> {
+    const { call, refByName, toolExecutor, tenantId, execution, round } = params;
+    const logger = execution.logger;
+    logger?.info({ tool: call.name, round, call_id: call.id }, 'llm_tool_call_requested');
+
+    const connectionRef = refByName.get(call.name);
+    if (connectionRef === undefined) {
+      // The model asked for a tool that was not offered to this step. Refuse safely.
+      logger?.warn({ tool: call.name, round, call_id: call.id, err_code: 'unknown_tool' }, 'llm_tool_call_failed');
+      return { id: call.id, error: { code: 'unknown_tool', message: `tool "${call.name}" is not available to this step` } };
+    }
+
+    logger?.info({ tool: call.name, round, call_id: call.id }, 'llm_tool_call_started');
+    const result = await toolExecutor.execute(
+      { id: call.id, name: call.name, arguments: call.arguments },
+      {
+        context: {
+          tenantId,
+          toolName: call.name,
+          ...(execution.runId !== undefined ? { runId: execution.runId } : {}),
+          ...(execution.stepRunId !== undefined ? { stepRunId: execution.stepRunId } : {}),
+        },
+        connectionRef,
+        ...(logger !== undefined ? { logger } : {}),
+      },
+    );
+
+    if (result.success) {
+      logger?.info({ tool: call.name, round, call_id: call.id }, 'llm_tool_call_succeeded');
+      return { id: call.id, output: result.output };
+    }
+    const code = result.error?.code ?? 'tool_error';
+    logger?.warn({ tool: call.name, round, call_id: call.id, err_code: code }, 'llm_tool_call_failed');
+    return { id: call.id, error: { code, message: result.error?.message ?? 'tool execution failed' } };
   }
 }
 
@@ -212,15 +427,27 @@ export interface DefaultStepHandlerRegistryOptions {
    * affected.
    */
   readonly llmProvider?: LlmProvider;
+  /**
+   * The tool catalogue an `llm` step may offer the model. Omitted → an `llm` step
+   * that declares `tools` fails cleanly with `llm_tools_not_configured`; a no-tools
+   * step is unaffected.
+   */
+  readonly toolRegistry?: ToolRegistry;
+  /** Builds a tenant-scoped connection resolver for a run's tenant. */
+  readonly resolverFactory?: (tenantId: string) => ConnectionResolver;
 }
 
 /** The registry the worker wires in production: every step type the MVP supports. */
 export function defaultStepHandlerRegistry(
   options: DefaultStepHandlerRegistryOptions = {},
 ): StepHandlerRegistry {
+  const toolDeps: LlmToolDeps = {
+    ...(options.toolRegistry !== undefined ? { toolRegistry: options.toolRegistry } : {}),
+    ...(options.resolverFactory !== undefined ? { resolverFactory: options.resolverFactory } : {}),
+  };
   const llmHandler: StepHandler =
     options.llmProvider !== undefined
-      ? new LlmStepHandler(options.llmProvider)
+      ? new LlmStepHandler(options.llmProvider, toolDeps)
       : new UnconfiguredLlmStepHandler();
   return new StepHandlerRegistry().register('noop', new NoopStepHandler()).register('llm', llmHandler);
 }

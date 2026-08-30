@@ -4,7 +4,7 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 9B of 13 — first real external connector (Slack).**
+> **Status: Step 10 of 13 — tool calling wired into Claude (end-to-end AI action).**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
 > service for authoring workflows and their immutable versioned definitions, a
@@ -18,12 +18,15 @@ an LLM, calling external tools, and keeping a durable audit trail of every step.
 > provider-neutral **tool / connector foundation** (a tenant-scoped `connections`
 > store with application-level AES-256-GCM credential encryption, a tool registry,
 > and a tool executor enforcing argument validation and a hard credential
-> boundary), and — new in this step — the **first concrete connector: Slack**,
-> exposing a single `send_slack_message` tool over `chat.postMessage`, built
-> entirely on that foundation. **OAuth is not implemented** (the Slack app is
-> installed manually in development and its bot token stored as an encrypted
-> connection), tool calling is **not yet wired into Claude**, and there is still
-> no arbitrary HTTP — the Slack API call is confined to the connector.
+> boundary), the **first concrete connector, Slack** (a single `send_slack_message`
+> tool over `chat.postMessage`), and — new in this step — **tool calling wired into
+> Claude**: an `llm` step may declare tools, the model can request them across a
+> bounded, per-round-metered loop, and the platform executes each one through the
+> tool executor with the trusted connection bound entirely on the platform side.
+> **OAuth is not implemented** (the Slack app is installed manually in development
+> and its bot token stored as an encrypted connection), there is still only one
+> connector, **no retries/backoff** (Step 11), and no autonomous multi-step agent
+> loop beyond the bounded per-step tool rounds.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -86,6 +89,7 @@ pnpm db:migrate
 | `pnpm connections disable <tenantId> <connectionId>` | Disable a connection so it can no longer be resolved for a tool run. |
 | `pnpm slack:smoke <tenantId> <connectionId> [channel]` | **Optional live Slack check** (not part of `pnpm test`). Resolves the trusted Slack connection and posts **one** harmless message (`"AI Workforce Slack connector test"`) to the channel (default `#ai-workforce-test`). Prints only safe metadata (tool, provider, connection id, channel, success, latency, Slack `ts`); never the token. Reports "NOT executed" and exits cleanly if the key or an active slack connection is absent. |
 | `pnpm llm:smoke ["question"]` | **Optional live Claude check.** Makes one real API call *only* if a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) is set; prints normalized model/tokens/latency + answer and the endpoint origin (never the key/token). Tests plain then structured output, reporting each separately. Exits cleanly with a message when no credential is set. |
+| `pnpm llm:tool-smoke <tenantId> <connectionId> [channel]` | **Optional live end-to-end tool-calling check** (not part of `pnpm test`). Runs the real `llm` handler with a real Claude provider and the real Slack connector: Claude requests `send_slack_message`, the platform executes it, and the model finalizes. Prints only safe metadata (rounds, per-round token counts, final output); never the API key, auth token, or bot token. Reports "NOT executed" and exits cleanly if the Claude credential, encryption key, or connection is absent. |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
 | `pnpm build` | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths. |
@@ -364,9 +368,10 @@ pnpm llm:smoke "In one sentence, what is a workflow?"
 
 > **The provider is a seam, not a workflow step.** The provider on its own only
 > knows how to talk to a model; it is the [`llm` workflow step](#the-llm-workflow-step)
-> (Step 8) that wires it into the execution engine. There is still no tool calling,
-> no agent loop, no autonomous agents, no MCP, no RAG, no embeddings, no prompt
-> caching and no streaming — those are deliberately absent.
+> (Step 8) that wires it into the execution engine, and [tool calling](#tool-calling-in-the-llm-step-step-10)
+> (Step 10) that lets the model drive real external action. There is still no
+> autonomous agent loop beyond a step's bounded tool rounds, no MCP, no RAG, no
+> embeddings, no prompt caching and no streaming — those are deliberately absent.
 
 ## The `llm` workflow step
 
@@ -436,6 +441,100 @@ transaction the engine already uses. The provider itself never writes to the
 database — it returns usage on its result and the engine persists it. Only
 metadata is stored: never the prompt, the model output, or any credential.
 
+## Tool calling in the `llm` step (Step 10)
+
+Step 10 closes the loop between AI reasoning and real external action. An `llm`
+step may now declare **tools**; the model can request them, and the platform
+executes each requested tool through the same [`ToolExecutor`](src/domain/tool-executor.ts)
+and Slack connector built in Step 9, feeding only safe, normalized results back to
+the model until it produces its final schema-validated output.
+
+The whole loop lives in [`LlmStepHandler`](src/domain/step-handler.ts) — the engine
+still advances **one run by exactly one step per job**; a step's several
+model↔tool rounds are internal to that one step.
+
+### What a tool step declares
+
+```jsonc
+{
+  "key": "notify",
+  "type": "llm",
+  "config": {
+    "system": "…static, developer-authored instructions…",
+    "input": "{{trigger.payload.text}}",
+    "output_schema": { "type": "object", "properties": { "summary": { "type": "string" } }, "required": ["summary"] },
+    "tools": [{ "name": "send_slack_message", "connection_id": "<uuid>" }],
+    "max_tool_rounds": 4
+  }
+}
+```
+
+`name` must be a **platform-registered** tool (the registry is the source of
+truth); `connection_id` is **trusted workflow config**, structurally separate from
+the model's argument path.
+
+### The trust boundary (two maps)
+
+The handler builds two maps once, and the split is the whole security model:
+
+- **Model-facing** — the model is offered only `{ name, description, inputSchema }`
+  per tool, taken from the registry. It never sees a `connection_id`, a tenant id,
+  a credential, or the provider binding.
+- **Platform-side** — a `Map<toolName, ConnectionRef>` holds the trusted binding.
+  Its `provider` is sourced from the **registry** (`tool.provider`), never from
+  config; its `connectionId` comes from the trusted step config. When the model
+  requests a tool, that `ConnectionRef` is passed to the executor as a **separate
+  argument** — never assembled from the model's `call.arguments`.
+
+Everything the executor then does is unchanged from Step 9: resolve the tool,
+validate arguments with the connector's `.strict()` schema, authorize the ref
+(provider must match), resolve+decrypt the credential **tenant-scoped**, call the
+connector, normalize the result. The decrypted bot token flows to the Slack client
+and nowhere else.
+
+### The bounded loop
+
+`for (round = 1 … max_tool_rounds)`: call `provider.converse(...)` with the system
+turn, the running message history, the model-facing tool defs and the compiled
+output schema. Each round is **metered as its own `llm_usage` row** (see below).
+
+- **`final`** → return the validated structured output; done.
+- **`tool_use`** → record the request, run each call, feed back **only** a safe
+  `{ output }` or `{ code, message }` per call, and loop.
+- A tool the model was **not** offered is refused as `unknown_tool` **without ever
+  reaching the executor**.
+- A tool failure is normalized to `{ code, message }` — never a credential,
+  connection metadata, tenant id, encrypted envelope, or internal error.
+- Rounds exhausted without a final answer → `llm_tool_rounds_exceeded`
+  (`PermanentError`); the run fails deterministically. **No retries** (Step 11).
+
+If a step declares tools but the handler has no tool registry / resolver (or no
+tenant to scope connections), it fails cleanly with `llm_tools_not_configured`
+rather than running blind.
+
+### Per-round usage
+
+The `llm_usage` table gained a **`round`** column (migration `0008`), and its
+uniqueness moved from `(step_run_id)` to `(step_run_id, round)`. A tool-calling
+step therefore records **one row per provider round** — all tied to the one
+step-run, still written **atomically with the step settle**, still metadata-only.
+
+### Live end-to-end smoke (optional, credential-gated)
+
+The automated suite proves the loop with a deterministic fake provider and fake
+Slack transport — it never calls a live model or Slack. To confirm the real
+Claude→Slack path by eye:
+
+```bash
+pnpm llm:tool-smoke <tenantId> <connectionId> "#ai-workforce-test"
+```
+
+It runs the real handler with a real Claude provider and the real Slack connector
+against a stored connection. Missing a Claude credential, the encryption key, or
+the connection → it prints `live smoke: NOT executed` and exits 0. It prints only
+safe metadata (rounds, per-round token counts, the final output) — never the API
+key, auth token, or bot token.
+
 ## Project layout
 
 ```
@@ -460,7 +559,7 @@ src/
 │   ├── webhook-repository.ts   Tenant-scoped webhook ingestion (event + run + first job, one txn)
 │   ├── job-queue.ts            PostgresJobQueue — enqueue/claim/complete/fail/requeueExpired
 │   └── execution-engine.ts     WorkflowExecutor — advances a run by one step, atomically
-├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts, inspect-webhooks.ts, llm-smoke.ts (bootstrap/dev)
+├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts, inspect-webhooks.ts, llm-smoke.ts, connections.ts, slack-smoke.ts, llm-tool-smoke.ts (bootstrap/dev)
 ├── worker/
 │   ├── main.ts               Entrypoint 2 — composition root: worker + reaper wiring, shutdown
 │   ├── worker.ts             The claim → verify → dispatch → settle loop
@@ -549,7 +648,7 @@ definition as a single immutable versioned value.
 | `workflow_runs` | One execution of a workflow, born from an event | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. Advanced one step per job by the execution engine. |
 | `jobs` | A unit of durable work advancing a run's step | `step_key`, `attempt`/`max_attempts`, `status` (`pending`→`running`→`done`/`failed`), `run_at`, `locked_by` + `lease_expires_at` (the lease), `last_error`. Claimed with `FOR UPDATE SKIP LOCKED`. |
 | `workflow_step_runs` | One executed step of a run | Records the step's `status`, `output` jsonb and error, one row per step the engine advances. Composite tenant-safe FK to its run. |
-| `llm_usage` | Token/latency accounting for one `llm` step | `provider`, `model`, `input_tokens`/`output_tokens`/`total_tokens`, `latency_ms`. Written atomically with the step-run settle; `UNIQUE(step_run_id)`. Metadata only — never the prompt, output or credential. |
+| `llm_usage` | Token/latency accounting for one provider round of an `llm` step | `provider`, `model`, `round`, `input_tokens`/`output_tokens`/`total_tokens`, `latency_ms`. Written atomically with the step-run settle; `UNIQUE(step_run_id, round)`. A no-tools step meters one round; a tool-calling step meters one row per request→execute round. Metadata only — never the prompt, output or credential. |
 | `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
 | `connections` | A tenant's authorization to act against an external provider | `provider`, `name`, `status` (`active`/`disabled`/`error`), `encrypted_credentials` jsonb (a versioned AES-256-GCM envelope — never plaintext), non-secret `metadata`, `last_used_at`. `UNIQUE(tenant_id, id)` for future composite FKs and `UNIQUE(tenant_id, provider, name)` for distinct names. A tenant may hold **many active connections to the same provider** (e.g. two Slack workspaces); which one a tool uses is decided by a trusted `connectionId` in platform/workflow config — never by the model. |
 
@@ -670,7 +769,7 @@ refuse to run unless the database name contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–9A)
+### Implemented (Steps 1–10)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -679,7 +778,7 @@ refuse to run unless the database name contains `test`.
 - `RetryableError` / `PermanentError` taxonomy
 - PostgreSQL schema for `tenants`, `users`, `workflows`, `workflow_versions`,
   `events`, `workflow_runs`, `workflow_step_runs`, `jobs`, `llm_usage`, `api_keys`,
-  with time-ordered UUIDv7 primary keys generated application-side
+  `connections`, with time-ordered UUIDv7 primary keys generated application-side
 - Drizzle ORM setup, connection pool with clean shutdown, and a migration
   workflow that needs no database to generate or verify
 - Database connectivity verified at startup before the API opens its port
@@ -724,9 +823,10 @@ refuse to run unless the database name contains `test`.
   `job_requeued`, `worker_shutdown`) carrying `tenant_id`/`run_id`/`job_id`/
   `worker_id`. A reaper returns expired-lease jobs to `pending` (incrementing
   `attempt`) with a single atomic UPDATE, safe across processes. The first job is
-  created in the same transaction as the event and run. **No step executes yet**:
-  the dispatcher refuses every step and the worker records that as a terminal
-  failure, never marking a job `done`.
+  created in the same transaction as the event and run. At this step **no step
+  executed yet** — the dispatcher was a stub that refused every step and the
+  worker recorded that as a terminal failure, never marking a job `done`; the real
+  execution engine arrives in Step 6.
 - **Workflow execution engine (Step 6)** — the real `StepDispatcher`
   ([`WorkflowExecutor`](src/repositories/execution-engine.ts)): one claimed job
   advances its run by **exactly one step**, never loading or running a whole
@@ -782,9 +882,9 @@ refuse to run unless the database name contains `test`.
   `PermanentError`. The engine persists a metadata-only `llm_usage` row atomically
   with the step-run settle (never prompt/output/credential). With no credential the
   worker registers an `UnconfiguredLlmStepHandler`, so the app still boots and an
-  `llm` step fails cleanly with `llm_provider_not_configured`. **Still no tool
-  calling, connectors or agent loop** — the step reasons over the run's own context
-  only; those are Step 9+.
+  `llm` step fails cleanly with `llm_provider_not_configured`. At this step the
+  step reasoned over the run's own context only — **tool calling, connectors and
+  an agent loop were not yet present**; those arrive in Steps 9–10.
 - **Tool / connector foundation (Step 9A)** — the generic, provider-neutral
   architecture a real connector will plug into, plus the credential boundary, and
   nothing service-specific. A tenant-scoped `connections` store keeps external
@@ -825,9 +925,32 @@ refuse to run unless the database name contains `test`.
   network/timeouts are **retryable** — classified but **never retried here** (Step 11).
   Success normalizes to `{ ok, channel, ts }`. **OAuth is not implemented** — the Slack
   app is installed manually in development and its bot token stored as an encrypted
-  connection. Tool calling is **not yet wired into Claude** (Step 10). A `pnpm
+  connection. Tool calling is now **wired into Claude** (Step 10, below). A `pnpm
   slack:smoke` command posts one live test message when configured; the automated
   suite never touches the live Slack API.
+- **LLM tool calling (Step 10)** — the `llm` step can now offer registered tools to
+  the model and execute the ones it requests, closing the loop between AI reasoning
+  and real external action. The bounded loop lives entirely in
+  [`LlmStepHandler`](src/domain/step-handler.ts); the engine's one-job-one-step
+  contract is unchanged. Two maps enforce the trust boundary: the model is offered
+  only `{name, description, inputSchema}` per tool (from the registry), while a
+  platform-side `Map<toolName, ConnectionRef>` holds the **trusted connection
+  binding** — its `provider` sourced from the registry, its `connection_id` from
+  trusted step config, never from a model argument. When the model requests a tool,
+  that `ConnectionRef` is passed to the `ToolExecutor` as a separate argument (the
+  full Step 9 security order: validate args → authorize → tenant-scoped decrypt →
+  connector → normalize); only the connector's **normalized, non-secret result** —
+  or a safe `{code, message}` — is fed back. A tool the model was not offered is
+  refused as `unknown_tool` without reaching the executor. The loop is bounded by
+  `max_tool_rounds` (exhaustion → `llm_tool_rounds_exceeded`, a `PermanentError`);
+  a step declaring tools with no registry/resolver or no tenant fails cleanly with
+  `llm_tools_not_configured`. Each provider round is metered as its own `llm_usage`
+  row (`round` column, `UNIQUE(step_run_id, round)` — migration `0008`), all written
+  atomically with the step-run settle. Integration and unit tests prove the loop
+  with a deterministic **fake provider** and fake Slack transport (no live model or
+  Slack); an optional, credential-gated `pnpm llm:tool-smoke` confirms the real
+  Claude→Slack path. **No retries** (Step 11), one connector, no OAuth, no MCP, and
+  no autonomous agent loop beyond a step's bounded rounds.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -858,33 +981,41 @@ development path, not production SaaS onboarding):
    pnpm slack:smoke <tenantId> <connectionId> "#ai-workforce-test"
    ```
 
+7. Confirm the full Claude→Slack tool-calling path end to end (optional, not part
+   of `pnpm test`; also needs a Claude credential):
+
+   ```bash
+   pnpm llm:tool-smoke <tenantId> <connectionId> "#ai-workforce-test"
+   ```
+
 ### Not implemented yet — intentionally
 
 Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| Additional connectors (Gmail, GitHub, …), OAuth onboarding, tool calling wired into Claude | Step 10 |
+| Additional connectors (Gmail, GitHub, …), OAuth onboarding | later steps / not scheduled |
 | Retry policy and backoff | Step 11 |
 | Run inspection endpoints and log redaction | Step 12 |
 | Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
 | HMAC / provider signature verification on webhooks | before production webhooks |
 | Agent loops, autonomous multi-step agents, MCP, RAG / embeddings, prompt caching, streaming, model training / fine-tuning, any frontend | not scheduled |
 
-The tool / connector foundation (Step 9A) and the first concrete connector — **Slack**
-(Step 9B) — now exist: the `connections` table, credential encryption, the tool
-registry and executor, and a `send_slack_message` tool over `chat.postMessage`. What
-does **not** exist yet: any other provider, OAuth onboarding, and tool calling wired
-into Claude (the executor is still invoked by trusted code, not by the model). A
-generic `audit_log` table is deliberately still absent — the structured,
-metadata-only execution record and logging stand in until the code that proves an
-audit schema necessary arrives.
+The tool / connector foundation (Step 9A), the first concrete connector — **Slack**
+(Step 9B) — and **tool calling wired into Claude** (Step 10) now exist: the
+`connections` table, credential encryption, the tool registry and executor, a
+`send_slack_message` tool over `chat.postMessage`, and an `llm` step that can offer
+those tools to the model and execute the ones it requests. What does **not** exist
+yet: any other provider, OAuth onboarding, retries/backoff (Step 11), and any
+autonomous agent loop beyond a single step's bounded tool rounds. A generic
+`audit_log` table is deliberately still absent — the structured, metadata-only
+execution record and logging stand in until the code that proves an audit schema
+necessary arrives.
 
-**Up next is Step 10** — connecting AI reasoning to real external action (wiring tool
-selection/tool calling into the workflow), built on the 9A foundation and the 9B Slack
-connector. Retries and backoff (Step 11), run-inspection endpoints (Step 12) and
-production hardening (Step 13) follow. Each step is implemented, verified and paused
-for review before the next begins.
+**Up next is Step 11** — a retry policy and backoff for the retryable failures the
+taxonomy already classifies but never acts on. Run-inspection endpoints (Step 12)
+and production hardening (Step 13) follow. Each step is implemented, verified and
+paused for review before the next begins.
 
 Explicitly out of scope for the MVP entirely: OAuth flows, billing, a visual
 workflow builder, Redis/Kafka, Kubernetes, microservices, vector stores or agent

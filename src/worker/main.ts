@@ -24,16 +24,21 @@
 import { and, eq } from 'drizzle-orm';
 
 import { loadEnv } from '@/config/env.js';
+import { createSlackToolRegistry } from '@/connectors/slack/index.js';
 import { createDatabase } from '@/db/client.js';
 import { workflowRuns } from '@/db/schema.js';
+import type { ConnectionResolver } from '@/domain/connection.js';
 import { isAppError } from '@/domain/errors.js';
 import { newId } from '@/domain/ids.js';
 import type { LlmProvider } from '@/domain/llm.js';
 import { defaultStepHandlerRegistry } from '@/domain/step-handler.js';
 import { createClaudeProvider } from '@/llm/claude-provider.js';
 import { createLogger } from '@/observability/logger.js';
+import { ConnectionRepository } from '@/repositories/connection-repository.js';
 import { WorkflowExecutor } from '@/repositories/execution-engine.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
+import { TenantScope } from '@/repositories/tenant-scope.js';
+import { createCredentialCipher } from '@/security/credential-cipher.js';
 import { Reaper } from '@/worker/reaper.js';
 import { Worker } from '@/worker/worker.js';
 import type { RunExistenceCheck } from '@/worker/worker.js';
@@ -68,6 +73,17 @@ try {
   }
 }
 
+// The tool wiring an `llm` step uses when it declares tools. The Slack registry is
+// the model-facing catalogue (name/description/inputSchema only); the resolver
+// factory builds a tenant-scoped connection resolver on demand. Both are safe to
+// build without a credential key — the cipher only demands one when an actual
+// decrypt runs — so the worker still boots when no connection is configured; a
+// tool call for a tenant with no key then fails cleanly at execution.
+const toolRegistry = createSlackToolRegistry({ logger });
+const cipher = createCredentialCipher(env);
+const resolverFactory = (tenantId: string): ConnectionResolver =>
+  new ConnectionRepository(new TenantScope(database.db, tenantId), cipher);
+
 /** The worker's job-validity check: does this run still exist for this tenant? */
 const runExists: RunExistenceCheck = async (tenantId, runId) => {
   const [row] = await database.db
@@ -86,7 +102,11 @@ const worker = new Worker({
   dispatcher: new WorkflowExecutor({
     db: database.db,
     queue,
-    registry: defaultStepHandlerRegistry({ ...(llmProvider !== undefined ? { llmProvider } : {}) }),
+    registry: defaultStepHandlerRegistry({
+      ...(llmProvider !== undefined ? { llmProvider } : {}),
+      toolRegistry,
+      resolverFactory,
+    }),
     logger,
   }),
   logger,

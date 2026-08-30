@@ -66,6 +66,35 @@ export const DEFAULT_LLM_MAX_OUTPUT_TOKENS = 1024;
 export const LLM_MAX_OUTPUT_TOKENS_LIMIT = 16_384;
 
 /**
+ * Tool names follow the same safe-identifier shape as step keys: lowercase,
+ * starting with a letter, then letters/digits/underscores, up to 64 chars. This
+ * is validated at authoring time so a malformed name is rejected before it could
+ * ever be looked up in the registry.
+ */
+export const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+
+/** Default number of tool rounds an `llm` step will run before giving up. */
+export const DEFAULT_MAX_TOOL_ROUNDS = 3;
+/** Hard cap on tool rounds — a bound against a runaway request/tool ping-pong. */
+export const MAX_TOOL_ROUNDS_LIMIT = 5;
+
+/**
+ * A single tool binding on an `llm` step. `name` is a platform-registered tool
+ * (the registry is the source of truth); `connection_id` is the TRUSTED workflow
+ * config that binds the tool to a specific connection. `connection_id` is never
+ * model input — it lives here, on the binding, structurally separate from the
+ * model's argument path. `.strict()` rejects any other key.
+ */
+const llmToolBinding = z
+  .object({
+    name: z
+      .string()
+      .regex(TOOL_NAME_PATTERN, 'tool name must be a lowercase identifier (a-z, 0-9, _), starting with a letter'),
+    connection_id: z.uuid('connection_id must be a valid UUID'),
+  })
+  .strict();
+
+/**
  * The config of an `llm` step — the first step type that performs real AI
  * reasoning. Deliberately small:
  *
@@ -109,8 +138,42 @@ const llmStep = z
           .min(1, 'max_output_tokens must be at least 1')
           .max(LLM_MAX_OUTPUT_TOKENS_LIMIT, `max_output_tokens must not exceed ${LLM_MAX_OUTPUT_TOKENS_LIMIT}`)
           .default(DEFAULT_LLM_MAX_OUTPUT_TOKENS),
+        /**
+         * Tools the model may REQUEST during this step. Each binds a
+         * platform-registered tool to a trusted connection. Absent → the step
+         * cannot call tools at all (the no-tools path). Duplicate tool names are
+         * rejected below.
+         */
+        tools: z.array(llmToolBinding).optional(),
+        /**
+         * How many request→execute rounds the bounded loop will run before the
+         * step fails. Defaults, and is hard-capped, to bound cost and ping-pong.
+         */
+        max_tool_rounds: z
+          .number()
+          .int('max_tool_rounds must be an integer')
+          .min(1, 'max_tool_rounds must be at least 1')
+          .max(MAX_TOOL_ROUNDS_LIMIT, `max_tool_rounds must not exceed ${MAX_TOOL_ROUNDS_LIMIT}`)
+          .default(DEFAULT_MAX_TOOL_ROUNDS),
       })
-      .strict(),
+      .strict()
+      .superRefine((config, ctx) => {
+        // Unique tool names within one step: a duplicate binding is a wiring bug,
+        // and the handler's model→connection map has one entry per name.
+        if (config.tools !== undefined) {
+          const seen = new Set<string>();
+          for (const [index, tool] of config.tools.entries()) {
+            if (seen.has(tool.name)) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `duplicate tool name "${tool.name}"`,
+                path: ['tools', index, 'name'],
+              });
+            }
+            seen.add(tool.name);
+          }
+        }
+      }),
   })
   .strict();
 

@@ -717,6 +717,12 @@ export const llmUsage = pgTable(
     provider: text('provider').notNull(),
     /** The model that actually served the request, as the provider reported it. */
     model: text('model').notNull(),
+    /**
+     * Which provider round this row meters. A no-tools `llm` step makes one call
+     * (round 1); a tool-calling step meters each request→execute round separately,
+     * so a step run can own several rows, one per round.
+     */
+    round: integer('round').notNull().default(1),
     inputTokens: integer('input_tokens').notNull(),
     outputTokens: integer('output_tokens').notNull(),
     totalTokens: integer('total_tokens').notNull(),
@@ -733,8 +739,8 @@ export const llmUsage = pgTable(
       columns: [t.tenantId, t.runId],
       foreignColumns: [workflowRuns.tenantId, workflowRuns.id],
     }).onDelete('cascade'),
-    /** At most one usage row per step execution — the idempotency backstop. */
-    unique('llm_usage_step_run_id_key').on(t.stepRunId),
+    /** At most one usage row per (step execution, round) — the idempotency backstop. */
+    unique('llm_usage_step_run_round_key').on(t.stepRunId, t.round),
     /** Tenant/run lookup for inspecting a run's usage. */
     index('llm_usage_tenant_id_run_id_idx').on(t.tenantId, t.runId),
   ],

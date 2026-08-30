@@ -26,6 +26,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
+import { z } from 'zod';
 
 import type { Env } from '@/config/env.js';
 import { AppError, PermanentError, RetryableError, isAppError } from '@/domain/errors.js';
@@ -36,6 +37,11 @@ import type {
   LlmProvider,
   LlmStructuredCompletion,
   LlmStructuredRequest,
+  LlmToolCall,
+  LlmToolDefinition,
+  LlmToolMessage,
+  LlmToolTurn,
+  LlmToolTurnRequest,
   LlmUsage,
 } from '@/domain/llm.js';
 import type { Logger } from '@/observability/logger.js';
@@ -221,6 +227,81 @@ export class ClaudeProvider implements LlmProvider {
     }
   }
 
+  /**
+   * One stateless tool-conversation turn. Offers the model the given tools plus
+   * the final-output schema and returns either the tools it requested or its
+   * final structured data. The bounded loop lives in the caller; this performs a
+   * single round-trip and never executes a tool or loops. `messages.parse`
+   * accepts `tools` and `output_config` together, so one call covers both the
+   * "requested a tool" and "produced final output" outcomes.
+   */
+  async converse(request: LlmToolTurnRequest): Promise<LlmToolTurn> {
+    const model = request.model ?? this.model;
+    const started = performance.now();
+    try {
+      if (request.messages.length === 0) {
+        throw new PermanentError('llm_invalid_request', 'at least one message is required', {
+          details: { provider: PROVIDER_NAME },
+        });
+      }
+
+      const response = await this.client.messages.parse(
+        {
+          model,
+          max_tokens: request.maxOutputTokens,
+          messages: toSdkToolMessages(request.messages),
+          output_config: { format: zodOutputFormat(request.schema) },
+          ...(request.tools.length > 0
+            ? { tools: toSdkTools(request.tools), tool_choice: { type: 'auto' as const } }
+            : {}),
+          ...(request.system !== undefined ? { system: request.system } : {}),
+        },
+        {
+          maxRetries: 0,
+          timeout: request.timeoutMs ?? this.defaultTimeoutMs,
+          ...(request.signal !== undefined ? { signal: request.signal } : {}),
+        },
+      );
+
+      const latencyMs = elapsed(started);
+      this.assertNotRefusal(response.stop_reason, model);
+      const usage = toUsage(response.usage);
+
+      // The model requested one or more tools: surface them for the caller to
+      // execute. We do NOT validate arguments here — the executor does, against
+      // the tool's own strict schema.
+      if (response.stop_reason === 'tool_use') {
+        const toolCalls = extractToolCalls(response.content);
+        if (toolCalls.length === 0) {
+          // stop_reason said tool_use but no tool_use block was present — a
+          // malformed turn we refuse rather than loop on.
+          throw new PermanentError(
+            'llm_tool_call_malformed',
+            'Claude signalled a tool use but produced no tool_use block',
+            { details: { provider: PROVIDER_NAME, model } },
+          );
+        }
+        this.logSuccess(model, usage, latencyMs);
+        return { kind: 'tool_use', toolCalls, model: response.model, usage, latencyMs, provider: PROVIDER_NAME };
+      }
+
+      // Otherwise the model produced its final answer. Defensively re-validate —
+      // unvalidated data must never escape this boundary into workflow context.
+      const parsed = request.schema.safeParse(response.parsed_output);
+      if (!parsed.success) {
+        throw new PermanentError(
+          'llm_structured_parse_failed',
+          'Claude structured output did not match the requested schema',
+          { details: { provider: PROVIDER_NAME, model } },
+        );
+      }
+      this.logSuccess(model, usage, latencyMs);
+      return { kind: 'final', data: parsed.data, model: response.model, usage, latencyMs, provider: PROVIDER_NAME };
+    } catch (error) {
+      throw this.handle(error, model, started);
+    }
+  }
+
   /** Rejects an empty conversation before spending an API round-trip on it. */
   private assertHasMessages(messages: readonly LlmMessage[]): void {
     if (messages.length === 0) {
@@ -396,6 +477,62 @@ function extractText(content: Anthropic.ContentBlock[]): string {
     .filter((block): block is Anthropic.TextBlock => block.type === 'text')
     .map((block) => block.text)
     .join('');
+}
+
+/**
+ * Translate our neutral tool messages to the SDK's `MessageParam[]`. The SDK has
+ * no generic "tool" role: a neutral `{role:'tool'}` becomes a `user` message
+ * whose content is `tool_result` blocks, and an assistant tool request becomes an
+ * `assistant` message whose content is `tool_use` blocks. A plain user turn maps
+ * straight across.
+ */
+function toSdkToolMessages(messages: readonly LlmToolMessage[]): Anthropic.MessageParam[] {
+  return messages.map((message): Anthropic.MessageParam => {
+    if (message.role === 'user') {
+      return { role: 'user', content: message.content };
+    }
+    if (message.role === 'assistant') {
+      const content: Anthropic.ToolUseBlockParam[] = message.toolCalls.map((call) => ({
+        type: 'tool_use',
+        id: call.id,
+        name: call.name,
+        input: call.arguments,
+      }));
+      return { role: 'assistant', content };
+    }
+    // role === 'tool': fold each safe result into a `tool_result` block on a USER
+    // message. The block content is the normalized output or the safe error only.
+    const content: Anthropic.ToolResultBlockParam[] = message.results.map((result) => {
+      const isError = result.error !== undefined;
+      return {
+        type: 'tool_result',
+        tool_use_id: result.id,
+        content: JSON.stringify(isError ? result.error : (result.output ?? null)),
+        ...(isError ? { is_error: true } : {}),
+      };
+    });
+    return { role: 'user', content };
+  });
+}
+
+/**
+ * Build the SDK tool list from the model-facing definitions. Only name,
+ * description, and a JSON-Schema view of the Zod input schema cross the boundary
+ * — never a provider, connection, tenant, or credential.
+ */
+function toSdkTools(tools: readonly LlmToolDefinition[]): Anthropic.ToolUnion[] {
+  return tools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    input_schema: z.toJSONSchema(tool.inputSchema) as Anthropic.Tool.InputSchema,
+  }));
+}
+
+/** Map a response's `tool_use` blocks onto our neutral {@link LlmToolCall[]}. */
+function extractToolCalls(content: Anthropic.ContentBlock[]): LlmToolCall[] {
+  return content
+    .filter((block): block is Anthropic.ToolUseBlock => block.type === 'tool_use')
+    .map((block) => ({ id: block.id, name: block.name, arguments: block.input }));
 }
 
 /** Normalize the SDK's usage into our own shape, computing the total. */

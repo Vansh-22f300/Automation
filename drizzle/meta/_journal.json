@@ -57,6 +57,13 @@
       "when": 1788085943906,
       "tag": "0007_smiling_warlock",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788097538325,
+      "tag": "0008_special_zeigeist",
+      "breakpoints": true
     }
   ]
 }
