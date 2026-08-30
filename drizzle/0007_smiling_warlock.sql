@@ -1,0 +1,1 @@
+DROP INDEX "connections_tenant_id_provider_active_key";

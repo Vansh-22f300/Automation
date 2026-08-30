@@ -113,6 +113,36 @@ const anthropicBaseUrl = z
     }
   });
 
+/**
+ * The credential-encryption master key (`CREDENTIAL_ENCRYPTION_KEY`).
+ *
+ * Optional: the application must boot without it. Only connection encrypt/decrypt
+ * paths need it, and they fail clearly at use time when it is absent (see
+ * src/security/credential-cipher.ts). When *present* it must be a real 256-bit key
+ * — 64 hex characters or a base64/base64url value decoding to exactly 32 bytes — so
+ * a misconfigured key is caught at boot, not at the first credential operation.
+ *
+ * It is a secret: never logged, never persisted, never returned to clients. The
+ * validation below describes only the *shape* problem and never echoes the value.
+ * The check is intentionally duplicated (not imported from credential-cipher) to
+ * keep the config layer free of a dependency cycle; the byte lengths are the
+ * contract, and credential-cipher parses the same shapes.
+ */
+const credentialEncryptionKey = z
+  .string()
+  .min(1, 'must not be empty when set')
+  .superRefine((value, ctx) => {
+    const trimmed = value.trim();
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) return; // 64 hex chars → 32 bytes.
+    if (Buffer.from(trimmed, 'base64').length === 32) return; // base64 → 32 bytes.
+    ctx.addIssue({
+      code: 'custom',
+      message:
+        'must decode to 32 bytes (256 bits): supply 64 hex characters or a base64 value of a 32-byte key ' +
+        '(generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))")',
+    });
+  });
+
 const envSchema = z
   .object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -171,6 +201,13 @@ const envSchema = z
    * Against a gateway this must be a model id that gateway actually accepts.
    */
   ANTHROPIC_MODEL: z.string().min(1).default('claude-opus-5'),
+
+  /**
+   * Master key for encrypting external-service credentials at rest (AES-256-GCM).
+   * Optional so the app boots without it; connection operations that actually need
+   * to encrypt/decrypt fail clearly when it is missing. Never logged or persisted.
+   */
+  CREDENTIAL_ENCRYPTION_KEY: credentialEncryptionKey.optional(),
   })
   .superRefine((env, ctx) => {
     // Reject ambiguous credentials rather than silently picking one. An API key

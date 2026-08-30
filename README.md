@@ -4,7 +4,7 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 8 of 13 — LLM workflow step (structured, schema-validated AI reasoning).**
+> **Status: Step 9A of 13 — tool / connector foundation (credential boundary).**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
 > service for authoring workflows and their immutable versioned definitions, a
@@ -13,11 +13,15 @@ an LLM, calling external tools, and keeping a durable audit trail of every step.
 > claims work under a lease (`FOR UPDATE SKIP LOCKED`) and a reaper that returns
 > abandoned jobs to the queue, a workflow execution engine that advances a run by
 > exactly one step per job, a framework-free LLM abstraction with a
-> production-safe Claude adapter behind it, and — new in this step — an `llm`
-> workflow step that runs real AI reasoning with schema-validated structured
-> output. **There is still no tool calling, no external connectors and no agent
-> loop** — the `llm` step reasons over the run's own context only; connectors and
-> tool use are Step 9+.
+> production-safe Claude adapter behind it, an `llm` workflow step that runs real
+> AI reasoning with schema-validated structured output, and — new in this step —
+> the generic, provider-neutral **tool / connector foundation**: a tenant-scoped
+> `connections` store with application-level AES-256-GCM credential encryption, a
+> tool registry, and a tool executor that enforces argument validation and a hard
+> credential boundary. **There is still no actual connector** (no Slack/Gmail/
+> GitHub, no OAuth, no arbitrary HTTP), and tool calling is not yet wired into
+> Claude — Step 9A builds only the architecture and the credential boundary; the
+> first real connector is Step 9B.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -75,6 +79,9 @@ pnpm db:migrate
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
 | `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs, jobs, step runs and `llm_usage` (read-only dev aid to verify ingestion, queueing and execution). |
+| `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY`). Never prints the decrypted secret or the key. |
+| `pnpm connections list <tenantId>` | List a tenant's connections — metadata only (id, provider/name, status, last-used), never the secret. |
+| `pnpm connections disable <tenantId> <connectionId>` | Disable a connection so it can no longer be resolved for a tool run. |
 | `pnpm llm:smoke ["question"]` | **Optional live Claude check.** Makes one real API call *only* if a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) is set; prints normalized model/tokens/latency + answer and the endpoint origin (never the key/token). Tests plain then structured output, reporting each separately. Exits cleanly with a message when no credential is set. |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
@@ -515,7 +522,7 @@ code rather than placeholder files.
 
 ## Data model
 
-Ten tables so far. Two rules drive the shape of all of them.
+Eleven tables so far. Two rules drive the shape of all of them.
 
 **Every tenant-scoped table carries `tenant_id`** — even where it is derivable by
 joining. Tenant isolation has to be expressible as a predicate on the table being
@@ -541,6 +548,7 @@ definition as a single immutable versioned value.
 | `workflow_step_runs` | One executed step of a run | Records the step's `status`, `output` jsonb and error, one row per step the engine advances. Composite tenant-safe FK to its run. |
 | `llm_usage` | Token/latency accounting for one `llm` step | `provider`, `model`, `input_tokens`/`output_tokens`/`total_tokens`, `latency_ms`. Written atomically with the step-run settle; `UNIQUE(step_run_id)`. Metadata only — never the prompt, output or credential. |
 | `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
+| `connections` | A tenant's authorization to act against an external provider | `provider`, `name`, `status` (`active`/`disabled`/`error`), `encrypted_credentials` jsonb (a versioned AES-256-GCM envelope — never plaintext), non-secret `metadata`, `last_used_at`. `UNIQUE(tenant_id, id)` for future composite FKs; partial unique index on `(tenant_id, provider) WHERE status='active'` so provider resolution is unambiguous. |
 
 Two constraints are worth calling out because they encode invariants the
 application would otherwise have to remember:
@@ -659,7 +667,7 @@ refuse to run unless the database name contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–8)
+### Implemented (Steps 1–9A)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -774,6 +782,32 @@ refuse to run unless the database name contains `test`.
   `llm` step fails cleanly with `llm_provider_not_configured`. **Still no tool
   calling, connectors or agent loop** — the step reasons over the run's own context
   only; those are Step 9+.
+- **Tool / connector foundation (Step 9A)** — the generic, provider-neutral
+  architecture a real connector will plug into, plus the credential boundary, and
+  nothing service-specific. A tenant-scoped `connections` store keeps external
+  credentials encrypted at rest with **application-level AES-256-GCM**
+  ([`credential-cipher.ts`](src/security/credential-cipher.ts)): a fresh random IV
+  per encryption, a GCM tag verified before any plaintext is returned, a 256-bit key
+  supplied only via `CREDENTIAL_ENCRYPTION_KEY` (never in the DB, never logged, never
+  returned by the API), and a versioned envelope (`{v,alg,iv,ct,tag}`) shaped for
+  future key rotation without a migration. The app still boots without the key;
+  only an actual encrypt/decrypt fails clearly when it is missing. A framework-free
+  [`ToolDefinition`](src/domain/tool.ts) binds a name + description + Zod
+  `inputSchema` to a `Connector` (no URL, method, script or shell — a tool can only
+  do what its reviewed connector code does); a [`ToolRegistry`](src/domain/tool-registry.ts)
+  registers/resolves tools (duplicate and unknown both rejected) and lists metadata
+  only. The [`ToolExecutor`](src/domain/tool-executor.ts) enforces a fixed order —
+  resolve tool → **validate arguments** (invalid args fail before anything external)
+  → authorize the connection reference (which comes from trusted config, **never the
+  model's arguments**) → resolve the tenant-scoped connection → decrypt at the
+  execution boundary only → run the connector → normalize to a `ToolResult` whose
+  error is classified and which never carries the credential. A
+  [`ConnectionRepository`](src/repositories/connection-repository.ts) owns the one
+  narrow decrypt path (`resolveForTool`) and metadata operations that never return
+  the secret; a dev-only `pnpm connections` CLI (create/list/disable) exercises it.
+  **No actual connector ships** (no Slack/Gmail/GitHub, no OAuth, no arbitrary HTTP),
+  tool calling is not wired into Claude, and there are no retries — those are Step 9B
+  and Step 11.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -783,20 +817,22 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| External connectors, tool calling, credential encryption, first integration (Slack) — the first step reaching outside the platform | Steps 9–10 |
+| First concrete external connector (Slack), OAuth, tool calling wired into Claude, arbitrary-HTTP-free provider integration | Step 9B–10 |
 | Retry policy and backoff | Step 11 |
 | Run inspection endpoints and log redaction | Step 12 |
 | Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
 | HMAC / provider signature verification on webhooks | before production webhooks |
 | Agent loops, autonomous multi-step agents, MCP, RAG / embeddings, prompt caching, streaming, model training / fine-tuning, any frontend | not scheduled |
 
-The tables later steps need — `connections`, `audit_log` — are not
-in the schema yet, for the same reason the directories are empty: they arrive with
-the code that uses them.
+The tool / connector *foundation* now exists (Step 9A: the `connections` table,
+credential encryption, the tool registry and executor), but no concrete connector
+does yet. A generic `audit_log` table is deliberately still absent — Step 9A keeps a
+structured, metadata-only execution record and logging rather than committing to a
+premature audit schema; it arrives with the code that proves it necessary.
 
-**Up next is Step 9 — the first external connector / tool integration**, the point
-at which a workflow first reaches outside the platform (connector definitions,
-credential handling and the first concrete integration). Retries and backoff
+**Up next is Step 9B — the first concrete external connector (Slack)**, the point
+at which a workflow first reaches outside the platform, built on the 9A foundation
+without touching the executor, worker, queue or LLM provider. Retries and backoff
 (Step 11), run-inspection endpoints (Step 12) and production hardening (Step 13)
 follow. Each step is implemented, verified and paused for review before the next
 begins.

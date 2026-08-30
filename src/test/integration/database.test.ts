@@ -74,6 +74,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('database integration', () => {
 
     expect(result.rows.map((r) => r.table_name)).toEqual([
       'api_keys',
+      'connections',
       'events',
       'jobs',
       'llm_usage',

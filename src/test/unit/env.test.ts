@@ -239,4 +239,35 @@ describe('parseEnv / ANTHROPIC_BASE_URL', () => {
       'ANTHROPIC_BASE_URL',
     );
   });
+
+  describe('CREDENTIAL_ENCRYPTION_KEY', () => {
+    it('is optional — the app parses without it', () => {
+      expect(parseEnv({ ...base })).not.toHaveProperty('CREDENTIAL_ENCRYPTION_KEY');
+    });
+
+    it('accepts 64 hex characters', () => {
+      const hex = 'a'.repeat(64);
+      expect(parseEnv({ ...base, CREDENTIAL_ENCRYPTION_KEY: hex }).CREDENTIAL_ENCRYPTION_KEY).toBe(hex);
+    });
+
+    it('accepts a base64 value decoding to 32 bytes', () => {
+      const b64 = Buffer.alloc(32, 7).toString('base64');
+      expect(parseEnv({ ...base, CREDENTIAL_ENCRYPTION_KEY: b64 }).CREDENTIAL_ENCRYPTION_KEY).toBe(b64);
+    });
+
+    it('rejects a key of the wrong length', () => {
+      expect(offendingVariables(() => parseEnv({ ...base, CREDENTIAL_ENCRYPTION_KEY: 'deadbeef' }))).toContain(
+        'CREDENTIAL_ENCRYPTION_KEY',
+      );
+      expect(
+        offendingVariables(() => parseEnv({ ...base, CREDENTIAL_ENCRYPTION_KEY: 'a'.repeat(63) })),
+      ).toContain('CREDENTIAL_ENCRYPTION_KEY');
+    });
+
+    it('rejects an explicitly empty value', () => {
+      expect(offendingVariables(() => parseEnv({ ...base, CREDENTIAL_ENCRYPTION_KEY: '' }))).toContain(
+        'CREDENTIAL_ENCRYPTION_KEY',
+      );
+    });
+  });
 });

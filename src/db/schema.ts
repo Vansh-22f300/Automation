@@ -150,6 +150,15 @@ export const workflowStepRunStatus = pgEnum('workflow_step_run_status', [
   'failed',
 ]);
 
+/**
+ * The lifecycle state of a stored external-service connection.
+ * - `active`   — usable; the only state credential resolution will decrypt.
+ * - `disabled` — deliberately turned off; resolution refuses it.
+ * - `error`    — marked broken (e.g. the credential was rejected upstream).
+ */
+export const connectionStatus = pgEnum('connection_status', ['active', 'disabled', 'error']);
+
+
 // ---------------------------------------------------------------------------
 // tenants
 // ---------------------------------------------------------------------------
@@ -798,6 +807,69 @@ export const apiKeys = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// connections
+// ---------------------------------------------------------------------------
+
+/**
+ * A tenant's stored authorization to act against an external provider (Slack,
+ * GitHub, Gmail — none of which exist yet; this is the generic store they will use).
+ *
+ * The security model is deliberate:
+ *
+ * - **The secret is never stored in the clear.** `encrypted_credentials` holds a
+ *   versioned AES-256-GCM envelope (see src/security/credential-cipher.ts), not a
+ *   token, refresh token, or password. A database dump reveals nothing usable
+ *   without the separately-held key, which never lives in Postgres.
+ * - **`metadata`** is for non-secret descriptors (account label, scopes) — a place
+ *   for facts safe to list and log. The secret never goes here.
+ * - **Tenant isolation is the database's, not just the code's.** `tenant_id`
+ *   cascades from `tenants`, and `unique(tenant_id, id)` makes this a valid target
+ *   for future composite tenant-safe FKs `(tenant_id, connection_id)`.
+ * - **`last_used_at`** records when a credential was last decrypted for use, for
+ *   hygiene. Nullable; a never-used connection has null here.
+ *
+ * Two uniqueness rules encode "one connection per name, one *active* per provider":
+ * `unique(tenant_id, provider, name)` keeps names distinct within a provider, and
+ * the partial unique index on `(tenant_id, provider) WHERE status = 'active'` makes
+ * "resolve this tenant's active connection for a provider" unambiguous. An explicit
+ * connection id still overrides that default resolution.
+ */
+export const connections = pgTable(
+  'connections',
+  {
+    id: primaryId(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id, { onDelete: 'cascade' }),
+    /** Stable provider identifier, e.g. `slack`. Free-form text, not an enum: the */
+    /** set of providers grows without a migration. */
+    provider: text('provider').notNull(),
+    /** Human label distinguishing multiple connections to the same provider. */
+    name: text('name').notNull(),
+    status: connectionStatus('status').notNull().default('active'),
+    /** The versioned AES-256-GCM envelope. Never plaintext. */
+    encryptedCredentials: jsonb('encrypted_credentials').notNull(),
+    /** Non-secret descriptors (account label, scopes, …). Never the secret. */
+    metadata: jsonb('metadata').notNull().default({}),
+    ...timestamps(),
+    /** When a credential was last decrypted for use. Null if never used. */
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    /** Composite tenant-safe FK target for future `(tenant_id, connection_id)` refs. */
+    unique('connections_tenant_id_id_key').on(t.tenantId, t.id),
+    /** Names are distinct within a tenant + provider. */
+    unique('connections_tenant_id_provider_name_key').on(t.tenantId, t.provider, t.name),
+    // NOTE: there is deliberately NO "one active connection per (tenant, provider)"
+    // constraint. A tenant may hold many active connections to the same provider
+    // (e.g. two Slack workspaces). Which one a tool uses is decided by a trusted
+    // `connectionId` in workflow/tool config — never inferred, never model-chosen.
+    /** Tenant-scoped listing, newest first. */
+    index('connections_tenant_id_created_at_idx').on(t.tenantId, t.createdAt.desc()),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Relations
 // ---------------------------------------------------------------------------
 //
@@ -815,6 +887,7 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   jobs: many(jobs),
   stepRuns: many(workflowStepRuns),
   llmUsage: many(llmUsage),
+  connections: many(connections),
 }));
 
 export const usersRelations = relations(users, ({ one }) => ({
@@ -885,6 +958,10 @@ export const jobsRelations = relations(jobs, ({ one }) => ({
   run: one(workflowRuns, { fields: [jobs.runId], references: [workflowRuns.id] }),
 }));
 
+export const connectionsRelations = relations(connections, ({ one }) => ({
+  tenant: one(tenants, { fields: [connections.tenantId], references: [tenants.id] }),
+}));
+
 // ---------------------------------------------------------------------------
 // Inferred row types
 // ---------------------------------------------------------------------------
@@ -921,3 +998,6 @@ export type NewWorkflowStepRun = typeof workflowStepRuns.$inferInsert;
 
 export type LlmUsage = typeof llmUsage.$inferSelect;
 export type NewLlmUsage = typeof llmUsage.$inferInsert;
+
+export type Connection = typeof connections.$inferSelect;
+export type NewConnection = typeof connections.$inferInsert;
