@@ -32,6 +32,7 @@ describe('parseEnv', () => {
       PORT: 3000,
       DATABASE_URL: VALID_DATABASE_URL,
       DATABASE_POOL_MAX: 10,
+      ANTHROPIC_MODEL: 'claude-opus-5',
     });
   });
 

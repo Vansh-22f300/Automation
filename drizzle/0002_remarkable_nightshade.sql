@@ -27,9 +27,9 @@ CREATE TABLE "workflow_runs" (
 --> statement-breakpoint
 ALTER TABLE "events" ADD CONSTRAINT "events_tenant_id_tenants_id_fk" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "workflow_runs" ADD CONSTRAINT "workflow_runs_tenant_id_workflow_id_fkey" FOREIGN KEY ("tenant_id","workflow_id") REFERENCES "public"."workflows"("tenant_id","id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "workflow_versions" ADD CONSTRAINT "workflow_versions_tenant_id_id_key" UNIQUE("tenant_id","id");--> statement-breakpoint
 ALTER TABLE "workflow_runs" ADD CONSTRAINT "workflow_runs_tenant_id_workflow_version_id_fkey" FOREIGN KEY ("tenant_id","workflow_version_id") REFERENCES "public"."workflow_versions"("tenant_id","id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "workflow_runs" ADD CONSTRAINT "workflow_runs_tenant_id_event_id_fkey" FOREIGN KEY ("tenant_id","event_id") REFERENCES "public"."events"("tenant_id","id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "events_tenant_id_source_received_at_idx" ON "events" USING btree ("tenant_id","source","received_at" DESC NULLS LAST);--> statement-breakpoint
 CREATE INDEX "workflow_runs_tenant_id_created_at_idx" ON "workflow_runs" USING btree ("tenant_id","created_at" DESC NULLS LAST);--> statement-breakpoint
-CREATE UNIQUE INDEX "workflow_versions_one_active_per_tenant_source_idx" ON "workflow_versions" USING btree ("tenant_id",("trigger_config" ->> 'source')) WHERE "workflow_versions"."is_active";--> statement-breakpoint
-ALTER TABLE "workflow_versions" ADD CONSTRAINT "workflow_versions_tenant_id_id_key" UNIQUE("tenant_id","id");
+CREATE UNIQUE INDEX "workflow_versions_one_active_per_tenant_source_idx" ON "workflow_versions" USING btree ("tenant_id",("trigger_config" ->> 'source')) WHERE "workflow_versions"."is_active";

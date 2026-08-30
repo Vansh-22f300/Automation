@@ -18,25 +18,17 @@
  * whose name does not contain "test".
  */
 
-import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { parseEnv } from '@/config/env.js';
-import { createDatabase, describeDatabaseUrl } from '@/db/client.js';
+
 import type { DatabaseHandle } from '@/db/client.js';
 import { tenants, users, workflowVersions, workflows } from '@/db/schema.js';
-import { createLogger } from '@/observability/logger.js';
 
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+import { TEST_DATABASE_URL, createTestDatabaseHandle, sqlStateOf } from './support.js';
 
 /** PostgreSQL SQLSTATE codes we assert on. */
 const UNIQUE_VIOLATION = '23505';
 const FOREIGN_KEY_VIOLATION = '23503';
-
-function sqlStateOf(error: unknown): string | undefined {
-  const code = (error as { readonly code?: unknown }).code;
-  return typeof code === 'string' ? code : undefined;
-}
 
 /** A minimal definition document; the real Zod schema arrives in Step 6. */
 const SAMPLE_DEFINITION = {
@@ -53,25 +45,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('database integration', () => {
   let otherTenantId: string;
 
   beforeAll(async () => {
-    const url = TEST_DATABASE_URL as string;
-    const target = describeDatabaseUrl(url);
-
-    if (!target.database.includes('test')) {
-      throw new Error(
-        `Refusing to run integration tests against database "${target.database}": ` +
-          'these tests write and delete rows. Point TEST_DATABASE_URL at a database ' +
-          'whose name contains "test".',
-      );
-    }
-
-    const env = parseEnv({ DATABASE_URL: url, LOG_LEVEL: 'silent' });
-    handle = createDatabase(env, createLogger(env, { service: 'test' }), {
-      service: 'test',
-      statementTimeoutMs: 60_000,
-    });
-
+    handle = createTestDatabaseHandle();
     await handle.verifyConnection();
-    await migrate(handle.db, { migrationsFolder: 'drizzle' });
 
     const inserted = await handle.db
       .insert(tenants)
@@ -98,8 +73,13 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('database integration', () => {
     );
 
     expect(result.rows.map((r) => r.table_name)).toEqual([
+      'api_keys',
+      'events',
+      'jobs',
       'tenants',
       'users',
+      'workflow_runs',
+      'workflow_step_runs',
       'workflow_versions',
       'workflows',
     ]);

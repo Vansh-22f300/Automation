@@ -24,26 +24,22 @@
  * not contain "test".
  */
 
-import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { parseEnv } from '@/config/env.js';
-import { createDatabase, describeDatabaseUrl } from '@/db/client.js';
 import type { DatabaseHandle } from '@/db/client.js';
 import { events, jobs, tenants, workflowRuns } from '@/db/schema.js';
-import { createLogger } from '@/observability/logger.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
 
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
 
-const definition = (label: string) => ({
+const definition = () => ({
   version: 1,
   steps: [
-    { key: 'first', type: 'noop', config: { label } },
+    { key: 'first', type: 'noop', config: {} },
     { key: 'second', type: 'noop', config: {} },
   ],
 });
@@ -59,23 +55,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
     new WorkflowRepository(new TenantScope(handle.db, tenantId));
 
   beforeAll(async () => {
-    const url = TEST_DATABASE_URL as string;
-    const target = describeDatabaseUrl(url);
-    if (!target.database.includes('test')) {
-      throw new Error(
-        `Refusing to run integration tests against database "${target.database}": ` +
-          'point TEST_DATABASE_URL at a database whose name contains "test".',
-      );
-    }
-
-    const env = parseEnv({ DATABASE_URL: url, LOG_LEVEL: 'silent' });
-    handle = createDatabase(env, createLogger(env, { service: 'test' }), {
-      service: 'test',
-      statementTimeoutMs: 60_000,
-    });
-
+    handle = createTestDatabaseHandle();
     await handle.verifyConnection();
-    await migrate(handle.db, { migrationsFolder: 'drizzle' });
 
     const inserted = await handle.db
       .insert(tenants)
@@ -172,7 +153,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
   it('creates a queued run with the right fields when an active workflow matches', async () => {
     const created = await workflowsFor(tenantA).create({
       name: 'Routed workflow',
-      definition: definition('v1'),
+      definition: definition(),
       triggerType: 'webhook',
       triggerConfig: { source: 'routed' },
     });
@@ -222,7 +203,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
   it('does not let tenant A trigger tenant B’s workflow on the same source', async () => {
     await workflowsFor(tenantB).create({
       name: 'B only',
-      definition: definition('b'),
+      definition: definition(),
       triggerType: 'webhook',
       triggerConfig: { source: 'tenant-scoped' },
     });
@@ -240,7 +221,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
   it('pins the version: activating a newer version leaves an existing run on the old one', async () => {
     const created = await workflowsFor(tenantA).create({
       name: 'Versioned',
-      definition: definition('v1'),
+      definition: definition(),
       triggerType: 'webhook',
       triggerConfig: { source: 'pinned' },
     });
@@ -254,7 +235,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
 
     // Author and activate v2 for the same workflow + source.
     const v2 = await workflowsFor(tenantA).createVersion(created.workflow.id, {
-      definition: definition('v2'),
+      definition: definition(),
       triggerType: 'webhook',
       triggerConfig: { source: 'pinned' },
       activate: true,
@@ -285,7 +266,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('webhook ingestion integration'
   it('reports a configured duplicate: a retry returns the existing run, not a new one', async () => {
     await workflowsFor(tenantA).create({
       name: 'Dup workflow',
-      definition: definition('d'),
+      definition: definition(),
       triggerType: 'webhook',
       triggerConfig: { source: 'dup' },
     });

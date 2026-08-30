@@ -24,22 +24,18 @@
  * not contain "test", and wipes the jobs table between tests for isolation.
  */
 
-import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
-import { parseEnv } from '@/config/env.js';
-import { createDatabase, describeDatabaseUrl } from '@/db/client.js';
 import type { DatabaseHandle } from '@/db/client.js';
 import { jobs, tenants } from '@/db/schema.js';
 import { InvalidJobTransitionError } from '@/domain/queue.js';
-import { createLogger } from '@/observability/logger.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
 
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
 
 const definition = () => ({
   version: 1,
@@ -83,23 +79,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres job queue integration
   };
 
   beforeAll(async () => {
-    const url = TEST_DATABASE_URL as string;
-    const target = describeDatabaseUrl(url);
-    if (!target.database.includes('test')) {
-      throw new Error(
-        `Refusing to run integration tests against database "${target.database}": ` +
-          'point TEST_DATABASE_URL at a database whose name contains "test".',
-      );
-    }
-
-    const env = parseEnv({ DATABASE_URL: url, LOG_LEVEL: 'silent' });
-    handle = createDatabase(env, createLogger(env, { service: 'test' }), {
-      service: 'test',
-      statementTimeoutMs: 60_000,
-    });
-
+    handle = createTestDatabaseHandle();
     await handle.verifyConnection();
-    await migrate(handle.db, { migrationsFolder: 'drizzle' });
 
     const inserted = await handle.db
       .insert(tenants)

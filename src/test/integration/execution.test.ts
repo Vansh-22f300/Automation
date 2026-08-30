@@ -20,12 +20,10 @@
  * tables between tests.
  */
 
-import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { parseEnv } from '@/config/env.js';
-import { createDatabase, describeDatabaseUrl } from '@/db/client.js';
 import type { DatabaseHandle } from '@/db/client.js';
 import { events, jobs, tenants, workflowRuns, workflowStepRuns } from '@/db/schema.js';
 import { PermanentError } from '@/domain/errors.js';
@@ -39,12 +37,15 @@ import { WebhookRepository } from '@/repositories/webhook-repository.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
 import { StepFailedError } from '@/worker/dispatcher.js';
 
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
 
 const steps = (...keys: string[]) => keys.map((key) => ({ key, type: 'noop', config: {} }));
 const definition = (...keys: string[]) => ({ version: 1, steps: steps(...keys) });
 
-const silent = () => createLogger(parseEnv({ DATABASE_URL: 'x', LOG_LEVEL: 'silent' }) as never, { service: 'test' });
+const silent = () =>
+  createLogger(parseEnv({ DATABASE_URL: 'postgresql://u:p@localhost:5432/db', LOG_LEVEL: 'silent' }) as never, {
+    service: 'test',
+  });
 
 describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine integration', () => {
   let handle: DatabaseHandle;
@@ -119,23 +120,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
   };
 
   beforeAll(async () => {
-    const url = TEST_DATABASE_URL as string;
-    const target = describeDatabaseUrl(url);
-    if (!target.database.includes('test')) {
-      throw new Error(
-        `Refusing to run integration tests against database "${target.database}": ` +
-          'point TEST_DATABASE_URL at a database whose name contains "test".',
-      );
-    }
-
-    const env = parseEnv({ DATABASE_URL: url, LOG_LEVEL: 'silent' });
-    handle = createDatabase(env, createLogger(env, { service: 'test' }), {
-      service: 'test',
-      statementTimeoutMs: 60_000,
-    });
-
+    handle = createTestDatabaseHandle();
     await handle.verifyConnection();
-    await migrate(handle.db, { migrationsFolder: 'drizzle' });
 
     const inserted = await handle.db
       .insert(tenants)

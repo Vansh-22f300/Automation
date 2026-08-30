@@ -4,16 +4,18 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 6 of 13 — workflow execution engine (linear `noop` workflows).**
+> **Status: Step 7 of 13 — Claude LLM provider (vendor-neutral `LlmProvider` seam).**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
 > service for authoring workflows and their immutable versioned definitions, a
 > webhook endpoint that captures events idempotently and creates a queued workflow
-> run (and its first job) atomically, and a durable `jobs` queue with a worker that
+> run (and its first job) atomically, a durable `jobs` queue with a worker that
 > claims work under a lease (`FOR UPDATE SKIP LOCKED`) and a reaper that returns
-> abandoned jobs to the queue. There is still no step executor and no AI
-> integration — a job is claimed but nothing executes the step yet; the worker
-> records that boundary as a clear job failure rather than pretending work was done.
+> abandoned jobs to the queue, a workflow execution engine that advances a run by
+> exactly one step per job, and now a framework-free LLM abstraction with a
+> production-safe Claude adapter behind it. **Claude is not yet a workflow step and
+> there is no tool calling or agent loop** — this step only builds the provider
+> seam; wiring it into an `llm` step and adding tool use are Step 8+.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -71,6 +73,7 @@ pnpm db:migrate
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
 | `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs and jobs (read-only dev aid to verify ingestion and queueing). |
+| `pnpm llm:smoke ["question"]` | **Optional live Claude check.** Makes one real API call *only* if `ANTHROPIC_API_KEY` is set; prints normalized model/tokens/latency + answer (never the key). Exits cleanly with a message when no key is set. |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
 | `pnpm build` | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths. |
@@ -244,14 +247,83 @@ FATAL: configuration error — refusing to start.
 | `LOG_LEVEL` | `info` | pino level: `fatal`…`trace`, or `silent`. `debug` also logs every SQL statement. |
 | `HOST` | `127.0.0.1` | API bind address. Use `0.0.0.0` in a container or on a PaaS. |
 | `PORT` | `3000` | API port. |
+| `ANTHROPIC_API_KEY` | *(unset)* | **Optional secret.** Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients. |
+| `ANTHROPIC_MODEL` | `claude-opus-5` | The Claude model the provider defaults to when a request names none. A deployment decision; any request may override it. |
 
 `.env` is loaded by Node's built-in `--env-file-if-exists`, so no `dotenv`
 dependency is involved. Validation of `DATABASE_URL` is structural only — scheme,
 host and database name — and never echoes the URL in an error, because it carries
 a password and these messages go to stderr.
 
-Variables are added only when code actually consumes them. `ANTHROPIC_API_KEY`
-and the credential encryption key arrive with the steps that need them.
+`ANTHROPIC_API_KEY` is deliberately **optional**: the API and worker start
+without it, and only fail — clearly, at the provider boundary — if something
+actually tries to construct a Claude provider without a key. It is a secret and
+is treated as one everywhere: never logged, never persisted, never placed in an
+error object, and never returned to an API client.
+
+## LLM provider (Step 7)
+
+The system talks to a large language model through one small, vendor-neutral
+seam — [`LlmProvider`](src/domain/llm.ts) — and nothing outside the adapter knows
+which vendor is behind it. The seam names only the capabilities actually needed
+today: text completion, schema-constrained structured output, and normalized
+token/latency/model metadata. It is framework-free (its only third-party import
+is Zod, already used pervasively for validation), so the engine and future
+workflow steps depend on the interface, never on any SDK.
+
+[`ClaudeProvider`](src/llm/claude-provider.ts) is the single implementation and
+the **only** place in the codebase that imports `@anthropic-ai/sdk`. It:
+
+- **owns one SDK client**, built from constructor config — it never reads
+  `process.env` itself. `createClaudeProvider(env, logger)` is the one bridge from
+  validated `Env` to a provider, and it fails clearly if the key is missing. This
+  is why the application boots without a key: nothing constructs a provider until
+  a Claude call is actually needed.
+- **normalizes requests and responses.** Callers pass a vendor-neutral
+  `LlmCompletionRequest` (system, messages, model, `maxOutputTokens`, optional
+  `temperature`/`timeoutMs`/`signal`) and receive an `LlmCompletion` (text, model,
+  `{inputTokens, outputTokens, totalTokens}`, latency, provider). Raw SDK objects
+  never escape the boundary.
+- **does structured output the SDK's way** — `messages.parse()` with
+  `zodOutputFormat(schema)`, not "return JSON" + ad-hoc parsing — then
+  defensively re-validates against the Zod schema. A mismatch (or a null parse) is
+  a `PermanentError` (`llm_structured_parse_failed`); malformed data never reaches
+  workflow context.
+- **maps errors by SDK class, never by string** onto the shared taxonomy.
+  *Retryable*: abort/timeout, connection failure, `429`, and transient `408`/`5xx`.
+  *Permanent*: bad key (`401`/`403`), invalid request (`400`/`422`), unknown model
+  (`404`), a refusal `stop_reason`, and — crucially — any *unrecognised* error, so
+  an unknown failure can never accidentally become retryable. The provider
+  **classifies but does not retry**: deciding whether to retry is the engine's job
+  (Step 11). The SDK's own retry loop is disabled (`maxRetries: 0`).
+- **times out and cancels** via a default timeout (`60s`, overridable per config
+  or per request) and an optional `AbortSignal` wired straight through.
+- **logs metadata only** — provider, model, latency, token counts, and on failure
+  an `err_code`. Never the API key, the prompt, or the response body. Raw SDK
+  errors (which may carry credentials or payloads) are never re-thrown to callers;
+  only a redacted `AppError` escapes.
+- **never touches the database.** Usage is returned on the result; persisting it
+  is the caller's responsibility (a later step), keeping the provider free of
+  infrastructure concerns.
+
+The model is injectable (`ANTHROPIC_MODEL`, default `claude-opus-5`, overridable
+per request) — there is no hardcoded model string in business logic. Note that
+current Claude models reject sampling parameters, so setting `temperature` against
+them surfaces as a permanent invalid-request error rather than being silently
+ignored; `temperature` is kept on the neutral interface because the seam is
+provider-generic.
+
+To confirm it end-to-end against the live API (optional, key-gated):
+
+```bash
+pnpm llm:smoke "In one sentence, what is a workflow?"
+```
+
+> **Claude is not a workflow step yet, and there is no tool calling.** Step 7 is
+> only the provider seam and its Claude adapter. Wiring an `llm` step into the
+> execution engine, and tool calling / agent loops, arrive in Step 8 and beyond.
+> Tool use, agent loops, autonomous agents, MCP, RAG, embeddings, prompt caching
+> and streaming are all deliberately absent here.
 
 ## Project layout
 
@@ -277,7 +349,7 @@ src/
 │   ├── webhook-repository.ts   Tenant-scoped webhook ingestion (event + run + first job, one txn)
 │   ├── job-queue.ts            PostgresJobQueue — enqueue/claim/complete/fail/requeueExpired
 │   └── execution-engine.ts     WorkflowExecutor — advances a run by one step, atomically
-├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts, inspect-webhooks.ts (bootstrap/dev)
+├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts, inspect-webhooks.ts, llm-smoke.ts (bootstrap/dev)
 ├── worker/
 │   ├── main.ts               Entrypoint 2 — composition root: worker + reaper wiring, shutdown
 │   ├── worker.ts             The claim → verify → dispatch → settle loop
@@ -299,7 +371,10 @@ src/
 │   ├── execution-context.ts  Framework-free trigger + step-output accessor
 │   ├── references.ts         No-eval {{trigger.*}} / {{steps.*.output}} resolver
 │   ├── step-handler.ts       StepHandler interface + registry (noop)
-│   └── queue.ts             Framework-free Queue contract + InvalidJobTransitionError
+│   ├── queue.ts             Framework-free Queue contract + InvalidJobTransitionError
+│   └── llm.ts               Framework-free LlmProvider seam + request/response/usage types
+├── llm/
+│   └── claude-provider.ts    ClaudeProvider — the only importer of @anthropic-ai/sdk
 └── test/
     ├── unit/                 No external dependencies
     └── integration/          Requires PostgreSQL; skipped without it
@@ -311,7 +386,7 @@ One codebase, two deployable processes. They share all domain code by direct
 import, and are separate processes because they fail and scale differently — a
 slow LLM call must never block webhook ingestion.
 
-Directories for future concerns (`engine/`, `queue/`, `llm/`, `connectors/`,
+Directories for future concerns (`engine/`, `queue/`, `connectors/`,
 `security/`) are deliberately **not** created yet; they appear when they hold real
 code rather than placeholder files.
 
@@ -466,7 +541,7 @@ contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–6)
+### Implemented (Steps 1–7)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -542,6 +617,23 @@ contains `test`.
   and enqueues nothing (no retries — Step 11). `webhooks:inspect` now also lists
   step runs. Structured logs: `step_started`, `step_succeeded`, `step_failed`,
   `run_advanced`, `run_succeeded`, `run_failed`.
+- **Claude LLM provider (Step 7)** — a framework-free
+  [`LlmProvider`](src/domain/llm.ts) seam (text completion, Zod-schema structured
+  output, normalized usage/latency/model) and a single
+  [`ClaudeProvider`](src/llm/claude-provider.ts) behind it — the only importer of
+  `@anthropic-ai/sdk`. It owns one SDK client built from constructor config
+  (`createClaudeProvider` is the one bridge from `Env`; missing key fails clearly,
+  so the app still boots without a key), normalizes requests/responses so no raw
+  SDK object escapes, does structured output via `messages.parse` +
+  `zodOutputFormat` with defensive re-validation (parse failure → `PermanentError`),
+  maps SDK errors **by class** onto `RetryableError`/`PermanentError` (unknown
+  errors are never retryable) while classifying-not-retrying with `maxRetries: 0`,
+  honours a default/overridable timeout and `AbortSignal`, and logs metadata only
+  (never key, prompt or response). Usage is returned, never persisted — the
+  provider never touches the DB. The model is config-injectable
+  (`ANTHROPIC_MODEL`, overridable per request). An optional key-gated
+  `pnpm llm:smoke` exercises the live API. **Not a workflow step and no tool
+  calling yet** — that is Step 8+.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -551,7 +643,7 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| Claude integration behind an `LlmProvider` interface | Steps 7–8 |
+| Claude as a workflow `llm` step, tool calling, agent loops | Step 8 |
 | Connectors, credential encryption, first integration (Slack) | Steps 9–10 |
 | Retry policy and backoff | Step 11 |
 | Run inspection endpoints and log redaction | Step 12 |

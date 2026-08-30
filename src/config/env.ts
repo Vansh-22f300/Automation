@@ -97,6 +97,24 @@ const envSchema = z.object({
    * Postgres plans cap connections aggressively; keep this modest.
    */
   DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
+
+  /**
+   * Anthropic (Claude) API key. Optional on purpose: the application must boot
+   * without it — only code paths that actually call Claude need it, and they
+   * validate its presence at the provider layer (see src/llm/claude-provider.ts).
+   * It is a secret: never logged, never persisted, never returned to API
+   * clients. `.min(1)` rejects an explicitly-empty value with a clear message
+   * while an unset variable is simply absent.
+   */
+  ANTHROPIC_API_KEY: z.string().min(1, 'must not be empty when set').optional(),
+
+  /**
+   * The Claude model the provider defaults to when a request does not name one.
+   * Configurable rather than hardcoded so the model is a deployment decision;
+   * any request may still override it. Kept as a free-form string because the
+   * set of valid model ids changes over time and is validated by the API, not us.
+   */
+  ANTHROPIC_MODEL: z.string().min(1).default('claude-opus-5'),
 });
 
 export type Env = z.infer<typeof envSchema>;

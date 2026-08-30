@@ -18,22 +18,18 @@
  * not contain "test".
  */
 
-import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { UnauthorizedError } from '@/api/errors.js';
 import { ApiKeyAuthenticator } from '@/auth/api-key-authenticator.js';
 import { DrizzleApiKeyStore } from '@/auth/api-key-store.js';
-import { parseEnv } from '@/config/env.js';
-import { createDatabase, describeDatabaseUrl } from '@/db/client.js';
 import type { DatabaseHandle } from '@/db/client.js';
 import { apiKeys, tenants } from '@/db/schema.js';
-import { createLogger } from '@/observability/logger.js';
 import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
 
 describe.skipIf(TEST_DATABASE_URL === undefined)('api-key integration', () => {
   let handle: DatabaseHandle;
@@ -44,23 +40,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('api-key integration', () => {
     new ApiKeyRepository(new TenantScope(handle.db, tenantId));
 
   beforeAll(async () => {
-    const url = TEST_DATABASE_URL as string;
-    const target = describeDatabaseUrl(url);
-    if (!target.database.includes('test')) {
-      throw new Error(
-        `Refusing to run integration tests against database "${target.database}": ` +
-          'point TEST_DATABASE_URL at a database whose name contains "test".',
-      );
-    }
-
-    const env = parseEnv({ DATABASE_URL: url, LOG_LEVEL: 'silent' });
-    handle = createDatabase(env, createLogger(env, { service: 'test' }), {
-      service: 'test',
-      statementTimeoutMs: 60_000,
-    });
-
+    handle = createTestDatabaseHandle();
     await handle.verifyConnection();
-    await migrate(handle.db, { migrationsFolder: 'drizzle' });
 
     const inserted = await handle.db
       .insert(tenants)
