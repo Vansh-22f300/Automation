@@ -75,6 +75,77 @@ describe('ClaudeProvider — construction', () => {
   });
 });
 
+describe('ClaudeProvider — configurable auth & base URL', () => {
+  /** Read the private SDK client a provider built for itself. */
+  function builtClientOf(config: Omit<ConstructorParameters<typeof ClaudeProvider>[0], 'model' | 'logger'>) {
+    const provider = new ClaudeProvider({ model: 'claude-opus-5', logger: silentLogger, ...config });
+    return (provider as unknown as { client: Anthropic }).client;
+  }
+
+  /** Inspect the request the SDK would send: target URL and auth headers. */
+  async function requestShape(client: Anthropic): Promise<{
+    url: string;
+    apiKey: string | null;
+    authorization: string | null;
+  }> {
+    const { req, url } = await client.buildRequest({ method: 'post', path: '/v1/messages', body: {} });
+    const headers = req.headers as Headers;
+    const get = (k: string): string | null =>
+      typeof headers.get === 'function' ? headers.get(k) : ((headers as never)[k] ?? null);
+    return { url, apiKey: get('x-api-key'), authorization: get('authorization') };
+  }
+
+  it('uses x-api-key (and no Authorization) when given an API key', async () => {
+    const shape = await requestShape(builtClientOf({ apiKey: 'sk-ant-abc' }));
+    expect(shape.apiKey).toBe('sk-ant-abc');
+    expect(shape.authorization).toBeNull();
+  });
+
+  it('uses Authorization: Bearer (and no x-api-key) when given an auth token', async () => {
+    const shape = await requestShape(builtClientOf({ authToken: 'gw-token' }));
+    expect(shape.authorization).toBe('Bearer gw-token');
+    expect(shape.apiKey).toBeNull();
+  });
+
+  it('targets the configured base URL, and the SDK appends /v1/messages once', async () => {
+    const shape = await requestShape(
+      builtClientOf({ authToken: 'gw-token', baseURL: 'https://gateway.example.com' }),
+    );
+    expect(shape.url).toBe('https://gateway.example.com/v1/messages');
+  });
+
+  it('throws llm_ambiguous_credentials when both an API key and an auth token are given', () => {
+    try {
+      new ClaudeProvider({
+        apiKey: 'sk-ant-abc',
+        authToken: 'gw-token',
+        model: 'claude-opus-5',
+        logger: silentLogger,
+      });
+      expect.unreachable('construction should have thrown');
+    } catch (error) {
+      expect(error).toBeInstanceOf(PermanentError);
+      expect((error as PermanentError).code).toBe('llm_ambiguous_credentials');
+      // The secret values must not ride along in the thrown error.
+      const serialised = `${(error as PermanentError).message} ${JSON.stringify(
+        (error as PermanentError).details,
+      )}`;
+      expect(serialised).not.toContain('sk-ant-abc');
+      expect(serialised).not.toContain('gw-token');
+    }
+  });
+
+  it('throws llm_missing_api_key when neither credential is given', () => {
+    try {
+      new ClaudeProvider({ model: 'claude-opus-5', logger: silentLogger });
+      expect.unreachable('construction should have thrown');
+    } catch (error) {
+      expect(error).toBeInstanceOf(PermanentError);
+      expect((error as PermanentError).code).toBe('llm_missing_api_key');
+    }
+  });
+});
+
 describe('createClaudeProvider', () => {
   it('builds a provider from env with a key present', () => {
     const provider = createClaudeProvider(
@@ -84,7 +155,29 @@ describe('createClaudeProvider', () => {
     expect(provider.defaultModel).toBe('claude-opus-5');
   });
 
-  it('throws a PermanentError when ANTHROPIC_API_KEY is unset', () => {
+  it('builds a provider from env in gateway (bearer) mode', () => {
+    const provider = createClaudeProvider(
+      {
+        ANTHROPIC_AUTH_TOKEN: 'gw-token',
+        ANTHROPIC_BASE_URL: 'https://gateway.example.com',
+        ANTHROPIC_MODEL: 'gateway-model',
+      },
+      silentLogger,
+    );
+    expect(provider.defaultModel).toBe('gateway-model');
+  });
+
+  it('throws a PermanentError when neither credential is set in env', () => {
+    try {
+      createClaudeProvider({ ANTHROPIC_MODEL: 'm' }, silentLogger);
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      expect(error).toBeInstanceOf(PermanentError);
+      expect((error as PermanentError).code).toBe('llm_missing_api_key');
+    }
+  });
+
+  it('throws a PermanentError when ANTHROPIC_API_KEY is explicitly undefined and no token is set', () => {
     try {
       createClaudeProvider({ ANTHROPIC_API_KEY: undefined, ANTHROPIC_MODEL: 'm' }, silentLogger);
       expect.unreachable('should have thrown');

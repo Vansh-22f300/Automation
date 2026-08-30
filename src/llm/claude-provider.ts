@@ -10,9 +10,11 @@
  * Design choices worth stating:
  * - Configuration arrives via the constructor; the provider never reads
  *   `process.env` itself. `createClaudeProvider` is the one bridge from `Env`.
- * - The API key is required to construct a provider (fail clearly, early), but
- *   the *application* boots without it because nothing constructs a provider
- *   until a Claude call is actually needed.
+ * - A credential — an API key (`x-api-key`) or a bearer token (`Authorization`)
+ *   — is required to construct a provider (fail clearly, early), and configuring
+ *   both is refused. An optional `baseURL` points the same provider at an
+ *   Anthropic-compatible gateway. The *application* still boots without any of
+ *   this because nothing constructs a provider until a Claude call is needed.
  * - The SDK's own retry loop is disabled (`maxRetries: 0`). Step 7 classifies
  *   failures; deciding whether to retry belongs to the engine (Step 11).
  * - Errors are mapped by SDK *class*, never by string-matching messages. Raw SDK
@@ -45,8 +47,23 @@ const PROVIDER_NAME = 'claude';
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface ClaudeProviderConfig {
-  /** The Anthropic API key. Required — construction fails clearly without it. */
-  readonly apiKey: string;
+  /**
+   * The Anthropic API key, sent as `x-api-key`. Mutually exclusive with
+   * `authToken`. Exactly one of the two must resolve to a non-empty value
+   * (unless an SDK `client` is injected, as in tests).
+   */
+  readonly apiKey?: string;
+  /**
+   * A bearer token for an Anthropic-compatible gateway, sent as
+   * `Authorization: Bearer <token>`. Mutually exclusive with `apiKey`.
+   */
+  readonly authToken?: string;
+  /**
+   * Base URL of the Anthropic-compatible endpoint. Omitted → the SDK default
+   * (`https://api.anthropic.com`). The SDK appends `/v1/messages`, so this must
+   * not itself end in `/v1`.
+   */
+  readonly baseURL?: string;
   /** The model used when a request does not name one. */
   readonly model: string;
   /** Logger for the provider boundary. Callers may pre-bind correlation ids. */
@@ -61,6 +78,13 @@ export interface ClaudeProviderConfig {
   readonly client?: Anthropic;
 }
 
+/** Trim to a defined non-empty string, or `undefined`. */
+function nonEmpty(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  return trimmed === '' ? undefined : value;
+}
+
 export class ClaudeProvider implements LlmProvider {
   readonly name = PROVIDER_NAME;
 
@@ -70,25 +94,46 @@ export class ClaudeProvider implements LlmProvider {
   private readonly client: Anthropic;
 
   constructor(config: ClaudeProviderConfig) {
-    if (config.apiKey.trim() === '') {
+    const apiKey = nonEmpty(config.apiKey);
+    const authToken = nonEmpty(config.authToken);
+
+    // Two auth methods at once is ambiguous; refuse rather than guess.
+    if (apiKey !== undefined && authToken !== undefined) {
       throw new PermanentError(
-        'llm_missing_api_key',
-        'a Claude API key is required to construct ClaudeProvider',
+        'llm_ambiguous_credentials',
+        'both an API key and an auth token were provided; configure exactly one',
         { details: { provider: PROVIDER_NAME } },
       );
     }
+
     this.model = config.model;
     this.logger = config.logger;
     this.defaultTimeoutMs = config.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.client =
-      config.client ??
-      new Anthropic({
-        apiKey: config.apiKey,
-        // We classify and let the engine decide on retries (Step 11); the SDK
-        // must not silently retry underneath us.
-        maxRetries: 0,
-        timeout: this.defaultTimeoutMs,
-      });
+
+    if (config.client !== undefined) {
+      this.client = config.client;
+      return;
+    }
+
+    if (apiKey === undefined && authToken === undefined) {
+      throw new PermanentError(
+        'llm_missing_api_key',
+        'a Claude API key (x-api-key) or auth token (bearer) is required to construct ClaudeProvider',
+        { details: { provider: PROVIDER_NAME } },
+      );
+    }
+
+    // Pin the chosen method and null the other, so an ambient ANTHROPIC_API_KEY /
+    // ANTHROPIC_AUTH_TOKEN in the environment can never smuggle in a second header.
+    this.client = new Anthropic({
+      ...(config.baseURL !== undefined ? { baseURL: config.baseURL } : {}),
+      apiKey: apiKey ?? null,
+      authToken: authToken ?? null,
+      // We classify and let the engine decide on retries (Step 11); the SDK
+      // must not silently retry underneath us.
+      maxRetries: 0,
+      timeout: this.defaultTimeoutMs,
+    });
   }
 
   get defaultModel(): string {
@@ -241,6 +286,13 @@ export class ClaudeProvider implements LlmProvider {
    */
   private toAppError(error: unknown, model: string): AppError {
     const details = { provider: PROVIDER_NAME, model };
+    // HTTP status is non-secret and invaluable for diagnosing a gateway; attach
+    // it to the classified client-error branches below.
+    const status =
+      error instanceof Anthropic.APIError && typeof error.status === 'number'
+        ? error.status
+        : undefined;
+    const withStatus = status !== undefined ? { ...details, status } : details;
 
     if (error instanceof Anthropic.APIUserAbortError) {
       return new RetryableError('llm_aborted', 'Claude request was aborted or timed out', {
@@ -260,7 +312,7 @@ export class ClaudeProvider implements LlmProvider {
     if (error instanceof Anthropic.RateLimitError) {
       return new RetryableError('llm_rate_limited', 'Claude rate limit exceeded', {
         cause: error,
-        details,
+        details: withStatus,
       });
     }
     if (
@@ -269,13 +321,13 @@ export class ClaudeProvider implements LlmProvider {
     ) {
       return new PermanentError('llm_auth', 'Claude rejected the API credentials', {
         cause: error,
-        details,
+        details: withStatus,
       });
     }
     if (error instanceof Anthropic.NotFoundError) {
       return new PermanentError('llm_invalid_model', 'Claude model or resource was not found', {
         cause: error,
-        details,
+        details: withStatus,
       });
     }
     if (
@@ -284,7 +336,7 @@ export class ClaudeProvider implements LlmProvider {
     ) {
       return new PermanentError('llm_invalid_request', 'Claude rejected the request as invalid', {
         cause: error,
-        details,
+        details: withStatus,
       });
     }
     if (error instanceof Anthropic.APIError) {
@@ -316,18 +368,23 @@ export class ClaudeProvider implements LlmProvider {
  * something actually asks for a Claude provider.
  */
 export function createClaudeProvider(
-  env: Pick<Env, 'ANTHROPIC_API_KEY' | 'ANTHROPIC_MODEL'>,
+  env: Pick<
+    Env,
+    'ANTHROPIC_API_KEY' | 'ANTHROPIC_AUTH_TOKEN' | 'ANTHROPIC_BASE_URL' | 'ANTHROPIC_MODEL'
+  >,
   logger: Logger,
 ): ClaudeProvider {
-  if (env.ANTHROPIC_API_KEY === undefined) {
+  if (env.ANTHROPIC_API_KEY === undefined && env.ANTHROPIC_AUTH_TOKEN === undefined) {
     throw new PermanentError(
       'llm_missing_api_key',
-      'ANTHROPIC_API_KEY is not set; the Claude provider cannot be created',
+      'neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set; the Claude provider cannot be created',
       { details: { provider: PROVIDER_NAME } },
     );
   }
   return new ClaudeProvider({
-    apiKey: env.ANTHROPIC_API_KEY,
+    ...(env.ANTHROPIC_API_KEY !== undefined ? { apiKey: env.ANTHROPIC_API_KEY } : {}),
+    ...(env.ANTHROPIC_AUTH_TOKEN !== undefined ? { authToken: env.ANTHROPIC_AUTH_TOKEN } : {}),
+    ...(env.ANTHROPIC_BASE_URL !== undefined ? { baseURL: env.ANTHROPIC_BASE_URL } : {}),
     model: env.ANTHROPIC_MODEL,
     logger,
   });

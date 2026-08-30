@@ -160,3 +160,83 @@ describe('parseEnv / DATABASE_POOL_MAX', () => {
     }
   });
 });
+
+describe('parseEnv / Claude credentials', () => {
+  it('boots with no Claude credential at all (provider is created lazily)', () => {
+    const env = parseEnv({ ...base });
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+  });
+
+  it('accepts a direct API key alone (x-api-key mode)', () => {
+    const env = parseEnv({ ...base, ANTHROPIC_API_KEY: 'sk-ant-xyz' });
+    expect(env.ANTHROPIC_API_KEY).toBe('sk-ant-xyz');
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  });
+
+  it('accepts a bearer auth token alone (gateway mode)', () => {
+    const env = parseEnv({ ...base, ANTHROPIC_AUTH_TOKEN: 'gw-token' });
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('gw-token');
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it('rejects configuring both an API key and an auth token (ambiguous)', () => {
+    expect(
+      offendingVariables(() =>
+        parseEnv({ ...base, ANTHROPIC_API_KEY: 'sk-ant-xyz', ANTHROPIC_AUTH_TOKEN: 'gw-token' }),
+      ),
+    ).toContain('ANTHROPIC_AUTH_TOKEN');
+  });
+
+  it('rejects an explicitly-empty auth token', () => {
+    expect(offendingVariables(() => parseEnv({ ...base, ANTHROPIC_AUTH_TOKEN: '' }))).toContain(
+      'ANTHROPIC_AUTH_TOKEN',
+    );
+  });
+
+  it('never echoes a credential in its error message', () => {
+    try {
+      parseEnv({ ...base, ANTHROPIC_API_KEY: 'sk-ant-SECRET', ANTHROPIC_AUTH_TOKEN: 'BEARER-SECRET' });
+      expect.unreachable('parseEnv should have thrown');
+    } catch (error) {
+      const message = (error as EnvValidationError).message;
+      expect(message).not.toContain('sk-ant-SECRET');
+      expect(message).not.toContain('BEARER-SECRET');
+    }
+  });
+});
+
+describe('parseEnv / ANTHROPIC_BASE_URL', () => {
+  it('accepts a gateway origin with no path', () => {
+    const env = parseEnv({
+      ...base,
+      ANTHROPIC_AUTH_TOKEN: 'gw-token',
+      ANTHROPIC_BASE_URL: 'https://gateway.example.com',
+    });
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://gateway.example.com');
+  });
+
+  it('accepts a gateway origin with a non-/v1 base path', () => {
+    const env = parseEnv({ ...base, ANTHROPIC_BASE_URL: 'https://gateway.example.com/api' });
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://gateway.example.com/api');
+  });
+
+  it('rejects a base URL ending in /v1 (would double-prefix to /v1/v1/messages)', () => {
+    expect(
+      offendingVariables(() => parseEnv({ ...base, ANTHROPIC_BASE_URL: 'https://gateway.example.com/v1' })),
+    ).toContain('ANTHROPIC_BASE_URL');
+    expect(
+      offendingVariables(() => parseEnv({ ...base, ANTHROPIC_BASE_URL: 'https://gateway.example.com/v1/' })),
+    ).toContain('ANTHROPIC_BASE_URL');
+  });
+
+  it('rejects a non-http(s) scheme and a non-URL string', () => {
+    expect(offendingVariables(() => parseEnv({ ...base, ANTHROPIC_BASE_URL: 'ftp://x/y' }))).toContain(
+      'ANTHROPIC_BASE_URL',
+    );
+    expect(offendingVariables(() => parseEnv({ ...base, ANTHROPIC_BASE_URL: 'not a url' }))).toContain(
+      'ANTHROPIC_BASE_URL',
+    );
+  });
+});

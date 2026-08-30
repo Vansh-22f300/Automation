@@ -73,7 +73,7 @@ pnpm db:migrate
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
 | `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs and jobs (read-only dev aid to verify ingestion and queueing). |
-| `pnpm llm:smoke ["question"]` | **Optional live Claude check.** Makes one real API call *only* if `ANTHROPIC_API_KEY` is set; prints normalized model/tokens/latency + answer (never the key). Exits cleanly with a message when no key is set. |
+| `pnpm llm:smoke ["question"]` | **Optional live Claude check.** Makes one real API call *only* if a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) is set; prints normalized model/tokens/latency + answer and the endpoint origin (never the key/token). Tests plain then structured output, reporting each separately. Exits cleanly with a message when no credential is set. |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
 | `pnpm build` | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths. |
@@ -247,19 +247,45 @@ FATAL: configuration error — refusing to start.
 | `LOG_LEVEL` | `info` | pino level: `fatal`…`trace`, or `silent`. `debug` also logs every SQL statement. |
 | `HOST` | `127.0.0.1` | API bind address. Use `0.0.0.0` in a container or on a PaaS. |
 | `PORT` | `3000` | API port. |
-| `ANTHROPIC_API_KEY` | *(unset)* | **Optional secret.** Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients. |
-| `ANTHROPIC_MODEL` | `claude-opus-5` | The Claude model the provider defaults to when a request names none. A deployment decision; any request may override it. |
+| `ANTHROPIC_API_KEY` | *(unset)* | **Optional secret.** Direct-Anthropic credential, sent as `x-api-key`. Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients. |
+| `ANTHROPIC_AUTH_TOKEN` | *(unset)* | **Optional secret.** Bearer token for an Anthropic-*compatible* gateway, sent as `Authorization: Bearer …`. **Mutually exclusive** with `ANTHROPIC_API_KEY` — set exactly one; configuring both is refused at startup. |
+| `ANTHROPIC_BASE_URL` | *(unset)* | Optional. Points the provider at an Anthropic-compatible gateway instead of `https://api.anthropic.com`. Give the **origin only** (optionally with a base path); do **not** include `/v1` — the SDK appends `/v1/messages` itself, so a trailing `/v1` would produce `/v1/v1/messages` (rejected at startup). |
+| `ANTHROPIC_MODEL` | `claude-opus-5` | The model the provider defaults to when a request names none. A deployment decision; any request may override it. Against a gateway, this must be a model id **that gateway accepts** — the default is not guaranteed to be valid there. |
 
 `.env` is loaded by Node's built-in `--env-file-if-exists`, so no `dotenv`
 dependency is involved. Validation of `DATABASE_URL` is structural only — scheme,
 host and database name — and never echoes the URL in an error, because it carries
 a password and these messages go to stderr.
 
-`ANTHROPIC_API_KEY` is deliberately **optional**: the API and worker start
-without it, and only fail — clearly, at the provider boundary — if something
-actually tries to construct a Claude provider without a key. It is a secret and
-is treated as one everywhere: never logged, never persisted, never placed in an
-error object, and never returned to an API client.
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are deliberately **optional**: the
+API and worker start without any Claude credential, and only fail — clearly, at
+the provider boundary — if something actually tries to construct a Claude
+provider without one. They are secrets and are treated as such everywhere: never
+logged, never persisted, never placed in an error object, and never returned to
+an API client. Provider credentials (key or token) are **local secrets** — keep
+them in `.env`, never in `.env.example` or version control.
+
+### Direct Anthropic vs. an Anthropic-compatible gateway
+
+The same [`ClaudeProvider`](src/llm/claude-provider.ts) serves both, chosen purely
+by configuration — no vendor-specific code path:
+
+- **Direct Anthropic** — set `ANTHROPIC_API_KEY` (and optionally `ANTHROPIC_MODEL`).
+  Requests authenticate with `x-api-key` against the default base URL.
+- **Anthropic-compatible gateway** — set `ANTHROPIC_AUTH_TOKEN` **and**
+  `ANTHROPIC_BASE_URL`. Requests authenticate with `Authorization: Bearer …`
+  against the gateway, which must speak the same `/v1/messages` protocol.
+
+Auth resolution is explicit: a token present → bearer; otherwise a key present →
+`x-api-key`; **both** present → configuration refused; **neither** → provider
+construction fails the moment a Claude call is attempted.
+
+> **Structured-output compatibility.** `completeStructured` uses the Anthropic
+> SDK's schema-constrained output (`messages.parse` + `zodOutputFormat`). Plain
+> text completion is broadly portable across compatible gateways, but structured
+> output depends on the gateway supporting those request fields — it is **not**
+> guaranteed. Verify it against your gateway with `pnpm llm:smoke`, which tests
+> plain completion first and structured output second, reporting each separately.
 
 ## LLM provider (Step 7)
 
@@ -276,9 +302,13 @@ the **only** place in the codebase that imports `@anthropic-ai/sdk`. It:
 
 - **owns one SDK client**, built from constructor config — it never reads
   `process.env` itself. `createClaudeProvider(env, logger)` is the one bridge from
-  validated `Env` to a provider, and it fails clearly if the key is missing. This
-  is why the application boots without a key: nothing constructs a provider until
-  a Claude call is actually needed.
+  validated `Env` to a provider, and it fails clearly if no credential is present.
+  Configuration selects the transport: an `ANTHROPIC_API_KEY` authenticates
+  directly with Anthropic via `x-api-key`, while an `ANTHROPIC_AUTH_TOKEN` plus
+  `ANTHROPIC_BASE_URL` targets an Anthropic-compatible gateway with a bearer token
+  (setting both credentials is refused). This is why the application boots without
+  a credential: nothing constructs a provider until a Claude call is actually
+  needed.
 - **normalizes requests and responses.** Callers pass a vendor-neutral
   `LlmCompletionRequest` (system, messages, model, `maxOutputTokens`, optional
   `temperature`/`timeoutMs`/`signal`) and receive an `LlmCompletion` (text, model,

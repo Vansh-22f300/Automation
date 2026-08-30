@@ -75,7 +75,46 @@ const postgresUrl = z
     }
   });
 
-const envSchema = z.object({
+/**
+ * A base URL for the Anthropic-compatible endpoint.
+ *
+ * Optional. When unset the SDK uses the default (`https://api.anthropic.com`).
+ * When set it points the provider at an Anthropic-*compatible* gateway that
+ * speaks the same `/v1/messages` protocol — the value must be the gateway's
+ * origin (optionally with a base path), NOT include the `/v1` segment: the SDK
+ * appends `/v1/messages` itself, so a `…/v1` here would yield `…/v1/v1/messages`.
+ * Verified against @anthropic-ai/sdk 0.122.0.
+ */
+const anthropicBaseUrl = z
+  .string()
+  .min(1, 'must not be empty when set')
+  .superRefine((value, ctx) => {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          'must be a valid URL, for example https://api.anthropic.com or https://your-gateway.example.com',
+      });
+      return;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      ctx.addIssue({ code: 'custom', message: `must use http:// or https:// (found ${url.protocol}//)` });
+    }
+    // The single documented footgun: a trailing /v1 double-prefixes the path.
+    if (/\/v1\/?$/.test(url.pathname)) {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          'must not end with /v1 — the SDK appends /v1/messages itself, so a /v1 here yields /v1/v1/messages',
+      });
+    }
+  });
+
+const envSchema = z
+  .object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(LOG_LEVELS).default('info'),
   /** Bind address. 127.0.0.1 locally; 0.0.0.0 when containerised. */
@@ -109,13 +148,43 @@ const envSchema = z.object({
   ANTHROPIC_API_KEY: z.string().min(1, 'must not be empty when set').optional(),
 
   /**
+   * Bearer auth token for an Anthropic-compatible gateway. Optional and mutually
+   * exclusive with `ANTHROPIC_API_KEY`: when set, the provider authenticates with
+   * `Authorization: Bearer <token>` instead of `x-api-key`. This is the seam that
+   * lets the same provider talk to gateways (e.g. an Anthropic-compatible relay)
+   * that expect bearer auth. Like the API key it is a secret: never logged, never
+   * persisted, never returned to clients.
+   */
+  ANTHROPIC_AUTH_TOKEN: z.string().min(1, 'must not be empty when set').optional(),
+
+  /**
+   * Optional override of the Anthropic base URL. Unset → direct Anthropic. Set →
+   * an Anthropic-compatible gateway. See `anthropicBaseUrl` above for the /v1 rule.
+   */
+  ANTHROPIC_BASE_URL: anthropicBaseUrl.optional(),
+
+  /**
    * The Claude model the provider defaults to when a request does not name one.
    * Configurable rather than hardcoded so the model is a deployment decision;
    * any request may still override it. Kept as a free-form string because the
    * set of valid model ids changes over time and is validated by the API, not us.
+   * Against a gateway this must be a model id that gateway actually accepts.
    */
   ANTHROPIC_MODEL: z.string().min(1).default('claude-opus-5'),
-});
+  })
+  .superRefine((env, ctx) => {
+    // Reject ambiguous credentials rather than silently picking one. An API key
+    // (x-api-key) and a bearer token are two different auth methods; configuring
+    // both is a mistake we refuse loudly instead of guessing at.
+    if (env.ANTHROPIC_API_KEY !== undefined && env.ANTHROPIC_AUTH_TOKEN !== undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['ANTHROPIC_AUTH_TOKEN'],
+        message:
+          'set either ANTHROPIC_API_KEY (direct Anthropic, x-api-key) or ANTHROPIC_AUTH_TOKEN (gateway bearer), not both',
+      });
+    }
+  });
 
 export type Env = z.infer<typeof envSchema>;
 
