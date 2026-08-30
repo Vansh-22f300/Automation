@@ -20,6 +20,8 @@
 
 import { z } from 'zod';
 
+import { outputSchemaSchema } from '@/domain/output-schema.js';
+
 /**
  * The definition-format version, distinct from a workflow's row `version`
  * number. It identifies which *schema* the document was written against, so a
@@ -37,8 +39,8 @@ export const DEFINITION_SCHEMA_VERSION = 1;
  */
 export const STEP_KEY_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 
-/** The step types the engine understands. Only `noop` in this stage. */
-export const SUPPORTED_STEP_TYPES = ['noop'] as const;
+/** The step types the engine understands. */
+export const SUPPORTED_STEP_TYPES = ['noop', 'llm'] as const;
 export type StepType = (typeof SUPPORTED_STEP_TYPES)[number];
 
 const stepKey = z
@@ -58,12 +60,69 @@ const noopStep = z
   })
   .strict();
 
+/** Default ceiling on tokens an `llm` step lets the model generate. */
+export const DEFAULT_LLM_MAX_OUTPUT_TOKENS = 1024;
+/** Hard ceiling on the configurable token limit, a guard against runaway cost. */
+export const LLM_MAX_OUTPUT_TOKENS_LIMIT = 16_384;
+
+/**
+ * The config of an `llm` step — the first step type that performs real AI
+ * reasoning. Deliberately small:
+ *
+ * - `system` — the developer's instruction to the model. It is **static**: the
+ *   trust boundary (see the LLM step handler) keeps configured instructions
+ *   structurally separate from workflow data, so a reference token here is
+ *   forbidden. It must never carry `{{…}}`; untrusted data goes in `input`.
+ * - `input` — the user/content turn. A single string that is either a literal or
+ *   one whole `{{…}}` reference resolved by the existing safe resolver against the
+ *   run context (`{{trigger.payload.text}}`, `{{steps.classify.output}}`). This is
+ *   the *only* place a reference is allowed, and the only place untrusted data
+ *   enters the prompt.
+ * - `output_schema` — the declarative, data-only shape the model must return
+ *   (see `@/domain/output-schema`); compiled to a runtime validator, never code.
+ * - `model` — optional per-step override; absent means the provider's default.
+ * - `max_output_tokens` — ceiling on generated tokens; defaults, and is capped.
+ *
+ * `.strict()` rejects any other key. Temperature and multi-turn history are out
+ * of scope for this step.
+ */
+const llmStep = z
+  .object({
+    key: stepKey,
+    type: z.literal('llm'),
+    config: z
+      .object({
+        system: z
+          .string()
+          .min(1, 'system instruction must not be empty')
+          .refine(
+            (s) => !s.includes('{{'),
+            'system instruction must not contain references ("{{…}}"): it is a static, trusted instruction, ' +
+              'kept separate from untrusted workflow data (which belongs in "input")',
+          ),
+        input: z.string().min(1, 'input must not be empty'),
+        output_schema: outputSchemaSchema,
+        model: z.string().min(1).optional(),
+        max_output_tokens: z
+          .number()
+          .int('max_output_tokens must be an integer')
+          .min(1, 'max_output_tokens must be at least 1')
+          .max(LLM_MAX_OUTPUT_TOKENS_LIMIT, `max_output_tokens must not exceed ${LLM_MAX_OUTPUT_TOKENS_LIMIT}`)
+          .default(DEFAULT_LLM_MAX_OUTPUT_TOKENS),
+      })
+      .strict(),
+  })
+  .strict();
+
+/** The validated config of an `llm` step. */
+export type LlmStepConfig = z.infer<typeof llmStep>['config'];
+
 /**
  * A single step. A discriminated union on `type` so that (a) each type can carry
  * its own config shape, and (b) an unsupported `type` produces a clear "invalid
- * discriminator" error rather than being coerced. Today the union has one member.
+ * discriminator" error rather than being coerced.
  */
-export const stepSchema = z.discriminatedUnion('type', [noopStep]);
+export const stepSchema = z.discriminatedUnion('type', [noopStep, llmStep]);
 
 export type WorkflowStep = z.infer<typeof stepSchema>;
 

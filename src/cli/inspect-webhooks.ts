@@ -37,11 +37,12 @@ try {
     new TenantScope(database.db, tenantId),
     new PostgresJobQueue(database.db),
   );
-  const [events, runs, jobs, stepRuns] = await Promise.all([
+  const [events, runs, jobs, stepRuns, usage] = await Promise.all([
     repository.listEvents(),
     repository.listRuns(),
     repository.listJobs(),
     repository.listStepRuns(),
+    repository.listLlmUsage(),
   ]);
 
   const lines: string[] = [];
@@ -73,6 +74,14 @@ try {
     const detail = s.status === 'failed' ? `error=${JSON.stringify(s.error)}` : `output=${output}`;
     lines.push(
       `  ${s.id}  status=${s.status}  run=${s.runId}  step=${s.stepKey}(${s.stepType})  attempt=${s.attempt}  ${duration}  ${detail}`,
+    );
+  }
+  lines.push('');
+  lines.push(`llm_usage (${usage.length}), newest first:`);
+  for (const u of usage) {
+    // Metadata only — never the prompt, the input payload, or the model output.
+    lines.push(
+      `  ${u.id}  run=${u.runId}  step_run=${u.stepRunId}  ${u.provider}/${u.model}  tokens=${u.inputTokens}in/${u.outputTokens}out/${u.totalTokens}total  ${u.latencyMs}ms`,
     );
   }
   lines.push('');

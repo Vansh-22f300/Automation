@@ -26,7 +26,7 @@
 import { and, eq } from 'drizzle-orm';
 
 import type { AppDatabase, Transaction } from '@/db/client.js';
-import { workflowRuns, workflowStepRuns, workflowVersions } from '@/db/schema.js';
+import { workflowRuns, workflowStepRuns, workflowVersions, llmUsage } from '@/db/schema.js';
 import type { WorkflowRun } from '@/db/schema.js';
 import { isAppError } from '@/domain/errors.js';
 import { ExecutionContext } from '@/domain/execution-context.js';
@@ -241,9 +241,9 @@ export class WorkflowExecutor implements StepDispatcher {
     const stepLog = log.child({ step_run_id: stepRunId, step_type: step.type });
     stepLog.info('step_started');
 
-    let output: unknown;
+    let result;
     try {
-      output = await this.registry.get(step.type).execute({ step, context, input });
+      result = await this.registry.get(step.type).execute({ step, context, input, logger: stepLog });
     } catch (error) {
       // A business failure: the step ran and failed deterministically. Record it
       // and mark the run failed — committed with this transaction.
@@ -264,6 +264,8 @@ export class WorkflowExecutor implements StepDispatcher {
       return { settle: 'fail', reason };
     }
 
+    const output = result.output;
+
     // Success: settle the step run and record its output in the context.
     const finishedAt = new Date();
     await tx
@@ -275,6 +277,24 @@ export class WorkflowExecutor implements StepDispatcher {
         durationMs: finishedAt.getTime() - startedAt.getTime(),
       })
       .where(eq(workflowStepRuns.id, stepRunId));
+
+    // If the step metered LLM usage, persist it atomically with the step result.
+    // The provider never writes to the database; the engine owns persistence.
+    if (result.usage !== undefined) {
+      const usage = result.usage;
+      await tx.insert(llmUsage).values({
+        tenantId: job.tenantId,
+        runId: job.runId,
+        stepRunId,
+        provider: usage.provider,
+        model: usage.model,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalTokens: usage.totalTokens,
+        latencyMs: usage.latencyMs,
+      });
+    }
+
     context.setStepOutput(step.key, output);
     stepLog.info('step_succeeded');
 

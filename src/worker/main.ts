@@ -26,8 +26,11 @@ import { and, eq } from 'drizzle-orm';
 import { loadEnv } from '@/config/env.js';
 import { createDatabase } from '@/db/client.js';
 import { workflowRuns } from '@/db/schema.js';
+import { isAppError } from '@/domain/errors.js';
 import { newId } from '@/domain/ids.js';
+import type { LlmProvider } from '@/domain/llm.js';
 import { defaultStepHandlerRegistry } from '@/domain/step-handler.js';
+import { createClaudeProvider } from '@/llm/claude-provider.js';
 import { createLogger } from '@/observability/logger.js';
 import { WorkflowExecutor } from '@/repositories/execution-engine.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
@@ -50,6 +53,21 @@ const workerId = `worker-${process.pid}-${newId().slice(0, 8)}`;
 const database = createDatabase(env, logger, { service: 'worker' });
 const queue = new PostgresJobQueue(database.db);
 
+// Build the LLM provider from config if a credential is present. The worker must
+// boot without one — nothing constructs a provider until an `llm` step runs — so
+// a missing credential is a warning, not a fatal error: `llm` steps then fail
+// cleanly at execution (via the unconfigured handler) rather than crashing boot.
+let llmProvider: LlmProvider | undefined;
+try {
+  llmProvider = createClaudeProvider(env, logger);
+} catch (error) {
+  if (isAppError(error) && error.code === 'llm_missing_api_key') {
+    logger.warn('no LLM credential configured; llm steps will fail until ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set');
+  } else {
+    throw error;
+  }
+}
+
 /** The worker's job-validity check: does this run still exist for this tenant? */
 const runExists: RunExistenceCheck = async (tenantId, runId) => {
   const [row] = await database.db
@@ -68,7 +86,7 @@ const worker = new Worker({
   dispatcher: new WorkflowExecutor({
     db: database.db,
     queue,
-    registry: defaultStepHandlerRegistry(),
+    registry: defaultStepHandlerRegistry({ ...(llmProvider !== undefined ? { llmProvider } : {}) }),
     logger,
   }),
   logger,
