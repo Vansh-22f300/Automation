@@ -28,7 +28,8 @@
     "workflow:create": "tsx --env-file-if-exists=.env src/cli/create-workflow.ts",
     "webhooks:inspect": "tsx --env-file-if-exists=.env src/cli/inspect-webhooks.ts",
     "llm:smoke": "tsx --env-file-if-exists=.env src/cli/llm-smoke.ts",
-    "connections": "tsx --env-file-if-exists=.env src/cli/connections.ts"
+    "connections": "tsx --env-file-if-exists=.env src/cli/connections.ts",
+    "slack:smoke": "tsx --env-file-if-exists=.env src/cli/slack-smoke.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",

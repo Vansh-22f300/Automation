@@ -4,7 +4,7 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 9A of 13 — tool / connector foundation (credential boundary).**
+> **Status: Step 9B of 13 — first real external connector (Slack).**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
 > service for authoring workflows and their immutable versioned definitions, a
@@ -14,14 +14,16 @@ an LLM, calling external tools, and keeping a durable audit trail of every step.
 > abandoned jobs to the queue, a workflow execution engine that advances a run by
 > exactly one step per job, a framework-free LLM abstraction with a
 > production-safe Claude adapter behind it, an `llm` workflow step that runs real
-> AI reasoning with schema-validated structured output, and — new in this step —
-> the generic, provider-neutral **tool / connector foundation**: a tenant-scoped
-> `connections` store with application-level AES-256-GCM credential encryption, a
-> tool registry, and a tool executor that enforces argument validation and a hard
-> credential boundary. **There is still no actual connector** (no Slack/Gmail/
-> GitHub, no OAuth, no arbitrary HTTP), and tool calling is not yet wired into
-> Claude — Step 9A builds only the architecture and the credential boundary; the
-> first real connector is Step 9B.
+> AI reasoning with schema-validated structured output, the generic,
+> provider-neutral **tool / connector foundation** (a tenant-scoped `connections`
+> store with application-level AES-256-GCM credential encryption, a tool registry,
+> and a tool executor enforcing argument validation and a hard credential
+> boundary), and — new in this step — the **first concrete connector: Slack**,
+> exposing a single `send_slack_message` tool over `chat.postMessage`, built
+> entirely on that foundation. **OAuth is not implemented** (the Slack app is
+> installed manually in development and its bot token stored as an encrypted
+> connection), tool calling is **not yet wired into Claude**, and there is still
+> no arbitrary HTTP — the Slack API call is confined to the connector.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -79,9 +81,10 @@ pnpm db:migrate
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
 | `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs, jobs, step runs and `llm_usage` (read-only dev aid to verify ingestion, queueing and execution). |
-| `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY`). Never prints the decrypted secret or the key. |
+| `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY`). Never prints the decrypted secret or the key. To keep a token out of shell history, omit the trailing JSON and pass it via the `CONNECTION_CREDENTIAL_JSON` env var instead. |
 | `pnpm connections list <tenantId>` | List a tenant's connections — metadata only (id, provider/name, status, last-used), never the secret. |
 | `pnpm connections disable <tenantId> <connectionId>` | Disable a connection so it can no longer be resolved for a tool run. |
+| `pnpm slack:smoke <tenantId> <connectionId> [channel]` | **Optional live Slack check** (not part of `pnpm test`). Resolves the trusted Slack connection and posts **one** harmless message (`"AI Workforce Slack connector test"`) to the channel (default `#ai-workforce-test`). Prints only safe metadata (tool, provider, connection id, channel, success, latency, Slack `ts`); never the token. Reports "NOT executed" and exits cleanly if the key or an active slack connection is absent. |
 | `pnpm llm:smoke ["question"]` | **Optional live Claude check.** Makes one real API call *only* if a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) is set; prints normalized model/tokens/latency + answer and the endpoint origin (never the key/token). Tests plain then structured output, reporting each separately. Exits cleanly with a message when no credential is set. |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
@@ -548,7 +551,7 @@ definition as a single immutable versioned value.
 | `workflow_step_runs` | One executed step of a run | Records the step's `status`, `output` jsonb and error, one row per step the engine advances. Composite tenant-safe FK to its run. |
 | `llm_usage` | Token/latency accounting for one `llm` step | `provider`, `model`, `input_tokens`/`output_tokens`/`total_tokens`, `latency_ms`. Written atomically with the step-run settle; `UNIQUE(step_run_id)`. Metadata only — never the prompt, output or credential. |
 | `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
-| `connections` | A tenant's authorization to act against an external provider | `provider`, `name`, `status` (`active`/`disabled`/`error`), `encrypted_credentials` jsonb (a versioned AES-256-GCM envelope — never plaintext), non-secret `metadata`, `last_used_at`. `UNIQUE(tenant_id, id)` for future composite FKs; partial unique index on `(tenant_id, provider) WHERE status='active'` so provider resolution is unambiguous. |
+| `connections` | A tenant's authorization to act against an external provider | `provider`, `name`, `status` (`active`/`disabled`/`error`), `encrypted_credentials` jsonb (a versioned AES-256-GCM envelope — never plaintext), non-secret `metadata`, `last_used_at`. `UNIQUE(tenant_id, id)` for future composite FKs and `UNIQUE(tenant_id, provider, name)` for distinct names. A tenant may hold **many active connections to the same provider** (e.g. two Slack workspaces); which one a tool uses is decided by a trusted `connectionId` in platform/workflow config — never by the model. |
 
 Two constraints are worth calling out because they encode invariants the
 application would otherwise have to remember:
@@ -805,11 +808,55 @@ refuse to run unless the database name contains `test`.
   [`ConnectionRepository`](src/repositories/connection-repository.ts) owns the one
   narrow decrypt path (`resolveForTool`) and metadata operations that never return
   the secret; a dev-only `pnpm connections` CLI (create/list/disable) exercises it.
-  **No actual connector ships** (no Slack/Gmail/GitHub, no OAuth, no arbitrary HTTP),
-  tool calling is not wired into Claude, and there are no retries — those are Step 9B
-  and Step 11.
+  A tenant may hold **many active connections to the same provider**; the connection
+  a tool uses is chosen by a trusted `connectionId`, never by the model.
+- **Slack connector (Step 9B)** — the first concrete connector, built entirely on the
+  9A foundation. A single [`SlackConnector`](src/connectors/slack/slack-connector.ts)
+  exposes one tool, `send_slack_message`, with a `.strict()` Zod schema of exactly
+  `{ channel, text }` (unknown fields — including any model-supplied `connectionId`/
+  `tenantId` — are rejected before resolution). The connector calls Slack's
+  `chat.postMessage` (`POST https://slack.com/api/chat.postMessage`, bot scope
+  **`chat:write`**) through a tiny fixed-endpoint client
+  ([`slack-client.ts`](src/connectors/slack/slack-client.ts)) — **no arbitrary HTTP**;
+  the bot token flows from the decrypted `{ botToken }` credential to that client and
+  nowhere else (never in the result, logs, or errors). Slack failures map onto the
+  error taxonomy: `invalid_auth`/`channel_not_found`/`not_in_channel`/`missing_scope`/
+  etc. are **permanent**, while 429 (with `Retry-After` kept as safe metadata), 5xx and
+  network/timeouts are **retryable** — classified but **never retried here** (Step 11).
+  Success normalizes to `{ ok, channel, ts }`. **OAuth is not implemented** — the Slack
+  app is installed manually in development and its bot token stored as an encrypted
+  connection. Tool calling is **not yet wired into Claude** (Step 10). A `pnpm
+  slack:smoke` command posts one live test message when configured; the automated
+  suite never touches the live Slack API.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
+
+### Development Slack app setup
+
+Step 9B uses a **manually installed** Slack app (no OAuth onboarding — this is a
+development path, not production SaaS onboarding):
+
+1. Create a Slack app and install it into your development workspace.
+2. Give the **bot** the `chat:write` scope — nothing broader. Do **not** add
+   `chat:write.public`, `channels:read`, `channels:history`, `users:read`, or any
+   `admin:*` scope.
+3. Copy the **Bot User OAuth Token** (`xoxb-…`).
+4. Invite the bot to your target channel (e.g. `/invite @your-bot` in
+   `#ai-workforce-test`). The bot can only post to channels it is a member of; if
+   Slack returns `not_in_channel`, fix membership rather than widening scopes.
+5. Store the token as an **encrypted** connection (never in `.env`, a file, or
+   argv — pass it via an env var so it stays out of shell history):
+
+   ```bash
+   CONNECTION_CREDENTIAL_JSON='{"botToken":"xoxb-…"}' \
+     pnpm connections create <tenantId> slack "my-development-slack"
+   ```
+
+6. Post one live test message (optional, not part of `pnpm test`):
+
+   ```bash
+   pnpm slack:smoke <tenantId> <connectionId> "#ai-workforce-test"
+   ```
 
 ### Not implemented yet — intentionally
 
@@ -817,25 +864,27 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| First concrete external connector (Slack), OAuth, tool calling wired into Claude, arbitrary-HTTP-free provider integration | Step 9B–10 |
+| Additional connectors (Gmail, GitHub, …), OAuth onboarding, tool calling wired into Claude | Step 10 |
 | Retry policy and backoff | Step 11 |
 | Run inspection endpoints and log redaction | Step 12 |
 | Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
 | HMAC / provider signature verification on webhooks | before production webhooks |
 | Agent loops, autonomous multi-step agents, MCP, RAG / embeddings, prompt caching, streaming, model training / fine-tuning, any frontend | not scheduled |
 
-The tool / connector *foundation* now exists (Step 9A: the `connections` table,
-credential encryption, the tool registry and executor), but no concrete connector
-does yet. A generic `audit_log` table is deliberately still absent — Step 9A keeps a
-structured, metadata-only execution record and logging rather than committing to a
-premature audit schema; it arrives with the code that proves it necessary.
+The tool / connector foundation (Step 9A) and the first concrete connector — **Slack**
+(Step 9B) — now exist: the `connections` table, credential encryption, the tool
+registry and executor, and a `send_slack_message` tool over `chat.postMessage`. What
+does **not** exist yet: any other provider, OAuth onboarding, and tool calling wired
+into Claude (the executor is still invoked by trusted code, not by the model). A
+generic `audit_log` table is deliberately still absent — the structured,
+metadata-only execution record and logging stand in until the code that proves an
+audit schema necessary arrives.
 
-**Up next is Step 9B — the first concrete external connector (Slack)**, the point
-at which a workflow first reaches outside the platform, built on the 9A foundation
-without touching the executor, worker, queue or LLM provider. Retries and backoff
-(Step 11), run-inspection endpoints (Step 12) and production hardening (Step 13)
-follow. Each step is implemented, verified and paused for review before the next
-begins.
+**Up next is Step 10** — connecting AI reasoning to real external action (wiring tool
+selection/tool calling into the workflow), built on the 9A foundation and the 9B Slack
+connector. Retries and backoff (Step 11), run-inspection endpoints (Step 12) and
+production hardening (Step 13) follow. Each step is implemented, verified and paused
+for review before the next begins.
 
 Explicitly out of scope for the MVP entirely: OAuth flows, billing, a visual
 workflow builder, Redis/Kafka, Kubernetes, microservices, vector stores or agent

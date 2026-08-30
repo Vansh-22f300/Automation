@@ -11,6 +11,15 @@
  *
  * `create` requires `CREDENTIAL_ENCRYPTION_KEY` to be configured; the credential is
  * encrypted before it touches the database. `list` shows metadata only.
+ *
+ * SECRET INPUT: to keep a token out of shell history and the process argument list,
+ * omit the trailing `<credentialJson>` and instead put the JSON in the
+ * `CONNECTION_CREDENTIAL_JSON` environment variable. e.g. to store a Slack bot token:
+ *
+ *   CONNECTION_CREDENTIAL_JSON='{"botToken":"xoxb-…"}' \
+ *     pnpm connections create <tenantId> slack "my-development-slack"
+ *
+ * The credential is never echoed back; only metadata is printed.
  */
 
 import { loadEnv } from '@/config/env.js';
@@ -49,7 +58,9 @@ try {
   if (command === 'create') {
     const provider = process.argv[4];
     const name = process.argv[5];
-    const credentialJson = process.argv[6];
+    // Prefer the env var (keeps secrets out of argv/shell history); fall back to the
+    // positional arg for convenience in throwaway dev use.
+    const credentialJson = process.env.CONNECTION_CREDENTIAL_JSON ?? process.argv[6];
     if (provider === undefined || name === undefined || credentialJson === undefined) usage();
 
     let credential: Record<string, unknown>;
