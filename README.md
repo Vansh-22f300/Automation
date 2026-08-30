@@ -4,7 +4,7 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: Step 7 of 13 — Claude LLM provider (vendor-neutral `LlmProvider` seam).**
+> **Status: Step 8 of 13 — LLM workflow step (structured, schema-validated AI reasoning).**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
 > service for authoring workflows and their immutable versioned definitions, a
@@ -12,10 +12,12 @@ an LLM, calling external tools, and keeping a durable audit trail of every step.
 > run (and its first job) atomically, a durable `jobs` queue with a worker that
 > claims work under a lease (`FOR UPDATE SKIP LOCKED`) and a reaper that returns
 > abandoned jobs to the queue, a workflow execution engine that advances a run by
-> exactly one step per job, and now a framework-free LLM abstraction with a
-> production-safe Claude adapter behind it. **Claude is not yet a workflow step and
-> there is no tool calling or agent loop** — this step only builds the provider
-> seam; wiring it into an `llm` step and adding tool use are Step 8+.
+> exactly one step per job, a framework-free LLM abstraction with a
+> production-safe Claude adapter behind it, and — new in this step — an `llm`
+> workflow step that runs real AI reasoning with schema-validated structured
+> output. **There is still no tool calling, no external connectors and no agent
+> loop** — the `llm` step reasons over the run's own context only; connectors and
+> tool use are Step 9+.
 > See [Current status](#current-status) for exactly what does and does not exist.
 
 ---
@@ -72,7 +74,7 @@ pnpm db:migrate
 | `pnpm tenant:create "<name>"` | Create a tenant; prints its id. Bootstrap step before minting a first key. |
 | `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
 | `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
-| `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs and jobs (read-only dev aid to verify ingestion and queueing). |
+| `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs, jobs, step runs and `llm_usage` (read-only dev aid to verify ingestion, queueing and execution). |
 | `pnpm llm:smoke ["question"]` | **Optional live Claude check.** Makes one real API call *only* if a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) is set; prints normalized model/tokens/latency + answer and the endpoint origin (never the key/token). Tests plain then structured output, reporting each separately. Exits cleanly with a message when no credential is set. |
 | `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
 | `pnpm test` | Run the test suite once (`vitest run`). |
@@ -213,7 +215,8 @@ PostgreSQL's, via `FOR UPDATE SKIP LOCKED`, not the application's.
 > queue job (no retries yet — that is Step 11). A redelivered job for a run that
 > has already advanced (or finished) does no work. The engine runs the version the
 > run pinned at creation, never the currently-active one, and scopes every
-> statement to the job's tenant. Only the `noop` step type is registered so far.
+> statement to the job's tenant. Two step types are registered: `noop` and `llm`
+> (see [The `llm` workflow step](#the-llm-workflow-step)).
 > A job whose run has vanished fails as `run_not_found`; an unexpected error leaves
 > the job `running` so the reaper recovers it.
 
@@ -287,7 +290,7 @@ construction fails the moment a Claude call is attempted.
 > guaranteed. Verify it against your gateway with `pnpm llm:smoke`, which tests
 > plain completion first and structured output second, reporting each separately.
 
-## LLM provider (Step 7)
+## LLM provider
 
 The system talks to a large language model through one small, vendor-neutral
 seam — [`LlmProvider`](src/domain/llm.ts) — and nothing outside the adapter knows
@@ -349,11 +352,79 @@ To confirm it end-to-end against the live API (optional, key-gated):
 pnpm llm:smoke "In one sentence, what is a workflow?"
 ```
 
-> **Claude is not a workflow step yet, and there is no tool calling.** Step 7 is
-> only the provider seam and its Claude adapter. Wiring an `llm` step into the
-> execution engine, and tool calling / agent loops, arrive in Step 8 and beyond.
-> Tool use, agent loops, autonomous agents, MCP, RAG, embeddings, prompt caching
-> and streaming are all deliberately absent here.
+> **The provider is a seam, not a workflow step.** The provider on its own only
+> knows how to talk to a model; it is the [`llm` workflow step](#the-llm-workflow-step)
+> (Step 8) that wires it into the execution engine. There is still no tool calling,
+> no agent loop, no autonomous agents, no MCP, no RAG, no embeddings, no prompt
+> caching and no streaming — those are deliberately absent.
+
+## The `llm` workflow step
+
+Step 8 turns the provider seam into a real workflow capability: a step type that
+performs AI reasoning and returns **schema-validated structured output**, wired
+into the same one-step-per-job execution engine as every other step.
+
+The path is a clean chain of the seams already in place:
+
+```
+LlmStepHandler → LlmProvider → ClaudeProvider
+```
+
+- [`LlmStepHandler`](src/domain/step-handler.ts) is pure domain logic. It depends
+  only on the vendor-neutral `LlmProvider` interface — it does **not** import
+  `@anthropic-ai/sdk`, know any vendor specifics, or touch the database. It
+  compiles the step's declarative output schema, calls
+  `provider.completeStructured(...)`, and returns the validated object plus token
+  usage as a `StepResult`.
+- `LlmProvider` is the same vendor-neutral seam described above.
+- [`ClaudeProvider`](src/llm/claude-provider.ts) remains the single adapter and the
+  only importer of the SDK.
+
+When no credential is configured the worker registers an
+`UnconfiguredLlmStepHandler` instead, so the process still boots; a run that
+reaches an `llm` step then fails cleanly with `llm_provider_not_configured`
+rather than crashing at startup.
+
+### Prompt-injection trust boundary
+
+The step keeps the workflow author's **static** instructions and the run's
+**untrusted** input strictly separate. The step's `system` text becomes the
+model's SYSTEM turn; the resolved `input` becomes a USER message. They are never
+concatenated into one string, so data flowing through a run cannot rewrite the
+instructions.
+
+### Declarative, data-only output schema
+
+An `llm` step must declare the shape it expects back, as **data, not code**. The
+schema lives in the workflow definition (which is stored JSON and may one day be
+authored by an AI), so there is no `eval`, no arbitrary JavaScript, and no
+caller-supplied validator function. [`src/domain/output-schema.ts`](src/domain/output-schema.ts)
+is the single authority on the format:
+
+- The supported subset is deliberately tiny: `object`, `string`, `number`,
+  `boolean`, string `enum`, and simple `array`. The root must be an `object`.
+- It is **not** full JSON Schema. `$ref`, combinators (`anyOf`/`oneOf`),
+  `pattern`, `format`, `type: "integer"` and recursion are all rejected — every
+  node is validated with Zod `.strict()`, so an unsupported construct fails at
+  workflow-definition time instead of being silently ignored.
+- Nesting is allowed but depth-bounded (`MAX_SCHEMA_DEPTH = 10`), so a
+  pathological document cannot blow the stack while compiling.
+- Free-text fields (`description`, enum values) forbid the `{{` reference token, so
+  the schema stays static, trusted structure that the engine's reference
+  resolution never rewrites.
+
+At run time the validated declarative schema is compiled to a Zod schema, handed
+to the provider's structured-output mode, and the model's response is re-validated
+against it. Unknown keys are stripped; a response that violates the schema is a
+`PermanentError`, never partially-valid data leaking into workflow context.
+
+### Usage accounting
+
+Each successful `llm` step records one row in the `llm_usage` table (provider,
+model, token counts, latency) **atomically with the step-run settle**, in the same
+transaction the engine already uses. The provider itself never writes to the
+database — it returns usage on its result and the engine persists it. Only
+metadata is stored: never the prompt, the model output, or any credential.
 
 ## Project layout
 
@@ -394,19 +465,21 @@ src/
 ├── domain/
 │   ├── ids.ts                UUIDv7 id generator
 │   ├── errors.ts             RetryableError / PermanentError taxonomy
-│   ├── workflow-definition.ts  Zod schema for linear noop workflow definitions
+│   ├── workflow-definition.ts  Zod schema for linear workflow definitions (noop + llm steps)
 │   ├── workflow-trigger.ts   Zod schema for webhook trigger config
 │   ├── workflow-run.ts       Run-context builder (trigger facts + empty steps)
 │   ├── run-state.ts          Run-status state machine (queued→running→succeeded/failed)
 │   ├── execution-context.ts  Framework-free trigger + step-output accessor
 │   ├── references.ts         No-eval {{trigger.*}} / {{steps.*.output}} resolver
-│   ├── step-handler.ts       StepHandler interface + registry (noop)
+│   ├── step-handler.ts       StepHandler interface + registry (noop, llm)
+│   ├── output-schema.ts       Declarative, data-only output schema → compiled Zod
 │   ├── queue.ts             Framework-free Queue contract + InvalidJobTransitionError
 │   └── llm.ts               Framework-free LlmProvider seam + request/response/usage types
 ├── llm/
 │   └── claude-provider.ts    ClaudeProvider — the only importer of @anthropic-ai/sdk
 └── test/
     ├── unit/                 No external dependencies
+    ├── support/              Shared test doubles (e.g. a deterministic fake LlmProvider)
     └── integration/          Requires PostgreSQL; skipped without it
 drizzle/                      Generated SQL migrations + snapshots (committed)
 drizzle.config.ts             drizzle-kit config (tooling, not application code)
@@ -442,7 +515,7 @@ code rather than placeholder files.
 
 ## Data model
 
-Eight tables so far. Two rules drive the shape of all of them.
+Ten tables so far. Two rules drive the shape of all of them.
 
 **Every tenant-scoped table carries `tenant_id`** — even where it is derivable by
 joining. Tenant isolation has to be expressible as a predicate on the table being
@@ -463,8 +536,10 @@ definition as a single immutable versioned value.
 | `workflows` | The stable identity of a process | Name, status. Holds no logic itself. |
 | `workflow_versions` | An immutable snapshot of the logic | `definition` jsonb, trigger config, version number. |
 | `events` | A raw external signal captured at the webhook boundary | `source`, `dedupe_key`, `payload` jsonb, `received_at`. Idempotent per `(tenant_id, source, dedupe_key)`. |
-| `workflow_runs` | One execution of a workflow, born from an event | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. A worker claims its jobs, but no step executes yet. |
+| `workflow_runs` | One execution of a workflow, born from an event | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. Advanced one step per job by the execution engine. |
 | `jobs` | A unit of durable work advancing a run's step | `step_key`, `attempt`/`max_attempts`, `status` (`pending`→`running`→`done`/`failed`), `run_at`, `locked_by` + `lease_expires_at` (the lease), `last_error`. Claimed with `FOR UPDATE SKIP LOCKED`. |
+| `workflow_step_runs` | One executed step of a run | Records the step's `status`, `output` jsonb and error, one row per step the engine advances. Composite tenant-safe FK to its run. |
+| `llm_usage` | Token/latency accounting for one `llm` step | `provider`, `model`, `input_tokens`/`output_tokens`/`total_tokens`, `latency_ms`. Written atomically with the step-run settle; `UNIQUE(step_run_id)`. Metadata only — never the prompt, output or credential. |
 | `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
 
 Two constraints are worth calling out because they encode invariants the
@@ -535,9 +610,17 @@ key lifecycle, route-level tenant isolation, and the plaintext never being logge
 or listed). They also assert the schema's structural invariants directly against
 the Drizzle model — a dropped `tenant_id`, a naive `timestamp`, or an
 `updated_at` appearing on `workflow_versions` all fail the build. For workflow
-authoring they cover definition validation (valid `noop` accepted; empty steps,
-duplicate keys, bad key format, unknown step type, malformed config all rejected)
-and trigger-config validation. The worker loop is covered with an in-memory fake
+authoring they cover definition validation (valid `noop` and `llm` steps accepted;
+empty steps, duplicate keys, bad key format, unknown step type, malformed config,
+`{{` in an `llm` system prompt, and unsupported output-schema constructs all
+rejected) and trigger-config validation. The declarative output schema is covered
+in isolation — the accepted subset, rejection of non-object roots / unknown types
+/ extra keys / `{{` text / empty enums / undeclared `required`, and compilation to
+Zod (missing-required, bad enum, wrong type, optionality, unknown-key stripping).
+The `llm` step handler is covered with a deterministic fake provider: a single
+provider call, the compiled schema passed through, the system/user trust boundary,
+model override forwarding, non-string input stringified, and `PermanentError`
+propagation. The worker loop is covered with an in-memory fake
 queue: an unimplemented step is failed and **never completed**, a job whose run
 has vanished is failed without dispatch, a job is completed only when the
 dispatcher reports success, an unexpected dispatcher error leaves the job
@@ -566,12 +649,17 @@ are ready (the `SKIP LOCKED` guarantee), that `complete`/`fail` reject illegal
 transitions and a terminal job is never re-claimed, that the reaper requeues an
 expired-lease job and increments its attempt while leaving live leases alone, and
 that a tenant-scoped queue can neither claim nor mutate another tenant's jobs.
-Because they write and delete rows, they refuse to run unless the database name
-contains `test`.
+For the **`llm` step end-to-end** they drive the real execution engine with a fake
+provider against PostgreSQL: an `llm` step succeeds and writes exactly one
+`llm_usage` row, `llm` composes with `noop` steps in a run, the pinned version is
+executed, a schema-mismatch fails the run without enqueuing a next job or writing
+usage, a redelivered `llm` job calls the provider only once (idempotency), and one
+tenant's run cannot touch another's. Because they write and delete rows, they
+refuse to run unless the database name contains `test`.
 
 ## Current status
 
-### Implemented (Steps 1–7)
+### Implemented (Steps 1–8)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -579,8 +667,8 @@ contains `test`.
   `run_id`, `step_run_id`
 - `RetryableError` / `PermanentError` taxonomy
 - PostgreSQL schema for `tenants`, `users`, `workflows`, `workflow_versions`,
-  `events`, `workflow_runs`, `workflow_step_runs`, `jobs`, `api_keys`, with
-  time-ordered UUIDv7 primary keys generated application-side
+  `events`, `workflow_runs`, `workflow_step_runs`, `jobs`, `llm_usage`, `api_keys`,
+  with time-ordered UUIDv7 primary keys generated application-side
 - Drizzle ORM setup, connection pool with clean shutdown, and a migration
   workflow that needs no database to generate or verify
 - Database connectivity verified at startup before the API opens its port
@@ -598,8 +686,9 @@ contains `test`.
     correlated into the logs, never exposing internals
   - Conservative in-memory rate limiting (no Redis)
 - **Workflow authoring (Step 4A)** — a Zod-validated workflow definition
-  (linear `noop` steps: unique valid keys, at least one step, no unknown step
-  types or config) and a `webhook` trigger config, both framework-free and
+  (linear steps: unique valid keys, at least one step, no unknown step types or
+  config; `noop` at first, with `llm` added in Step 8) and a `webhook` trigger
+  config, both framework-free and
   reusable; a tenant-scoped `WorkflowRepository` that creates a workflow with its
   active version 1, appends immutable new versions (fresh INSERT, version 1 never
   updated), numbers versions monotonically with a `FOR UPDATE` lock plus the DB
@@ -638,7 +727,8 @@ contains `test`.
   `ExecutionContext` and a no-`eval` reference resolver (`{{trigger.payload.x}}`,
   `{{steps.first.output}}` — unknown paths fail cleanly, nothing is evaluated)
   feed each step its input; a `StepHandler` registry keeps step internals out of
-  the worker (only `noop`, yielding `{ ok: true }`, is registered). Idempotency
+  the worker (`noop`, yielding `{ ok: true }`, at this step; `llm` joined it in
+  Step 8). Idempotency
   under at-least-once delivery is two-layered: a `SELECT … FOR UPDATE` on the run
   plus a "has this run already advanced past this step?" guard, backed by a
   partial unique index (one success per `run_id`+`step_key`+`attempt`). The run
@@ -662,8 +752,28 @@ contains `test`.
   (never key, prompt or response). Usage is returned, never persisted — the
   provider never touches the DB. The model is config-injectable
   (`ANTHROPIC_MODEL`, overridable per request). An optional key-gated
-  `pnpm llm:smoke` exercises the live API. **Not a workflow step and no tool
-  calling yet** — that is Step 8+.
+  `pnpm llm:smoke` exercises the live API. The provider is the seam only; wiring it
+  into a workflow step is Step 8.
+- **`llm` workflow step (Step 8)** — the first AI-reasoning step type, wired as
+  `LlmStepHandler → LlmProvider → ClaudeProvider`. The handler is pure domain logic
+  depending only on the vendor-neutral `LlmProvider` (no SDK import, no DB access):
+  it keeps the workflow author's static `system` instruction and the run's
+  untrusted `input` as **separate** SYSTEM/USER turns (a prompt-injection trust
+  boundary), calls `completeStructured`, and returns validated structured output
+  plus usage. Each step declares its expected output as a **declarative, data-only
+  schema** ([`output-schema.ts`](src/domain/output-schema.ts)) — a deliberately
+  tiny JSON-Schema subset (`object`/`string`/`number`/`boolean`/string `enum`/
+  simple `array`, root always an object), Zod-`.strict()`-validated so unsupported
+  constructs (`$ref`, combinators, `pattern`, `integer`, recursion, executable
+  code) are rejected at definition time, depth-bounded, and forbidding `{{` in
+  free text. The schema compiles to Zod, constrains the model's output, and
+  re-validates the response; unknown keys are stripped and a violation is a
+  `PermanentError`. The engine persists a metadata-only `llm_usage` row atomically
+  with the step-run settle (never prompt/output/credential). With no credential the
+  worker registers an `UnconfiguredLlmStepHandler`, so the app still boots and an
+  `llm` step fails cleanly with `llm_provider_not_configured`. **Still no tool
+  calling, connectors or agent loop** — the step reasons over the run's own context
+  only; those are Step 9+.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 
@@ -673,16 +783,23 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area | Arrives in |
 | --- | --- |
-| Claude as a workflow `llm` step, tool calling, agent loops | Step 8 |
-| Connectors, credential encryption, first integration (Slack) | Steps 9–10 |
+| External connectors, tool calling, credential encryption, first integration (Slack) — the first step reaching outside the platform | Steps 9–10 |
 | Retry policy and backoff | Step 11 |
 | Run inspection endpoints and log redaction | Step 12 |
 | Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
 | HMAC / provider signature verification on webhooks | before production webhooks |
+| Agent loops, autonomous multi-step agents, MCP, RAG / embeddings, prompt caching, streaming, model training / fine-tuning, any frontend | not scheduled |
 
 The tables later steps need — `connections`, `audit_log` — are not
 in the schema yet, for the same reason the directories are empty: they arrive with
 the code that uses them.
+
+**Up next is Step 9 — the first external connector / tool integration**, the point
+at which a workflow first reaches outside the platform (connector definitions,
+credential handling and the first concrete integration). Retries and backoff
+(Step 11), run-inspection endpoints (Step 12) and production hardening (Step 13)
+follow. Each step is implemented, verified and paused for review before the next
+begins.
 
 Explicitly out of scope for the MVP entirely: OAuth flows, billing, a visual
 workflow builder, Redis/Kafka, Kubernetes, microservices, vector stores or agent
