@@ -25,7 +25,11 @@ export interface ClaimedJob {
   readonly tenantId: string;
   readonly runId: string;
   readonly stepKey: string;
-  /** The attempt number this claim represents (0 for a job's first execution). */
+  /**
+   * The attempt number this claim represents (0 for a job's first execution).
+   * Incremented only when the reaper recovers an abandoned lease — never by a
+   * business retry — and bounded by `MAX_CRASH_ATTEMPTS`.
+   */
   readonly attempt: number;
   /**
    * How many business retries this job has already consumed (0 before its first
@@ -53,6 +57,47 @@ export interface EnqueueInput {
 
 /** A structured, log-safe failure reason persisted on a failed job. */
 export type JobError = Record<string, unknown>;
+
+/**
+ * How many times a job may be recovered from an abandoned lease before the queue
+ * gives up on it.
+ *
+ * A worker that crashes mid-step leaves its job `running` under a lease nobody
+ * will renew, and the reaper returns it to `pending`. That safety net is also a
+ * loop: a job that *causes* the crash — an OOM on a pathological payload, a
+ * segfaulting native dependency, a step that wedges the process — is handed back
+ * to the next worker, which dies the same way, forever. The ceiling turns that
+ * loop into a terminal state after a bounded number of recoveries, so a poison
+ * job costs a finite amount of work instead of pinning a worker indefinitely.
+ *
+ * Five is deliberately generous: real crash recovery is rare, and a genuine
+ * infrastructure incident (a rolling deploy, a node eviction, an OOM caused by a
+ * *neighbouring* job) should not be enough to condemn work that would otherwise
+ * succeed. It is compared against `attempt`, never `retry_count`.
+ */
+export const MAX_CRASH_ATTEMPTS = 5;
+
+/**
+ * A job the reaper refused to requeue because its crash-recovery budget was
+ * exhausted. Carries exactly the identifiers an operator needs to find it —
+ * never a payload, a credential or a step's output.
+ */
+export interface DeadLetteredJob {
+  readonly id: string;
+  readonly tenantId: string;
+  readonly runId: string;
+  readonly stepKey: string;
+  /** The recoveries this job had already consumed, i.e. at or above the ceiling. */
+  readonly attempt: number;
+}
+
+/** The outcome of one reaper sweep. */
+export interface ReapResult {
+  /** How many expired jobs were returned to `pending` (budget remained). */
+  readonly requeued: number;
+  /** The expired jobs moved to `failed` instead, because the budget was spent. */
+  readonly deadLettered: readonly DeadLetteredJob[];
+}
 
 /**
  * The durable work queue.
@@ -96,11 +141,20 @@ export interface Queue {
   retry(jobId: string, error: JobError, runAt: Date): Promise<void>;
 
   /**
-   * Return every `running` job whose lease has expired to `pending`, clearing
-   * its lock and counting the lost attempt. Safe to run from several processes
-   * at once. Returns how many jobs were reclaimed.
+   * Sweep expired leases. Every `running` job whose lease has lapsed is either
+   *
+   *   - returned to `pending` with its lock cleared and the lost attempt counted
+   *     (`attempt + 1`), while crash-recovery budget remains; or
+   *   - moved to `failed` with a `crash_attempts_exhausted` error once `attempt`
+   *     has reached `MAX_CRASH_ATTEMPTS`, and never offered to a worker again.
+   *
+   * Dead-lettering settles the *job* only. The run is left exactly as it was, so
+   * it stays inspectable and whoever owns run state decides what a stuck run
+   * means; the reaper claims no authority over it.
+   *
+   * Safe to run from several processes at once. Returns what the sweep did.
    */
-  requeueExpired(): Promise<number>;
+  requeueExpired(): Promise<ReapResult>;
 }
 
 /**

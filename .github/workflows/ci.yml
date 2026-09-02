@@ -1,0 +1,148 @@
+# Continuous integration.
+#
+# Two jobs, deliberately independent so both report on every push:
+#
+#   verify — no database. Proves a clean checkout typechecks, that the committed
+#            migrations are internally consistent, that src/db/schema.ts and
+#            drizzle/ have not drifted apart, and that the build emits.
+#   test   — the real vitest suite (unit + integration) against a PostgreSQL 17
+#            service container. This is the only place the integration suites
+#            actually execute: there is no local PostgreSQL in this project's
+#            development environment, so before this workflow existed the
+#            SKIP-without-TEST_DATABASE_URL path was the only path they took.
+#
+# Nothing here deploys, publishes, writes back to the repository, or needs a
+# secret. Every command is one the repository already defines in package.json.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per ref: a new push supersedes an in-flight run for the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege. Reading the checkout is all either job needs.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (no database)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm must be installed BEFORE setup-node: setup-node's `cache: pnpm`
+      # shells out to pnpm to locate the store, and fails if it is missing.
+      # No `version:` input on purpose — pnpm/action-setup reads
+      # `packageManager` (pnpm@11.4.0) from package.json, keeping the repository
+      # the single source of truth for the pnpm version.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # package.json pins engines.node to ">=24.0.0 <25".
+          node-version: '24'
+          cache: pnpm
+
+      # --frozen-lockfile makes the install fail rather than silently resolve a
+      # different tree when pnpm-lock.yaml is out of date with package.json.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Check migration consistency
+        run: pnpm db:check
+
+      # Drift guard. `db:generate` diffs schema.ts against the SQL already in
+      # drizzle/ and needs no database. On a healthy tree it prints "No schema
+      # changes" and writes nothing, so ANY change under drizzle/ afterwards
+      # means a schema edit was committed without its migration. stdin is closed
+      # so that a drizzle-kit rename prompt fails the job instead of hanging it.
+      - name: Schema and migrations must not have drifted
+        run: |
+          pnpm db:generate < /dev/null
+          if [ -n "$(git status --porcelain drizzle)" ]; then
+            echo "::error::src/db/schema.ts and drizzle/ have diverged. Run 'pnpm db:generate', review the SQL by hand, and commit the migration."
+            git status --porcelain drizzle
+            git --no-pager diff -- drizzle
+            exit 1
+          fi
+
+      - name: Build
+        run: pnpm build
+
+  test:
+    name: test (PostgreSQL 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # The database NAME must contain "test": the guard in
+          # src/test/integration/support.ts refuses to run suites that write and
+          # delete rows against anything else. Created by the container at init,
+          # so no extra createdb step is needed.
+          POSTGRES_DB: ai_workforce_test
+        ports:
+          - 5432:5432
+        # The job does not start until these health checks pass.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_workforce_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # 127.0.0.1 rather than localhost: the mapped service port is published on
+      # IPv4, and `localhost` can resolve to ::1 first on the runner.
+      # No sslmode — the service container speaks plain TCP on the loopback.
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ai_workforce_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `vitest run` exits 0 when every integration suite SKIPS, so a green tick
+      # alone does not prove the database suites ran. TEST_DATABASE_URL being
+      # non-empty is what proves it: it is the single gate every integration file
+      # reads (`describe.skipIf(TEST_DATABASE_URL === undefined)`), and it is also
+      # what makes global-setup.ts migrate — which fails the run if the database
+      # is unreachable. Assert it here so the guarantee is explicit and a future
+      # edit that drops the variable turns CI red instead of quietly reducing it
+      # to a unit-only suite.
+      - name: Assert the integration gate is armed
+        run: |
+          if [ -z "$TEST_DATABASE_URL" ]; then
+            echo "::error::TEST_DATABASE_URL is empty, so every integration suite would SKIP and this job would pass without touching PostgreSQL."
+            exit 1
+          fi
+          echo "TEST_DATABASE_URL is set; integration suites will run."
+
+      # Runs both vitest projects: unit (parallel) and integration (single fork,
+      # after global-setup.ts applies the migrations once).
+      - name: Test
+        run: pnpm test

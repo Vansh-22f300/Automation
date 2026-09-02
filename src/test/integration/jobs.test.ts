@@ -18,6 +18,8 @@
  *   - a done/failed job is terminal and never re-claimed;
  *   - the reaper returns expired-lease running jobs to pending, increments the
  *     attempt, clears the lock, and leaves live leases alone;
+ *   - a job that has burned its crash-recovery budget is dead-lettered instead of
+ *     being requeued forever, without touching its business retry counter;
  *   - a tenant-scoped queue can neither claim nor mutate another tenant's jobs.
  *
  * The suite writes and deletes rows, so it refuses any database whose name does
@@ -29,7 +31,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import type { DatabaseHandle } from "@/db/client.js";
 import { jobs, tenants } from "@/db/schema.js";
-import { InvalidJobTransitionError } from "@/domain/queue.js";
+import { InvalidJobTransitionError, MAX_CRASH_ATTEMPTS } from "@/domain/queue.js";
 import { PostgresJobQueue } from "@/repositories/job-queue.js";
 import { TenantScope } from "@/repositories/tenant-scope.js";
 import { WebhookRepository } from "@/repositories/webhook-repository.js";
@@ -44,9 +46,6 @@ const definition = () => ({
     { key: "second", type: "noop", config: {} },
   ],
 });
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
 
 describe.skipIf(TEST_DATABASE_URL === undefined)(
   "postgres job queue integration",
@@ -66,6 +65,25 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
     const jobById = async (id: string) => {
       const [row] = await handle.db.select().from(jobs).where(eq(jobs.id, id));
       return row;
+    };
+
+    /**
+     * Force a claimed job's lease into the past — and optionally put its crash
+     * counter at a chosen value.
+     *
+     * Deterministic on purpose: lease expiry is a timestamp comparison, so it can
+     * be *stated* rather than waited for. A short `leaseDurationMs` plus a sleep
+     * would test the test runner's timing, not the queue, and would be the first
+     * thing to flake on a loaded CI runner.
+     */
+    const expireLease = async (id: string, attempt?: number): Promise<void> => {
+      await handle.db
+        .update(jobs)
+        .set({
+          leaseExpiresAt: new Date(Date.now() - 1),
+          ...(attempt === undefined ? {} : { attempt }),
+        })
+        .where(eq(jobs.id, id));
     };
 
     const seedRun = async (
@@ -295,20 +313,18 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
 
     describe("reaper (requeueExpired)", () => {
       it("returns an expired-lease job to pending, incrementing its attempt", async () => {
-        // A one-millisecond lease so it is expired almost immediately.
-        const shortLease = new PostgresJobQueue(handle.db, {
-          leaseDurationMs: 1,
-        });
-        const { id } = await shortLease.enqueue({
+        const q = queueFor();
+        const { id } = await q.enqueue({
           tenantId: tenantA,
           runId: runA,
           stepKey: "first",
         });
-        await shortLease.claim("worker-dead");
+        await q.claim("worker-dead");
+        await expireLease(id);
 
-        await sleep(20);
-        const requeued = await queueFor().requeueExpired();
-        expect(requeued).toBeGreaterThanOrEqual(1);
+        const result = await queueFor().requeueExpired();
+        expect(result.requeued).toBe(1);
+        expect(result.deadLettered).toEqual([]);
 
         const job = await jobById(id);
         expect(job!.status).toBe("pending");
@@ -328,8 +344,157 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         });
         await q.claim("worker-1");
 
-        await expect(q.requeueExpired()).resolves.toBe(0);
+        await expect(q.requeueExpired()).resolves.toEqual({
+          requeued: 0,
+          deadLettered: [],
+        });
         expect((await jobById(id))!.status).toBe("running");
+      });
+    });
+
+    describe("reaper poison-job ceiling (dead-letter)", () => {
+      it("dead-letters an expired job whose crash-recovery budget is exhausted", async () => {
+        const q = queueFor();
+        const { id } = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        await q.claim("worker-that-keeps-dying");
+        await expireLease(id, MAX_CRASH_ATTEMPTS);
+
+        const result = await queueFor().requeueExpired();
+        expect(result.requeued).toBe(0);
+        expect(result.deadLettered).toEqual([
+          {
+            id,
+            tenantId: tenantA,
+            runId: runA,
+            stepKey: "first",
+            attempt: MAX_CRASH_ATTEMPTS,
+          },
+        ]);
+
+        const job = await jobById(id);
+        expect(job!.status).toBe("failed");
+        // No recovery happened, so no attempt is consumed: `attempt === the
+        // ceiling` remains the readable "exhausted" signal.
+        expect(job!.attempt).toBe(MAX_CRASH_ATTEMPTS);
+        expect(job!.retryCount).toBe(0);
+        expect(job!.lockedBy).toBeNull();
+        expect(job!.leaseExpiresAt).toBeNull();
+        expect(job!.lastError!.code).toBe("crash_attempts_exhausted");
+        expect(job!.lastError!.retryable).toBe(false);
+        expect(job!.lastError!.details).toEqual({
+          crash_attempt_limit: MAX_CRASH_ATTEMPTS,
+        });
+        expect(typeof job!.lastError!.message).toBe("string");
+      });
+
+      it("recovers the job on its last remaining attempt, and condemns it on the next expiry", async () => {
+        const q = queueFor();
+        const { id } = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        await q.claim("worker-dead-1");
+
+        // One attempt short of the ceiling: still recoverable.
+        await expireLease(id, MAX_CRASH_ATTEMPTS - 1);
+        const first = await queueFor().requeueExpired();
+        expect(first.requeued).toBe(1);
+        expect(first.deadLettered).toEqual([]);
+        expect((await jobById(id))!.status).toBe("pending");
+        expect((await jobById(id))!.attempt).toBe(MAX_CRASH_ATTEMPTS);
+
+        // It is claimed again, and abandoned again. Now the budget is spent.
+        await q.claim("worker-dead-2");
+        await expireLease(id);
+        const second = await queueFor().requeueExpired();
+        expect(second.requeued).toBe(0);
+        expect(second.deadLettered.map((j) => j.id)).toEqual([id]);
+        expect((await jobById(id))!.status).toBe("failed");
+      });
+
+      it("a dead-lettered job is terminal: no later sweep requeues it and no worker claims it", async () => {
+        const q = queueFor();
+        const { id } = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        await q.claim("worker-dead");
+        await expireLease(id, MAX_CRASH_ATTEMPTS);
+        expect((await queueFor().requeueExpired()).deadLettered).toHaveLength(1);
+
+        // The job is no longer `running`, so every subsequent sweep skips it —
+        // it can never be dead-lettered twice or returned to pending.
+        await expect(queueFor().requeueExpired()).resolves.toEqual({
+          requeued: 0,
+          deadLettered: [],
+        });
+        expect((await jobById(id))!.status).toBe("failed");
+        await expect(queueFor().claim("worker-2")).resolves.toBeNull();
+      });
+
+      it("keeps the crash counter and the business retry counter independent", async () => {
+        const q = queueFor();
+        const { id } = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+
+        // A business retry first: retry_count moves, attempt does not.
+        await q.claim("worker-1");
+        await q.retry(
+          id,
+          { code: "llm_rate_limited", retryable: true },
+          new Date(Date.now() - 1_000), // immediately claimable again
+        );
+        expect((await jobById(id))!.retryCount).toBe(1);
+        expect((await jobById(id))!.attempt).toBe(0);
+
+        // Then a crash at the ceiling: attempt decides the dead-letter, and the
+        // business counter is left exactly as the retry left it.
+        await q.claim("worker-2");
+        await expireLease(id, MAX_CRASH_ATTEMPTS);
+        expect((await queueFor().requeueExpired()).deadLettered).toHaveLength(1);
+
+        const job = await jobById(id);
+        expect(job!.status).toBe("failed");
+        expect(job!.retryCount).toBe(1);
+        expect(job!.attempt).toBe(MAX_CRASH_ATTEMPTS);
+        expect(job!.maxAttempts).toBe(5); // the business budget is untouched
+      });
+
+      it("requeues and dead-letters in the same sweep, each by its own budget", async () => {
+        const q = queueFor();
+        const healthy = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        const poison = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "second",
+        });
+        await q.claim("worker-1");
+        await q.claim("worker-2");
+
+        await expireLease(healthy.id, 0);
+        await expireLease(poison.id, MAX_CRASH_ATTEMPTS);
+
+        const result = await queueFor().requeueExpired();
+        expect(result.requeued).toBe(1);
+        expect(result.deadLettered.map((j) => j.id)).toEqual([poison.id]);
+
+        expect((await jobById(healthy.id))!.status).toBe("pending");
+        expect((await jobById(healthy.id))!.attempt).toBe(1);
+        expect((await jobById(healthy.id))!.lastError).toBeNull();
+        expect((await jobById(poison.id))!.status).toBe("failed");
       });
     });
 
@@ -458,25 +623,19 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
       });
 
       it("is safe against a reaper race: once the reaper requeues the job, retry is rejected and nothing double-counts", async () => {
-        // A 1ms lease so the reaper reclaims the job almost immediately.
-        const shortLease = new PostgresJobQueue(handle.db, {
-          leaseDurationMs: 1,
-        });
-        const { id } = await shortLease.enqueue({
+        const q = queueFor();
+        const { id } = await q.enqueue({
           tenantId: tenantA,
           runId: runA,
           stepKey: "first",
         });
-        await shortLease.claim("worker-dead");
+        await q.claim("worker-dead");
 
         // Make the lease deterministically expired instead of depending on timing.
-        await handle.db
-          .update(jobs)
-          .set({ leaseExpiresAt: new Date(Date.now() - 1) })
-          .where(eq(jobs.id, id));
+        await expireLease(id);
 
         // The reaper wins the race: running → pending, attempt incremented.
-        expect(await queueFor().requeueExpired()).toBeGreaterThanOrEqual(1);
+        expect((await queueFor().requeueExpired()).requeued).toBe(1);
 
         // The worker (which was mid-dispatch) now tries to schedule a business retry.
         // The job is no longer `running`, so the guarded UPDATE matches nothing.
@@ -531,33 +690,62 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
       });
 
       it("a tenant-scoped queue only reaps its own expired jobs", async () => {
-        const shortA = new PostgresJobQueue(handle.db, {
-          leaseDurationMs: 1,
-          tenantId: tenantA,
-        });
-        const shortB = new PostgresJobQueue(handle.db, { leaseDurationMs: 1 });
-        const a = await shortA.enqueue({
+        const q = queueFor();
+        const a = await q.enqueue({
           tenantId: tenantA,
           runId: runA,
           stepKey: "first",
         });
-        const b = await shortB.enqueue({
+        const b = await q.enqueue({
           tenantId: tenantB,
           runId: runB,
           stepKey: "first",
         });
-        await shortA.claim("worker-a");
-        await shortB.claim("worker-b");
+        await q.claim("worker-1");
+        await q.claim("worker-2");
 
-        await sleep(20);
+        await expireLease(a.id);
+        await expireLease(b.id);
+
         // Scoped to A: reaps A's job only.
-        const requeued = await new PostgresJobQueue(handle.db, {
-          tenantId: tenantA,
-        }).requeueExpired();
-        expect(requeued).toBe(1);
+        const result = await queueFor(tenantA).requeueExpired();
+        expect(result.requeued).toBe(1);
+        expect(result.deadLettered).toEqual([]);
 
         expect((await jobById(a.id))!.status).toBe("pending");
         expect((await jobById(b.id))!.status).toBe("running");
+      });
+
+      it("a tenant-scoped queue does not dead-letter another tenant’s exhausted job", async () => {
+        const q = queueFor();
+        const a = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        const b = await q.enqueue({
+          tenantId: tenantB,
+          runId: runB,
+          stepKey: "first",
+        });
+        await q.claim("worker-1");
+        await q.claim("worker-2");
+
+        // Identical state: both expired, both at the ceiling. The tenant
+        // predicate is the only thing that separates them.
+        await expireLease(a.id, MAX_CRASH_ATTEMPTS);
+        await expireLease(b.id, MAX_CRASH_ATTEMPTS);
+
+        const result = await queueFor(tenantA).requeueExpired();
+        expect(result.deadLettered.map((j) => j.id)).toEqual([a.id]);
+        expect(result.deadLettered[0]!.tenantId).toBe(tenantA);
+
+        expect((await jobById(a.id))!.status).toBe("failed");
+        // B's job is untouched: still running, still leased, no error written.
+        const other = await jobById(b.id);
+        expect(other!.status).toBe("running");
+        expect(other!.lastError).toBeNull();
+        expect(other!.lockedBy).not.toBeNull();
       });
     });
   },

@@ -24,6 +24,11 @@
  * row is how an illegal transition (or a lost race) surfaces, rather than
  * silently succeeding.
  *
+ * Recovery is bounded. Handing an abandoned job back to a worker is a safety net,
+ * but done unconditionally it is also how one poisonous job crash-loops a fleet
+ * forever, so `requeueExpired` dead-letters a job that has already burned its
+ * `MAX_CRASH_ATTEMPTS` recoveries instead of offering it again.
+ *
  * The class is optionally bound to a tenant. Unbound (the worker's view) it
  * claims and reaps across all tenants — a worker is shared infrastructure.
  * Bound to a tenant it adds a `tenant_id` predicate to every statement, which
@@ -31,12 +36,18 @@
  * property rather than a convention.
  */
 
-import { and, asc, eq, lt, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, lt, lte, sql } from 'drizzle-orm';
 
 import type { AppDatabase, Executor } from '@/db/client.js';
 import { jobs } from '@/db/schema.js';
-import { InvalidJobTransitionError } from '@/domain/queue.js';
-import type { ClaimedJob, EnqueueInput, JobError, Queue } from '@/domain/queue.js';
+import { InvalidJobTransitionError, MAX_CRASH_ATTEMPTS } from '@/domain/queue.js';
+import type {
+  ClaimedJob,
+  EnqueueInput,
+  JobError,
+  Queue,
+  ReapResult,
+} from '@/domain/queue.js';
 
 /** Producers that enqueue inside an already-open transaction depend on this. */
 export interface TransactionalJobEnqueuer {
@@ -45,6 +56,24 @@ export interface TransactionalJobEnqueuer {
 
 /** The initial lease granted on claim: long enough to run a step, short enough to reclaim promptly. */
 export const DEFAULT_LEASE_MS = 5 * 60 * 1_000;
+
+/**
+ * What a dead-lettered job records in `last_error`.
+ *
+ * Constant, not per-row: the row's own `attempt` column already states how many
+ * recoveries it consumed, so nothing is lost by not repeating it here — and a
+ * fixed payload keeps the dead-letter UPDATE a single plain statement instead of
+ * per-row JSON construction. Contains no payload, no credential and no step
+ * output, so it is safe to return from the inspection API and to log.
+ */
+const CRASH_ATTEMPTS_EXHAUSTED: JobError = {
+  code: 'crash_attempts_exhausted',
+  message:
+    `the lease expired again after ${MAX_CRASH_ATTEMPTS} crash recoveries; ` +
+    'the job is dead-lettered instead of being requeued a further time',
+  retryable: false,
+  details: { crash_attempt_limit: MAX_CRASH_ATTEMPTS },
+};
 
 export interface PostgresJobQueueOptions {
   /** How long a claim's lease lasts. Defaults to five minutes. */
@@ -186,31 +215,66 @@ export class PostgresJobQueue implements Queue, TransactionalJobEnqueuer {
     if (updated.length === 0) throw new InvalidJobTransitionError(jobId, 'retried');
   }
 
-  async requeueExpired(): Promise<number> {
+  /** Every `running` job whose lease has lapsed, within this queue's tenant view. */
+  private expiredLease(now: Date): ReturnType<typeof eq>[] {
+    return [eq(jobs.status, 'running'), lt(jobs.leaseExpiresAt, now), ...this.tenantScoped()];
+  }
+
+  async requeueExpired(): Promise<ReapResult> {
     const now = this.now();
 
-    // A single UPDATE … WHERE is atomic and self-serialising: two reapers
-    // running it concurrently take row locks in turn, and whichever commits
-    // second matches nothing (the rows are no longer `running`), so no job is
-    // requeued — or its attempt incremented — twice.
-    const requeued = await this.db
-      .update(jobs)
-      .set({
-        status: 'pending',
-        lockedBy: null,
-        leaseExpiresAt: null,
-        attempt: sql`${jobs.attempt} + 1`,
-        runAt: now,
-      })
-      .where(
-        and(
-          eq(jobs.status, 'running'),
-          lt(jobs.leaseExpiresAt, now),
-          ...this.tenantScoped(),
-        ),
-      )
-      .returning({ id: jobs.id });
+    // Two UPDATEs, one transaction, disjoint by construction: a row is either at
+    // the crash-recovery ceiling or below it, never both, so neither statement can
+    // touch a row the other claimed and their order is irrelevant.
+    //
+    // Each UPDATE … WHERE is atomic and self-serialising, which is what makes
+    // concurrent reapers safe: two of them take the row locks in turn, and
+    // whichever commits second matches nothing (the rows are no longer `running`),
+    // so no job is requeued — or its attempt incremented, or dead-lettered —
+    // twice. The transaction adds nothing to that guarantee; it only makes the
+    // pair of counts this method returns describe a single point in time.
+    return this.db.transaction(async (tx) => {
+      // Budget spent: settle the job terminally. `attempt` is deliberately NOT
+      // incremented — it counts recoveries actually performed, and this is the
+      // refusal to perform one, so `attempt === MAX_CRASH_ATTEMPTS` stays the
+      // readable "exhausted" signal (and no attempt number is minted that will
+      // never correspond to a step run).
+      //
+      // Only the job is settled. The run keeps whatever status it had, because
+      // run-state authority lives with the execution engine, not the reaper; the
+      // failed job is visible on the run either way.
+      const deadLettered = await tx
+        .update(jobs)
+        .set({
+          status: 'failed',
+          lastError: CRASH_ATTEMPTS_EXHAUSTED,
+          lockedBy: null,
+          leaseExpiresAt: null,
+        })
+        .where(and(...this.expiredLease(now), gte(jobs.attempt, MAX_CRASH_ATTEMPTS)))
+        .returning({
+          id: jobs.id,
+          tenantId: jobs.tenantId,
+          runId: jobs.runId,
+          stepKey: jobs.stepKey,
+          attempt: jobs.attempt,
+        });
 
-    return requeued.length;
+      // Budget remains: recover the job exactly as before, counting the lost
+      // attempt. `retry_count` is untouched — a crash is not a business retry.
+      const requeued = await tx
+        .update(jobs)
+        .set({
+          status: 'pending',
+          lockedBy: null,
+          leaseExpiresAt: null,
+          attempt: sql`${jobs.attempt} + 1`,
+          runAt: now,
+        })
+        .where(and(...this.expiredLease(now), lt(jobs.attempt, MAX_CRASH_ATTEMPTS)))
+        .returning({ id: jobs.id });
+
+      return { requeued: requeued.length, deadLettered };
+    });
   }
 }

@@ -267,6 +267,15 @@ against the `jobs` table:
 - a **reaper** that periodically returns jobs whose lease has expired to `pending`
   (incrementing `attempt`, **never** the business `retry_count`), so a job held by
   a crashed worker is never lost — logging `job_requeued` when it recovers any.
+  That safety net is **bounded**: a job that has already been recovered
+  `MAX_CRASH_ATTEMPTS` (5) times is *dead-lettered* on its next expiry — moved to
+  `failed` with `last_error.code = "crash_attempts_exhausted"`, never offered to a
+  worker again, and logged once at error level as `job_dead_lettered` with its
+  tenant, run, job, step and attempt. Without the ceiling, a job that *causes* the
+  crash (an OOM on a pathological payload, a wedged native dependency) would be
+  handed to the next worker forever. Dead-lettering settles the **job** only: the
+  run keeps whatever status it had, so it stays inspectable and run-state authority
+  stays with the execution engine.
 
 Two workers can run at once without ever claiming the same job; that guarantee is
 PostgreSQL's, via `FOR UPDATE SKIP LOCKED`, not the application's.
@@ -616,7 +625,7 @@ src/
 ├── worker/
 │   ├── main.ts               Entrypoint 2 — composition root: worker + reaper wiring, shutdown
 │   ├── worker.ts             The claim → verify → dispatch → settle loop
-│   ├── reaper.ts             Periodic sweep returning expired-lease jobs to the queue
+│   ├── reaper.ts             Periodic sweep: expired leases back to the queue, poison jobs dead-lettered
 │   └── dispatcher.ts         StepDispatcher seam + StepFailedError (WorkflowExecutor implements it)
 ├── db/
 │   ├── schema.ts             Tables, enums, constraints — source of truth
@@ -810,8 +819,12 @@ lease (oldest first, never a future `run_at`), that two workers claiming
 concurrently never receive the same job and each gets a distinct one when several
 are ready (the `SKIP LOCKED` guarantee), that `complete`/`fail` reject illegal
 transitions and a terminal job is never re-claimed, that the reaper requeues an
-expired-lease job and increments its attempt while leaving live leases alone, and
-that a tenant-scoped queue can neither claim nor mutate another tenant's jobs. For
+expired-lease job and increments its attempt while leaving live leases alone, that
+a job at the crash-recovery ceiling is dead-lettered instead — recovered on its
+last remaining attempt, condemned on the next expiry, then terminal (no later sweep
+requeues it and no worker claims it) — with `retry_count` and `attempt` provably
+independent in both directions, and that a tenant-scoped queue can neither claim,
+mutate, nor dead-letter another tenant's jobs. For
 **retries** (Step 11) they prove — in pure unit tests for the equal-jitter policy,
 and against real PostgreSQL for the queue and engine — that `retry` moves a running
 job back to `pending` with a future `run_at` while bumping `retry_count` (never
@@ -847,6 +860,43 @@ proves the same against real rows: one run assembles coherently under the tenant
 predicate, step ordering and usage attribution hold, secrets are scrubbed in both
 summary and detail mode, a cross-tenant or nonexistent run returns `null`, and
 `leased` reflects a live lease.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main`, on every pull request,
+and on demand via *Run workflow*. It is two independent jobs, so a failure in one
+never hides the other.
+
+**`verify` (no database)** — `pnpm install --frozen-lockfile`, `pnpm typecheck`,
+`pnpm db:check`, a schema-drift guard, then `pnpm build`. The drift guard runs
+`pnpm db:generate` (which needs no database) and fails if anything under
+`drizzle/` changed afterwards: on a healthy tree the generator prints *No schema
+changes* and writes nothing, so a new or modified file there means
+`src/db/schema.ts` was edited without committing its migration. stdin is closed
+for that step so a drizzle-kit rename prompt fails fast instead of hanging the
+job.
+
+**`test` (PostgreSQL 17)** — the same install, then `pnpm test` against a
+`postgres:17` service container. This is the only place the integration suites
+actually execute, because there is no local PostgreSQL in this development
+environment. The container's database is named `ai_workforce_test` so it
+satisfies the "name must contain `test`" guard in
+`src/test/integration/support.ts`, and `TEST_DATABASE_URL` addresses it over
+`127.0.0.1` rather than `localhost` — the published service port is on IPv4 and
+`localhost` can resolve to `::1` first on a runner. `global-setup.ts` applies the
+migrations once before the suites run.
+
+Because `vitest run` exits 0 when every integration suite *skips*, the job
+asserts `TEST_DATABASE_URL` is non-empty before running the tests. That variable
+is the single gate every integration file reads, so an edit that drops it turns
+CI red instead of quietly reducing the run to unit tests only.
+
+CI needs **no secrets**. Every suite that touches credentials generates its own
+key with `generateCredentialKey()`, and the Anthropic and Slack transports are
+faked, so the checkout plus the PostgreSQL container is the whole environment.
+The pnpm version comes from `packageManager` in `package.json` (the workflow
+passes no version of its own) and the Node major matches `engines.node`, so CI
+cannot drift from local development.
 
 ## Current status
 

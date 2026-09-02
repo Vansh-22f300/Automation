@@ -19,7 +19,7 @@
 import pino from 'pino';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ClaimedJob, EnqueueInput, JobError, Queue } from '@/domain/queue.js';
+import type { ClaimedJob, EnqueueInput, JobError, Queue, ReapResult } from '@/domain/queue.js';
 import { StepExecutionNotImplementedError, StepFailedError, StepRetryError, UnimplementedStepDispatcher } from '@/worker/dispatcher.js';
 import type { StepDispatcher } from '@/worker/dispatcher.js';
 import { Worker } from '@/worker/worker.js';
@@ -75,8 +75,8 @@ class FakeQueue implements Queue {
     return Promise.resolve();
   }
 
-  requeueExpired(): Promise<number> {
-    return Promise.resolve(0);
+  requeueExpired(): Promise<ReapResult> {
+    return Promise.resolve({ requeued: 0, deadLettered: [] });
   }
 }
 
