@@ -1,0 +1,24 @@
+{
+  "extends": "./.nuxt/tsconfig.json",
+  "include": [
+    "./.nuxt/*.d.ts",
+    "./.nuxt/types/**/*.d.ts",
+    "./app.vue",
+    "./nuxt.config.ts",
+    "./components/**/*.vue",
+    "./composables/**/*.ts",
+    "./layouts/**/*.vue",
+    "./lib/**/*.ts",
+    "./pages/**/*.vue",
+    "./types/**/*.ts"
+  ],
+  "exclude": [
+    "./node_modules",
+    "./.nuxt/dev",
+    "./.nuxt/dist",
+    "./.nuxt/schema",
+    "./.output",
+    "../src/**/*",
+    "../dist/**/*"
+  ]
+}
