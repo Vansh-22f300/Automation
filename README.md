@@ -4,7 +4,7 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: backend production hardening is paused after Step 13 Items 1–3; Frontend Milestone 1 is available in `frontend/`.**
+> **Status: Step 10 of 13 — tool calling wired into Claude (end-to-end AI action).**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
 > service for authoring workflows and their immutable versioned definitions, a
@@ -131,31 +131,6 @@ pnpm dev:api
 
 It verifies the database is reachable **before** opening the port, then binds to
 `HOST:PORT` (default `127.0.0.1:3000`).
-
-## Local frontend
-
-The visible application lives in [`frontend/`](frontend/), a separate Nuxt 3
-single-page app. It consumes Fastify through a small typed client; it does not
-duplicate API routes or contain backend business logic.
-
-Start the API first, then in another terminal:
-
-```bash
-cd frontend
-pnpm dev
-```
-
-Open `http://localhost:3001`. Create `frontend/.env` from
-[`frontend/.env.example`](frontend/.env.example) and set `NUXT_PUBLIC_API_KEY`
-to a local tenant API key. This is development-only browser configuration; never
-commit a real key. The Nuxt Vite server proxies `/backend/*` to
-`NUXT_BACKEND_URL` (default `http://127.0.0.1:3000`) so browser requests remain
-same-origin and Fastify needs no CORS policy.
-
-The current API exposes `GET /v1/runs/:runId` but deliberately has no workflow,
-run-list, or connection-list endpoint. The dashboard and those collection pages
-show that limitation explicitly; run detail is populated from the existing safe,
-tenant-scoped inspection DTO.
 
 ### Endpoints
 
