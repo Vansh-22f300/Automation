@@ -16,6 +16,8 @@
 
 import { z } from 'zod';
 
+import { DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS } from '@/domain/timing.js';
+
 export const LOG_LEVELS = [
   'fatal',
   'error',
@@ -166,6 +168,14 @@ const envSchema = z
    * Postgres plans cap connections aggressively; keep this modest.
    */
   DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
+
+  /** How long graceful worker shutdown waits for in-flight work before giving up. */
+  WORKER_SHUTDOWN_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(1, 'must be at least 1ms')
+    .max(300_000, 'must not exceed 300000ms (5 minutes)')
+    .default(DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS),
 
   /**
    * Anthropic (Claude) API key. Optional on purpose: the application must boot

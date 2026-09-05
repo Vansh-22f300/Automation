@@ -118,11 +118,11 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('llm workflow step integration'
     if (job === null) return 'empty';
     try {
       await executor.dispatch(job);
-      await queue().complete(job.id);
+      await queue().complete(job.id, job.lockedBy);
       return 'done';
     } catch (error) {
       if (error instanceof StepFailedError) {
-        await queue().fail(job.id, error.reason);
+        await queue().fail(job.id, job.lockedBy, error.reason);
         return 'failed';
       }
       throw error;
@@ -310,7 +310,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('llm workflow step integration'
     const job = await scopedA.claim('worker-a');
     expect(job!.tenantId).toBe(tenantA);
     await executor.dispatch(job!);
-    await scopedA.complete(job!.id);
+    await scopedA.complete(job!.id, job!.lockedBy);
 
     expect((await runById(a.runId))!.status).toBe('succeeded');
     const runB = await runById(b.runId);

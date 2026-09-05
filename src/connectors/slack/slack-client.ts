@@ -58,6 +58,8 @@ export interface FetchSlackTransportOptions {
   readonly timeoutMs?: number;
 }
 
+export const DEFAULT_SLACK_TIMEOUT_MS = 10_000;
+
 /**
  * The real transport: POSTs form-encoded params to the fixed Slack URL with the bot
  * token in the Authorization header (never in the body, never logged). A timeout
@@ -65,7 +67,7 @@ export interface FetchSlackTransportOptions {
  */
 export function createFetchSlackTransport(options: FetchSlackTransportOptions = {}): SlackTransport {
   const fetchFn: FetchLike = options.fetch ?? (globalThis.fetch as FetchLike);
-  const timeoutMs = options.timeoutMs ?? 10_000;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SLACK_TIMEOUT_MS;
 
   return {
     async postMessage(input: SlackPostMessageInput, botToken: string): Promise<SlackHttpResponse> {

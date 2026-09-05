@@ -17,8 +17,9 @@
  * step failed, and left for the reaper on an unexpected mid-execution error.
  *
  * The composition root wires the real dependencies (database, queue, dispatcher)
- * and owns process concerns: startup verification, signal handling, and a clean
- * shutdown that stops claiming, drains the loops, and closes the pool.
+ * and owns process concerns: startup verification, signal handling, and a
+ * time-bounded shutdown that stops claiming, drains the loops (handing back the
+ * lease of anything still in flight when the wait runs out) and closes the pool.
  */
 
 import { and, eq } from 'drizzle-orm';
@@ -48,6 +49,17 @@ import type { RunExistenceCheck } from '@/worker/worker.js';
 const POLL_INTERVAL_MS = 1_000;
 /** How often the reaper sweeps for expired leases. */
 const REAPER_INTERVAL_MS = 30_000;
+/**
+ * Extra time the force-exit watchdog allows *beyond* `WORKER_SHUTDOWN_TIMEOUT_MS`.
+ *
+ * `Worker.stop()` gives up waiting at that timeout and then still has real work to
+ * do: hand its lease back, stop the reaper, close the pool. A watchdog armed at
+ * exactly the same deadline would kill the process at the instant that tail begins
+ * and lose the lease release — the thing that makes the job immediately
+ * re-claimable rather than stranded until its lease lapses. This grace bounds the
+ * tail; it is not part of the wait for the step itself.
+ */
+const SHUTDOWN_GRACE_MS = 5_000;
 
 // The durable business-retry policy. A retryable step failure is deferred by an
 // equal-jitter backoff and re-claimed after its `run_at`; crash recovery (the
@@ -121,6 +133,7 @@ const worker = new Worker({
   workerId,
   pollIntervalMs: POLL_INTERVAL_MS,
   runExists,
+  shutdownTimeoutMs: env.WORKER_SHUTDOWN_TIMEOUT_MS,
 });
 
 const reaper = new Reaper({ queue, logger, intervalMs: REAPER_INTERVAL_MS });
@@ -131,7 +144,32 @@ async function shutdown(reason: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  logger.info({ reason, worker_id: workerId }, 'worker shutting down');
+  // The absolute ceiling on this process's lifetime from here. `Worker.stop()`
+  // bounds its own wait; this bounds everything after it, so a hung pool close or
+  // reaper stop cannot keep a terminating process alive indefinitely either.
+  const forceExitAfterMs = env.WORKER_SHUTDOWN_TIMEOUT_MS + SHUTDOWN_GRACE_MS;
+
+  logger.info(
+    {
+      reason,
+      worker_id: workerId,
+      shutdown_timeout_ms: env.WORKER_SHUTDOWN_TIMEOUT_MS,
+      force_exit_after_ms: forceExitAfterMs,
+    },
+    'worker shutting down',
+  );
+
+  const timeout = setTimeout(() => {
+    logger.error(
+      {
+        timeout_ms: forceExitAfterMs,
+        shutdown_timeout_ms: env.WORKER_SHUTDOWN_TIMEOUT_MS,
+      },
+      'worker process shutdown timed out; forcing exit',
+    );
+    process.exit(1);
+  }, forceExitAfterMs);
+  timeout.unref();
 
   try {
     // Stop claiming new work first, then stop the reaper, then release the pool.
@@ -144,6 +182,8 @@ async function shutdown(reason: string): Promise<void> {
   } catch (error) {
     logger.error({ err: error }, 'worker shutdown failed');
     process.exitCode = 1;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -176,6 +216,7 @@ try {
       worker_id: workerId,
       poll_interval_ms: POLL_INTERVAL_MS,
       reaper_interval_ms: REAPER_INTERVAL_MS,
+      shutdown_timeout_ms: env.WORKER_SHUTDOWN_TIMEOUT_MS,
     },
     'worker running',
   );

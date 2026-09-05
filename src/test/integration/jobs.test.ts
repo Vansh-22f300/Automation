@@ -14,8 +14,12 @@
  *   - a future run_at is not claimed; an empty queue yields null;
  *   - two workers claiming concurrently never receive the same job, and each
  *     gets a distinct job when several are ready (the SKIP LOCKED guarantee);
- *   - complete/fail only act on a running job; illegal transitions are rejected;
+ *   - complete/fail only act on a running job, and only for the worker that still
+ *     holds its lease; illegal transitions are rejected;
  *   - a done/failed job is terminal and never re-claimed;
+ *   - a graceful-shutdown release returns an owned running job to pending without
+ *     touching attempt, retry_count, last_error or run_at — and an old worker
+ *     cannot release a lease another worker has since claimed;
  *   - the reaper returns expired-lease running jobs to pending, increments the
  *     attempt, clears the lock, and leaves live leases alone;
  *   - a job that has burned its crash-recovery budget is dead-lettered instead of
@@ -32,6 +36,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { DatabaseHandle } from "@/db/client.js";
 import { jobs, tenants } from "@/db/schema.js";
 import { InvalidJobTransitionError, MAX_CRASH_ATTEMPTS } from "@/domain/queue.js";
+import { DEFAULT_LEASE_MS } from "@/domain/timing.js";
 import { PostgresJobQueue } from "@/repositories/job-queue.js";
 import { TenantScope } from "@/repositories/tenant-scope.js";
 import { WebhookRepository } from "@/repositories/webhook-repository.js";
@@ -171,6 +176,25 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
     });
 
     describe("claim", () => {
+      it("stamps the centrally derived lease on the row it claims", async () => {
+        // The arithmetic invariant (lease > worst-case step duration) is proven in
+        // src/test/unit/timing.test.ts, which runs without a database. What only a
+        // real server can show is that the queue actually stamps *that* lease.
+        const { id } = await queueFor().enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+
+        const before = Date.now();
+        const claimed = await queueFor().claim("worker-1");
+        const stamped = claimed!.leaseExpiresAt.getTime();
+
+        expect(stamped).toBeGreaterThanOrEqual(before + DEFAULT_LEASE_MS);
+        expect(stamped).toBeLessThanOrEqual(Date.now() + DEFAULT_LEASE_MS);
+        expect((await jobById(id))!.leaseExpiresAt!.getTime()).toBe(stamped);
+      });
+
       it("moves the oldest pending job to running under a lease", async () => {
         const { id } = await queueFor().enqueue({
           tenantId: tenantA,
@@ -261,16 +285,16 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         });
 
         // pending → complete is illegal (never claimed).
-        await expect(q.complete(id)).rejects.toBeInstanceOf(
+        await expect(q.complete(id, "worker-1")).rejects.toBeInstanceOf(
           InvalidJobTransitionError,
         );
 
         await q.claim("worker-1");
-        await q.complete(id);
+        await q.complete(id, "worker-1");
         expect((await jobById(id))!.status).toBe("done");
 
         // done → complete again is illegal; the job is terminal.
-        await expect(q.complete(id)).rejects.toBeInstanceOf(
+        await expect(q.complete(id, "worker-1")).rejects.toBeInstanceOf(
           InvalidJobTransitionError,
         );
       });
@@ -284,7 +308,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         });
         await q.claim("worker-1");
 
-        await q.fail(id, { code: "boom", message: "nope" });
+        await q.fail(id, "worker-1", { code: "boom", message: "nope" });
         const job = await jobById(id);
         expect(job!.status).toBe("failed");
         expect(job!.lastError).toEqual({ code: "boom", message: "nope" });
@@ -292,9 +316,33 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         expect(job!.leaseExpiresAt).toBeNull();
 
         // failed → running is not automatic, and failed cannot be failed again.
-        await expect(q.fail(id, { code: "again" })).rejects.toBeInstanceOf(
+        await expect(q.fail(id, "worker-1", { code: "again" })).rejects.toBeInstanceOf(
           InvalidJobTransitionError,
         );
+      });
+
+      it("does not let a different worker settle a running job it does not own", async () => {
+        const q = queueFor();
+        const { id } = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        await q.claim("worker-1");
+
+        await expect(q.complete(id, "worker-2")).rejects.toBeInstanceOf(
+          InvalidJobTransitionError,
+        );
+        await expect(q.fail(id, "worker-2", { code: "x" })).rejects.toBeInstanceOf(
+          InvalidJobTransitionError,
+        );
+        await expect(
+          q.retry(id, "worker-2", { code: "x" }, new Date(Date.now() + 1_000)),
+        ).rejects.toBeInstanceOf(InvalidJobTransitionError);
+
+        const job = await jobById(id);
+        expect(job!.status).toBe("running");
+        expect(job!.lockedBy).toBe("worker-1");
       });
 
       it("never re-claims a terminal job", async () => {
@@ -305,7 +353,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
           stepKey: "first",
         });
         await q.claim("worker-1");
-        await q.complete(id);
+        await q.complete(id, "worker-1");
 
         await expect(queueFor().claim("worker-2")).resolves.toBeNull();
       });
@@ -336,7 +384,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
       });
 
       it("leaves a job with a live lease alone", async () => {
-        const q = queueFor(); // default five-minute lease
+        const q = queueFor(); // default centrally-derived safe lease
         const { id } = await q.enqueue({
           tenantId: tenantA,
           runId: runA,
@@ -450,6 +498,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         await q.claim("worker-1");
         await q.retry(
           id,
+          "worker-1",
           { code: "llm_rate_limited", retryable: true },
           new Date(Date.now() - 1_000), // immediately claimable again
         );
@@ -498,6 +547,88 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
       });
     });
 
+    describe("release (graceful shutdown)", () => {
+      it("releases an owned running job back to pending without consuming attempt or retry budget", async () => {
+        const q = queueFor();
+        // A distinctive past `run_at`: claimable now (claim requires `run_at <= now`),
+        // and a value the release must leave exactly as it found it. A release is not
+        // a deferral — the job becomes ready again immediately.
+        const runAt = new Date(Date.now() - 60_000);
+        const { id } = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+          runAt,
+        });
+        expect(await q.claim("worker-1")).not.toBeNull();
+        // A job that has already burned a business retry, to prove the release does
+        // not touch that counter either.
+        await handle.db
+          .update(jobs)
+          .set({ retryCount: 2 })
+          .where(eq(jobs.id, id));
+
+        await expect(q.release(id, "worker-1")).resolves.toEqual({ outcome: "released" });
+
+        const job = await jobById(id);
+        expect(job!.status).toBe("pending");
+        expect(job!.attempt).toBe(0);
+        expect(job!.retryCount).toBe(2);
+        expect(job!.runAt.getTime()).toBe(runAt.getTime());
+        expect(job!.lastError).toBeNull();
+        expect(job!.lockedBy).toBeNull();
+        expect(job!.leaseExpiresAt).toBeNull();
+
+        // The operational point of a voluntary release: the job is ready again at
+        // once, not after the remainder of the lease the old worker walked away from.
+        // (`beforeEach` empties `jobs`, so this is the only candidate.)
+        const reclaimed = await q.claim("worker-2");
+        expect(reclaimed!.id).toBe(id);
+        expect(reclaimed!.attempt).toBe(0);
+        expect(reclaimed!.retryCount).toBe(2);
+      });
+
+      it("is safe and idempotent when the job is no longer running", async () => {
+        const q = queueFor();
+        const { id } = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        await q.claim("worker-1");
+        await q.complete(id, "worker-1");
+
+        await expect(q.release(id, "worker-1")).resolves.toEqual({ outcome: "not_running", status: "done" });
+        expect((await jobById(id))!.status).toBe("done");
+      });
+
+      it("does not let an old worker release a lease that a new worker has already claimed", async () => {
+        const q = queueFor();
+        const { id } = await q.enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        await q.claim("worker-old");
+        await expireLease(id);
+
+        expect((await q.requeueExpired()).requeued).toBe(1);
+        const reclaimed = await q.claim("worker-new");
+        expect(reclaimed).not.toBeNull();
+
+        await expect(q.release(id, "worker-old")).resolves.toEqual({
+          outcome: "not_owned",
+          lockedBy: "worker-new",
+        });
+
+        const job = await jobById(id);
+        expect(job!.status).toBe("running");
+        expect(job!.lockedBy).toBe("worker-new");
+        expect(job!.attempt).toBe(1);
+        expect(job!.retryCount).toBe(0);
+      });
+    });
+
     describe("retry (business retries)", () => {
       it("moves a running job back to pending with a future run_at, bumping retry_count and not attempt", async () => {
         const q = queueFor();
@@ -511,6 +642,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         const runAt = new Date(Date.now() + 60_000);
         await q.retry(
           id,
+          "worker-1",
           { code: "llm_rate_limited", message: "slow down", retryable: true },
           runAt,
         );
@@ -541,6 +673,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         // Retry comfortably into the future: not claimable now.
         await q.retry(
           id,
+          "worker-1",
           { code: "llm_timeout", retryable: true },
           new Date(Date.now() + 60_000),
         );
@@ -568,14 +701,14 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
 
         // pending → retry is illegal (never claimed).
         await expect(
-          q.retry(id, { code: "x" }, new Date()),
+          q.retry(id, "worker-1", { code: "x" }, new Date()),
         ).rejects.toBeInstanceOf(InvalidJobTransitionError);
 
         await q.claim("worker-1");
-        await q.complete(id);
+        await q.complete(id, "worker-1");
         // done → retry is illegal.
         await expect(
-          q.retry(id, { code: "x" }, new Date()),
+          q.retry(id, "worker-1", { code: "x" }, new Date()),
         ).rejects.toBeInstanceOf(InvalidJobTransitionError);
       });
 
@@ -593,6 +726,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
           expect(claimed!.id).toBe(id);
           await q.retry(
             id,
+            "worker-1",
             { code: "llm_rate_limited", retryable: true },
             new Date(Date.now() - 1),
           );
@@ -614,6 +748,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         await expect(
           queueFor(tenantB).retry(
             id,
+            "worker-1",
             { code: "x" },
             new Date(Date.now() + 1_000),
           ),
@@ -642,6 +777,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         await expect(
           queueFor().retry(
             id,
+            "worker-dead",
             { code: "llm_timeout", retryable: true },
             new Date(Date.now() + 1_000),
           ),
@@ -676,17 +812,35 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         await queueFor().claim("worker-1"); // now running
 
         // B's scoped queue matches no row (tenant predicate excludes it).
-        await expect(queueFor(tenantB).complete(id)).rejects.toBeInstanceOf(
+        await expect(queueFor(tenantB).complete(id, "worker-1")).rejects.toBeInstanceOf(
           InvalidJobTransitionError,
         );
         await expect(
-          queueFor(tenantB).fail(id, { code: "x" }),
+          queueFor(tenantB).fail(id, "worker-1", { code: "x" }),
         ).rejects.toBeInstanceOf(InvalidJobTransitionError);
 
         // The job is untouched and still completable by the unscoped worker.
         expect((await jobById(id))!.status).toBe("running");
-        await queueFor().complete(id);
+        await queueFor().complete(id, "worker-1");
         expect((await jobById(id))!.status).toBe("done");
+      });
+
+      it("a tenant-scoped queue cannot release another tenant’s running job", async () => {
+        const { id } = await queueFor().enqueue({
+          tenantId: tenantA,
+          runId: runA,
+          stepKey: "first",
+        });
+        await queueFor().claim("worker-1");
+
+        await expect(queueFor(tenantB).release(id, "worker-1")).resolves.toEqual({
+          outcome: "not_running",
+          status: null,
+        });
+
+        const job = await jobById(id);
+        expect(job!.status).toBe("running");
+        expect(job!.lockedBy).toBe("worker-1");
       });
 
       it("a tenant-scoped queue only reaps its own expired jobs", async () => {

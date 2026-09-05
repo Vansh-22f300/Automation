@@ -261,9 +261,14 @@ against the `jobs` table:
 
 - a **claim loop** that takes one ready job at a time with `SELECT … FOR UPDATE
   SKIP LOCKED` inside a short transaction, stamps this worker's instance id and a
-  five-minute lease on it, checks the job's run still exists, and hands it to a
-  dispatcher — logging `job_claimed`, then `job_completed`, `job_failed`, or
-  `job_retry_scheduled` when a retryable step failure defers the job;
+  **15-minute lease** on the row, checks the job's run still exists, and hands it to
+  a dispatcher — logging `job_claimed`, then `job_completed`, `job_failed`, or
+  `job_retry_scheduled` when a retryable step failure defers the job. The lease is
+  not a round number picked by taste: [`src/domain/timing.ts`](src/domain/timing.ts)
+  derives the worst case a legitimate step can take from the timeouts that actually
+  bound it (5 tool rounds × (60 s Claude + 4 × 10 s Slack) + 60 s overhead ≈ 9 m 20 s)
+  and keeps the lease a safety margin above it, so a step can never outlive the lease
+  and have its job handed to a second worker. A unit test fails if any input drifts;
 - a **reaper** that periodically returns jobs whose lease has expired to `pending`
   (incrementing `attempt`, **never** the business `retry_count`), so a job held by
   a crashed worker is never lost — logging `job_requeued` when it recovers any.
@@ -296,8 +301,25 @@ PostgreSQL's, via `FOR UPDATE SKIP LOCKED`, not the application's.
 > A job whose run has vanished fails as `run_not_found`; an unexpected error leaves
 > the job `running` so the reaper recovers it.
 
-Stop it with `Ctrl+C`; it stops claiming first, drains the loops, closes the pool,
-and logs `worker_shutdown`.
+Stop it with `Ctrl+C`. It stops claiming first, then waits for any in-flight job for
+at most `WORKER_SHUTDOWN_TIMEOUT_MS` (default 10 s) — logging
+`worker_shutdown_requested` and `worker_shutdown_waiting`. If the job finishes in
+time, its normal completion or failure handling stays authoritative. If the wait runs
+out, the worker logs `worker_shutdown_timed_out` and hands the lease it still owns
+back to the queue (`worker_lease_release_attempted` → `worker_lease_release_succeeded`,
+or `worker_lease_release_skipped` when another worker has already taken the row), so
+the job is `pending` and re-claimable at once instead of stranded for the rest of its
+15-minute lease. The release is **not** a retry: `attempt`, `retry_count`,
+`last_error` and `run_at` are all untouched. The job is never marked failed just
+because shutdown ran out of patience.
+
+What this does **not** do is cancel an in-flight Claude or Slack request — neither is
+abortable from the shutdown path — so the step may still complete after the worker
+has let go of it, and external side effects remain **at-least-once**. A late
+settlement cannot corrupt the new owner: `complete`, `fail`, `retry` and `release`
+all require the row to still be locked by the worker calling them, so a superseded
+worker's write matches no row and is refused. Finally the reaper stops and the pool
+closes; the process force-exits 5 s past the shutdown timeout if any of that hangs.
 
 The two processes are independent — neither requires the other to run. Both
 refuse to start if the database is unreachable, because a process that is
@@ -326,6 +348,7 @@ FATAL: configuration error — refusing to start.
 | `LOG_LEVEL` | `info` | pino level: `fatal`…`trace`, or `silent`. `debug` also logs every SQL statement. |
 | `HOST` | `127.0.0.1` | API bind address. Use `0.0.0.0` in a container or on a PaaS. |
 | `PORT` | `3000` | API port. |
+| `WORKER_SHUTDOWN_TIMEOUT_MS` | `10000` | How long graceful worker shutdown waits for an in-flight job before returning and, if it still owns the lease, releasing that job back to `pending`. This does **not** cancel the underlying external request. |
 | `ANTHROPIC_API_KEY` | *(unset)* | **Optional secret.** Direct-Anthropic credential, sent as `x-api-key`. Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients. |
 | `ANTHROPIC_AUTH_TOKEN` | *(unset)* | **Optional secret.** Bearer token for an Anthropic-*compatible* gateway, sent as `Authorization: Bearer …`. **Mutually exclusive** with `ANTHROPIC_API_KEY` — set exactly one; configuring both is refused at startup. |
 | `ANTHROPIC_BASE_URL` | *(unset)* | Optional. Points the provider at an Anthropic-compatible gateway instead of `https://api.anthropic.com`. Give the **origin only** (optionally with a base path); do **not** include `/v1` — the SDK appends `/v1/messages` itself, so a trailing `/v1` would produce `/v1/v1/messages` (rejected at startup). |
@@ -619,7 +642,7 @@ src/
 │   ├── api-key-repository.ts Tenant-scoped create/list/revoke
 │   ├── workflow-repository.ts  Tenant-scoped workflow + immutable version authoring
 │   ├── webhook-repository.ts   Tenant-scoped webhook ingestion (event + run + first job, one txn)
-│   ├── job-queue.ts            PostgresJobQueue — enqueue/claim/complete/fail/requeueExpired
+│   ├── job-queue.ts            PostgresJobQueue — enqueue/claim/complete/fail/retry/release/requeueExpired
 │   └── execution-engine.ts     WorkflowExecutor — advances a run by one step, atomically
 ├── cli/                      create-tenant.ts, create-api-key.ts, create-workflow.ts, inspect-webhooks.ts, llm-smoke.ts, connections.ts, slack-smoke.ts, llm-tool-smoke.ts (bootstrap/dev)
 ├── worker/
@@ -645,6 +668,7 @@ src/
 │   ├── step-handler.ts       StepHandler interface + registry (noop, llm)
 │   ├── output-schema.ts       Declarative, data-only output schema → compiled Zod
 │   ├── queue.ts             Framework-free Queue contract + InvalidJobTransitionError
+│   ├── timing.ts            Derived step-duration budget → job lease + shutdown timeout
 │   └── llm.ts               Framework-free LlmProvider seam + request/response/usage types
 ├── llm/
 │   └── claude-provider.ts    ClaudeProvider — the only importer of @anthropic-ai/sdk
@@ -944,20 +968,24 @@ cannot drift from local development.
   workflow for a source is a success (event kept, no run), not an error. A
   `webhooks:inspect` CLI lists a tenant's events, runs and jobs.
 - **Job queue, worker and reaper (Step 5)** — a durable `jobs` table and a
-  framework-free `Queue` contract (`enqueue`/`claim`/`complete`/`fail`/
-  `requeueExpired`) with a PostgreSQL implementation that claims one ready job at a
-  time via `SELECT … FOR UPDATE SKIP LOCKED` in a short transaction, holds it under
-  a five-minute lease (`locked_by` + `lease_expires_at`), and rejects illegal state
-  transitions (`done`/`failed` are terminal). The worker stamps its instance id on
-  every claim, verifies the run still exists, dispatches, and settles — with
-  structured logs (`worker_started`, `job_claimed`, `job_completed`, `job_failed`,
-  `job_requeued`, `worker_shutdown`) carrying `tenant_id`/`run_id`/`job_id`/
-  `worker_id`. A reaper returns expired-lease jobs to `pending` (incrementing
-  `attempt`) with a single atomic UPDATE, safe across processes. The first job is
-  created in the same transaction as the event and run. At this step **no step
-  executed yet** — the dispatcher was a stub that refused every step and the
-  worker recorded that as a terminal failure, never marking a job `done`; the real
-  execution engine arrives in Step 6.
+  framework-free `Queue` contract (`enqueue`/`claim`/`complete`/`fail`/`retry`/
+  `release`/`requeueExpired`) with a PostgreSQL implementation that claims one ready
+  job at a time via `SELECT … FOR UPDATE SKIP LOCKED` in a short transaction, holds it
+  under a 15-minute lease (`locked_by` + `lease_expires_at`) derived in
+  [`src/domain/timing.ts`](src/domain/timing.ts) from the timeouts that actually bound
+  a step, and rejects illegal state transitions (`done`/`failed` are terminal, and
+  every settlement must come from the worker that still holds the lease). The worker
+  stamps its instance id on every claim, verifies the run still exists, dispatches,
+  and settles — with structured logs (`worker_started`, `job_claimed`,
+  `job_completed`, `job_failed`, `job_requeued`, `worker_shutdown`) carrying
+  `tenant_id`/`run_id`/`job_id`/`worker_id`. Shutdown is time-bounded and hands back
+  the lease of anything still in flight (`WORKER_SHUTDOWN_TIMEOUT_MS`). A reaper
+  returns expired-lease jobs to `pending` (incrementing `attempt`) with a single
+  atomic UPDATE, safe across processes. The first job is created in the same
+  transaction as the event and run. At this step **no step executed yet** — the
+  dispatcher was a stub that refused every step and the worker recorded that as a
+  terminal failure, never marking a job `done`; the real execution engine arrives in
+  Step 6.
 - **Workflow execution engine (Step 6)** — the real `StepDispatcher`
   ([`WorkflowExecutor`](src/repositories/execution-engine.ts)): one claimed job
   advances its run by **exactly one step**, never loading or running a whole

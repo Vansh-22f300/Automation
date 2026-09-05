@@ -1,25 +1,31 @@
 /**
  * Unit tests for the worker loop, driven with an in-memory fake queue.
  *
- * These prove the *orchestration* — claim → verify → dispatch → settle — without
- * a database and without asserting anything about PostgreSQL locking (that is
- * the integration suite's job, against a real server). What matters here is the
+ * These prove the *orchestration* — claim → verify → dispatch → settle → stop —
+ * without a database and without asserting anything about PostgreSQL locking (that
+ * is the integration suite's job, against a real server). What matters here is the
  * behaviour that must hold regardless of storage:
  *
- *   - a claimed job whose step cannot execute yet is failed, never completed;
+ *   - a job is completed only when the dispatcher reported success, and a step
+ *     that failed, refused, or cannot execute is never marked done;
  *   - a job whose run has vanished is failed with a clear reason and never dispatched;
- *   - the worker stamps its instance id on every claim;
- *   - an empty queue is a no-op;
- *   - once stopped, the worker claims nothing further.
- *
- * The single most important assertion across all of them: the worker never calls
- * `complete` in Step 5, because no work is ever really performed.
+ *   - the worker stamps its instance id on every claim and on every settlement, so
+ *     a settlement it no longer owns is refused rather than applied;
+ *   - shutdown is bounded on every path: it stops claiming, waits for the in-flight
+ *     job up to its timeout, then hands back the lease it still owns — and it never
+ *     rejects, whatever the queue does.
  */
 
 import pino from 'pino';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ClaimedJob, EnqueueInput, JobError, Queue, ReapResult } from '@/domain/queue.js';
+import type { ClaimedJob, EnqueueInput, JobError, Queue, ReapResult, ReleaseResult } from '@/domain/queue.js';
+import { InvalidJobTransitionError } from '@/domain/queue.js';
+import {
+  DEFAULT_LEASE_MS,
+  DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS,
+  MAX_LEGITIMATE_STEP_DURATION_MS,
+} from '@/domain/timing.js';
 import { StepExecutionNotImplementedError, StepFailedError, StepRetryError, UnimplementedStepDispatcher } from '@/worker/dispatcher.js';
 import type { StepDispatcher } from '@/worker/dispatcher.js';
 import { Worker } from '@/worker/worker.js';
@@ -43,9 +49,11 @@ const claimedJob = (overrides: Partial<ClaimedJob> = {}): ClaimedJob => ({
 class FakeQueue implements Queue {
   private readonly pending: ClaimedJob[];
   readonly completed: string[] = [];
-  readonly failed: Array<{ id: string; error: JobError }> = [];
-  readonly retried: Array<{ id: string; error: JobError; runAt: Date }> = [];
+  readonly failed: Array<{ id: string; workerId: string; error: JobError }> = [];
+  readonly retried: Array<{ id: string; workerId: string; error: JobError; runAt: Date }> = [];
+  readonly released: Array<{ id: string; workerId: string }> = [];
   claimedBy: string[] = [];
+  releaseResult: ReleaseResult = { outcome: 'released' };
 
   constructor(pending: ClaimedJob[] = []) {
     this.pending = [...pending];
@@ -60,19 +68,24 @@ class FakeQueue implements Queue {
     return Promise.resolve(this.pending.shift() ?? null);
   }
 
-  complete(jobId: string): Promise<void> {
+  complete(jobId: string, _workerId: string): Promise<void> {
     this.completed.push(jobId);
     return Promise.resolve();
   }
 
-  fail(jobId: string, error: JobError): Promise<void> {
-    this.failed.push({ id: jobId, error });
+  fail(jobId: string, workerId: string, error: JobError): Promise<void> {
+    this.failed.push({ id: jobId, workerId, error });
     return Promise.resolve();
   }
 
-  retry(jobId: string, error: JobError, runAt: Date): Promise<void> {
-    this.retried.push({ id: jobId, error, runAt });
+  retry(jobId: string, workerId: string, error: JobError, runAt: Date): Promise<void> {
+    this.retried.push({ id: jobId, workerId, error, runAt });
     return Promise.resolve();
+  }
+
+  release(jobId: string, workerId: string): Promise<ReleaseResult> {
+    this.released.push({ id: jobId, workerId });
+    return Promise.resolve(this.releaseResult);
   }
 
   requeueExpired(): Promise<ReapResult> {
@@ -86,16 +99,62 @@ const makeWorker = (
     dispatcher: StepDispatcher;
     runExists: (tenantId: string, runId: string) => Promise<boolean>;
     workerId: string;
+    shutdownTimeoutMs: number;
+    logger: typeof silentLogger;
   }> = {},
 ): Worker =>
   new Worker({
     queue,
     dispatcher: overrides.dispatcher ?? new UnimplementedStepDispatcher(),
-    logger: silentLogger,
+    logger: overrides.logger ?? silentLogger,
     workerId: overrides.workerId ?? 'worker-test',
     pollIntervalMs: 5,
     runExists: overrides.runExists ?? (() => Promise.resolve(true)),
+    ...(overrides.shutdownTimeoutMs !== undefined ? { shutdownTimeoutMs: overrides.shutdownTimeoutMs } : {}),
   });
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function capturingLogger(): {
+  logger: typeof silentLogger;
+  records: () => Record<string, unknown>[];
+} {
+  let buffer = '';
+  const stream = {
+    write: (chunk: string) => {
+      buffer += chunk;
+      return true;
+    },
+  };
+  return {
+    logger: pino({ level: 'trace' }, stream as unknown as pino.DestinationStream),
+    records: () =>
+      buffer
+        .split('\n')
+        .filter((line) => line !== '')
+        .map((line) => JSON.parse(line) as Record<string, unknown>),
+  };
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('Worker.pollOnce', () => {
   it('returns false and dispatches nothing when the queue is empty', async () => {
@@ -120,6 +179,7 @@ describe('Worker.pollOnce', () => {
     expect(queue.failed).toHaveLength(1);
     expect(queue.failed[0]!.id).toBe('job-1');
     expect(queue.failed[0]!.error.code).toBe('step_execution_not_implemented');
+    expect(queue.failed[0]!.workerId).toBe('worker-test');
     await worker.stop();
   });
 
@@ -167,6 +227,7 @@ describe('Worker.pollOnce', () => {
     expect(queue.failed).toHaveLength(1);
     expect(queue.failed[0]!.id).toBe('job-1');
     expect(queue.failed[0]!.error).toEqual(reason);
+    expect(queue.failed[0]!.workerId).toBe('worker-test');
     await worker.stop();
   });
 
@@ -188,6 +249,7 @@ describe('Worker.pollOnce', () => {
     expect(queue.retried[0]!.id).toBe('job-1');
     expect(queue.retried[0]!.error).toEqual(reason);
     expect(queue.retried[0]!.runAt).toEqual(runAt);
+    expect(queue.retried[0]!.workerId).toBe('worker-test');
     await worker.stop();
   });
 
@@ -203,6 +265,26 @@ describe('Worker.pollOnce', () => {
     // Neither completed nor failed: the lease will lapse and the reaper requeues it.
     expect(queue.completed).toEqual([]);
     expect(queue.failed).toEqual([]);
+    await worker.stop();
+  });
+
+  it('logs a lost-lease settlement refusal instead of an unexpected error', async () => {
+    const { logger, records } = capturingLogger();
+    const queue = new FakeQueue([claimedJob()]);
+    // Another worker re-claimed the row while this step ran, so the ownership-
+    // guarded `complete` matches nothing and the queue refuses the transition.
+    queue.complete = (jobId) => Promise.reject(new InvalidJobTransitionError(jobId, 'completed'));
+    const worker = makeWorker(queue, {
+      logger,
+      dispatcher: { dispatch: () => Promise.resolve() },
+    });
+    worker.start();
+
+    await worker.pollOnce();
+
+    expect(records().some((record) => record.msg === 'job_settlement_not_owned')).toBe(true);
+    expect(records().some((record) => record.msg === 'job_processing_error')).toBe(false);
+    expect(queue.failed).toEqual([]); // losing a lease is not a step failure
     await worker.stop();
   });
 
@@ -226,6 +308,155 @@ describe('Worker.pollOnce', () => {
     const before = queue.claimedBy.length;
     await expect(worker.pollOnce()).resolves.toBe(false);
     expect(queue.claimedBy.length).toBe(before);
+  });
+});
+
+describe('Worker.stop', () => {
+  it('uses defaults that bound shutdown and keep the lease above the current max step duration', () => {
+    expect(DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS).toBe(10_000);
+    expect(DEFAULT_LEASE_MS).toBeGreaterThan(MAX_LEGITIMATE_STEP_DURATION_MS);
+  });
+
+  it('stops claiming new jobs once shutdown begins', async () => {
+    const queue = new FakeQueue([claimedJob({ id: 'job-1' }), claimedJob({ id: 'job-2' })]);
+    const gate = deferred<void>();
+    const worker = makeWorker(queue, {
+      shutdownTimeoutMs: 1_000,
+      dispatcher: { dispatch: () => gate.promise },
+    });
+
+    worker.start();
+    await vi.runOnlyPendingTimersAsync();
+
+    const stopPromise = worker.stop();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(queue.claimedBy).toHaveLength(1);
+
+    gate.resolve();
+    await stopPromise;
+    expect(queue.claimedBy).toEqual(['worker-test']);
+    expect(queue.completed).toEqual(['job-1']);
+  });
+
+  it('waits for an in-flight job that finishes before the shutdown timeout', async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    const gate = deferred<void>();
+    const worker = makeWorker(queue, {
+      shutdownTimeoutMs: 1_000,
+      dispatcher: { dispatch: () => gate.promise },
+    });
+
+    worker.start();
+    await vi.runOnlyPendingTimersAsync();
+
+    const stopPromise = worker.stop();
+    expect(queue.released).toEqual([]);
+
+    gate.resolve();
+    await stopPromise;
+
+    expect(queue.completed).toEqual(['job-1']);
+    expect(queue.released).toEqual([]);
+  });
+
+  it('returns after the shutdown timeout instead of waiting forever, and releases the lease it still owns', async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    const gate = deferred<void>();
+    const worker = makeWorker(queue, {
+      shutdownTimeoutMs: 50,
+      dispatcher: { dispatch: () => gate.promise },
+    });
+
+    worker.start();
+    await vi.runOnlyPendingTimersAsync();
+
+    const stopPromise = worker.stop();
+    await vi.advanceTimersByTimeAsync(50);
+    await stopPromise;
+
+    expect(queue.released).toEqual([{ id: 'job-1', workerId: 'worker-test' }]);
+    expect(queue.completed).toEqual([]);
+
+    // The late completion path still runs, but the ownership-safe queue API will
+    // reject it in the real queue instead of settling another worker's lease.
+    gate.resolve();
+  });
+
+  it('logs the shutdown timeout and skips release when the worker no longer owns the lease', async () => {
+    const { logger, records } = capturingLogger();
+    const queue = new FakeQueue([claimedJob()]);
+    queue.releaseResult = { outcome: 'not_owned', lockedBy: 'worker-new' };
+    const gate = deferred<void>();
+    const worker = makeWorker(queue, {
+      logger,
+      shutdownTimeoutMs: 25,
+      dispatcher: { dispatch: () => gate.promise },
+    });
+
+    worker.start();
+    await vi.runOnlyPendingTimersAsync();
+
+    const stopPromise = worker.stop();
+    await vi.advanceTimersByTimeAsync(25);
+    await stopPromise;
+
+    expect(records().some((record) => record.msg === 'worker_shutdown_timed_out')).toBe(true);
+    expect(
+      records().some(
+        (record) =>
+          record.msg === 'worker_lease_release_skipped' &&
+          record.outcome === 'not_owned' &&
+          record.locked_by === 'worker-new',
+      ),
+    ).toBe(true);
+
+    gate.resolve();
+  });
+
+  it('does not reject when the lease release fails — shutdown still completes', async () => {
+    const { logger, records } = capturingLogger();
+    const queue = new FakeQueue([claimedJob()]);
+    queue.release = () => Promise.reject(new Error('connection reset'));
+    const gate = deferred<void>();
+    const worker = makeWorker(queue, {
+      logger,
+      shutdownTimeoutMs: 25,
+      dispatcher: { dispatch: () => gate.promise },
+    });
+
+    worker.start();
+    await vi.runOnlyPendingTimersAsync();
+
+    const stopPromise = worker.stop();
+    await vi.advanceTimersByTimeAsync(25);
+    // A failed release must not reject `stop()`: main.ts still has to stop the
+    // reaper and close the pool. The reaper recovers the job when its lease lapses.
+    await expect(stopPromise).resolves.toBeUndefined();
+
+    expect(records().some((record) => record.msg === 'worker_lease_release_failed')).toBe(true);
+    expect(records().some((record) => record.msg === 'worker_shutdown')).toBe(true);
+
+    gate.resolve();
+  });
+
+  it('returns even when the claim itself never settles, with no lease to release', async () => {
+    const { logger, records } = capturingLogger();
+    const queue = new FakeQueue([claimedJob()]);
+    // A `claim` that never resolves. There is no claimed job to hand back, and the
+    // wait must still be bounded — the process has to be able to terminate.
+    queue.claim = () => new Promise<ClaimedJob | null>(() => undefined);
+    const worker = makeWorker(queue, { logger, shutdownTimeoutMs: 30 });
+
+    worker.start();
+    await vi.runOnlyPendingTimersAsync();
+
+    const stopPromise = worker.stop();
+    await vi.advanceTimersByTimeAsync(30);
+    await expect(stopPromise).resolves.toBeUndefined();
+
+    expect(queue.released).toEqual([]);
+    expect(records().some((record) => record.msg === 'worker_shutdown_timed_out')).toBe(true);
+    expect(records().some((record) => record.msg === 'worker_shutdown')).toBe(true);
   });
 });
 

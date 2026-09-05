@@ -58,6 +58,6 @@ Step 6 (workflow execution engine, linear `noop`) implemented and committed by t
 user. Always re-read that memory file at session start to confirm the current step.
 
 ## What each layer owns
-- **Queue** (`job-queue.ts`): enqueue/claim/complete/fail/requeueExpired; `FOR UPDATE SKIP LOCKED`, 5-min lease.
-- **Worker** (`worker.ts`): claims a job, verifies its run exists, dispatches, settles the queue job by outcome. Knows nothing of workflow internals.
+- **Queue** (`job-queue.ts`): enqueue/claim/complete/fail/retry/release/requeueExpired; `FOR UPDATE SKIP LOCKED`; 15-min lease derived in `domain/timing.ts` from the real step timeouts. Every settlement is guarded on `locked_by`, so a superseded worker cannot touch a re-claimed row.
+- **Worker** (`worker.ts`): claims a job, verifies its run exists, dispatches, settles the queue job by outcome. Shutdown is bounded by `WORKER_SHUTDOWN_TIMEOUT_MS` and hands back the lease of anything still in flight. Knows nothing of workflow internals.
 - **Execution engine** (`execution-engine.ts`): one job advances one run by exactly one step, in one transaction (step_run + context/status + next job OR finish). Idempotent (FOR UPDATE + currentStepKey guard + partial unique index), version-pinned, tenant-scoped.

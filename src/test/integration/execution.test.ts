@@ -115,15 +115,15 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
     if (job === null) return 'empty';
     try {
       await executor.dispatch(job);
-      await queue().complete(job.id);
+      await queue().complete(job.id, job.lockedBy);
       return 'done';
     } catch (error) {
       if (error instanceof StepFailedError) {
-        await queue().fail(job.id, error.reason);
+        await queue().fail(job.id, job.lockedBy, error.reason);
         return 'failed';
       }
       if (error instanceof StepRetryError) {
-        await queue().retry(job.id, error.reason, error.runAt);
+        await queue().retry(job.id, job.lockedBy, error.reason, error.runAt);
         return 'retried';
       }
       throw error;
@@ -434,7 +434,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
       expect(job).not.toBeNull();
       expect(job!.tenantId).toBe(tenantA);
       await executor.dispatch(job!);
-      await scopedA.complete(job!.id);
+      await scopedA.complete(job!.id, job!.lockedBy);
 
       // A ran to completion.
       expect((await runById(a.runId))!.status).toBe('succeeded');

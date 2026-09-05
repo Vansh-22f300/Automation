@@ -32,6 +32,7 @@ describe('parseEnv', () => {
       PORT: 3000,
       DATABASE_URL: VALID_DATABASE_URL,
       DATABASE_POOL_MAX: 10,
+      WORKER_SHUTDOWN_TIMEOUT_MS: 10_000,
       ANTHROPIC_MODEL: 'claude-opus-5',
     });
   });
@@ -157,6 +158,22 @@ describe('parseEnv / DATABASE_POOL_MAX', () => {
   it('rejects zero, negatives, fractions and absurd values', () => {
     for (const value of ['0', '-1', '2.5', '1000']) {
       expect(() => parseEnv({ ...base, DATABASE_POOL_MAX: value })).toThrow(EnvValidationError);
+    }
+  });
+});
+
+describe('parseEnv / WORKER_SHUTDOWN_TIMEOUT_MS', () => {
+  it('defaults to 10000ms', () => {
+    expect(parseEnv({ ...base }).WORKER_SHUTDOWN_TIMEOUT_MS).toBe(10_000);
+  });
+
+  it('coerces from a string', () => {
+    expect(parseEnv({ ...base, WORKER_SHUTDOWN_TIMEOUT_MS: '2500' }).WORKER_SHUTDOWN_TIMEOUT_MS).toBe(2500);
+  });
+
+  it('rejects zero, negatives, fractions and absurd values', () => {
+    for (const value of ['0', '-1', '2.5', '999999']) {
+      expect(() => parseEnv({ ...base, WORKER_SHUTDOWN_TIMEOUT_MS: value })).toThrow(EnvValidationError);
     }
   });
 });

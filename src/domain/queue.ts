@@ -8,11 +8,11 @@
  * interface so that the storage engine behind the queue can change (a broker, a
  * different table design) without either of them noticing.
  *
- * Deliberately small: enqueue / claim / complete / fail / requeueExpired. That
- * is the whole surface the MVP needs. Heartbeats, priorities, delayed-retry
- * scheduling and a real retry policy are later steps and are intentionally
- * absent — adding them now would be guessing at shapes we do not yet have to
- * commit to.
+ * Deliberately small: enqueue / claim / complete / fail / retry / release /
+ * requeueExpired. That is the whole surface the MVP needs. Heartbeats,
+ * priorities, delayed-retry scheduling and a real retry policy are later steps
+ * and are intentionally absent — adding them now would be guessing at shapes we
+ * do not yet have to commit to.
  */
 
 /**
@@ -100,10 +100,25 @@ export interface ReapResult {
 }
 
 /**
+ * What a graceful-shutdown lease release attempted to do.
+ *
+ * `released` means the worker still owned the running lease and voluntarily
+ * returned it to `pending`. `not_running` / `not_owned` are safe no-ops: by the
+ * time shutdown tried to release, the row had already settled or another worker
+ * owned the lease.
+ */
+export type ReleaseResult =
+  | { readonly outcome: 'released' }
+  | { readonly outcome: 'not_running'; readonly status: string | null }
+  | { readonly outcome: 'not_owned'; readonly lockedBy: string | null };
+
+/**
  * The durable work queue.
  *
- * `claim`, `complete`, `fail` and `requeueExpired` are worker-side operations;
- * `enqueue` produces work. The concrete PostgreSQL queue additionally lets a
+ * `claim`, `complete`, `fail`, `retry`, `release` and `requeueExpired` are
+ * worker-side operations; `enqueue` produces work. Every worker-side settlement
+ * names the worker that holds the lease, so the queue can refuse one from a worker
+ * that has since been superseded. The concrete PostgreSQL queue additionally lets a
  * producer enqueue inside an existing transaction (see `TransactionalJobEnqueuer`
  * in `@/repositories/job-queue`), so webhook ingestion can make the first job
  * part of the same atomic write as the event and the run — a storage detail this
@@ -120,25 +135,41 @@ export interface Queue {
    */
   claim(workerId: string): Promise<ClaimedJob | null>;
 
-  /** Move a `running` job to `done`. Rejects if the job is not `running`. */
-  complete(jobId: string): Promise<void>;
+  /**
+   * Move a `running` job to `done`, but only if `workerId` still owns its lease.
+   * Rejects if the job is not `running` or its lease belongs to someone else.
+   */
+  complete(jobId: string, workerId: string): Promise<void>;
 
   /**
-   * Move a `running` job to `failed`, recording `error`. Rejects if the job is
-   * not `running`. Terminal: a failed job is not re-claimed automatically.
+   * Move a `running` job to `failed`, recording `error`. Rejects if the job is not
+   * `running` or its lease belongs to someone else. Terminal: a failed job is not
+   * re-claimed automatically.
    */
-  fail(jobId: string, error: JobError): Promise<void>;
+  fail(jobId: string, workerId: string, error: JobError): Promise<void>;
 
   /**
    * Move a `running` job back to `pending` for a *business* retry: record
    * `error`, defer the job until `runAt`, increment `retry_count`, and clear the
-   * lease. Rejects if the job is not `running`. This is how a retryable step
-   * failure with remaining budget is scheduled durably — the deferral lives on
-   * the row, enforced by `claim`'s `run_at <= now()` predicate, so a crash
-   * during the wait loses nothing. Does NOT touch `attempt` (crash recovery is
-   * the reaper's counter, not this one).
+   * lease. Rejects if the job is not `running` or its lease belongs to someone
+   * else. This is how a retryable step failure with remaining budget is scheduled
+   * durably — the deferral lives on the row, enforced by `claim`'s
+   * `run_at <= now()` predicate, so a crash during the wait loses nothing. Does
+   * NOT touch `attempt` (crash recovery is the reaper's counter, not this one).
    */
-  retry(jobId: string, error: JobError, runAt: Date): Promise<void>;
+  retry(jobId: string, workerId: string, error: JobError, runAt: Date): Promise<void>;
+
+  /**
+   * Voluntarily release a `running` job's lease during graceful shutdown,
+   * returning it to `pending` without consuming any crash-recovery or business
+   * retry budget: `attempt`, `retry_count`, `last_error` and `run_at` are all left
+   * exactly as they were. This is not a retry — it says only "this worker has
+   * stopped owning this lease".
+   *
+   * Safe and idempotent: if the row is no longer `running`, or is now leased by
+   * another worker, nothing is overwritten and the outcome says which it was.
+   */
+  release(jobId: string, workerId: string): Promise<ReleaseResult>;
 
   /**
    * Sweep expired leases. Every `running` job whose lease has lapsed is either

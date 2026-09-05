@@ -47,15 +47,14 @@ import type {
   JobError,
   Queue,
   ReapResult,
+  ReleaseResult,
 } from '@/domain/queue.js';
+import { DEFAULT_LEASE_MS } from '@/domain/timing.js';
 
 /** Producers that enqueue inside an already-open transaction depend on this. */
 export interface TransactionalJobEnqueuer {
   enqueue(input: EnqueueInput, executor?: Executor): Promise<{ readonly id: string }>;
 }
-
-/** The initial lease granted on claim: long enough to run a step, short enough to reclaim promptly. */
-export const DEFAULT_LEASE_MS = 5 * 60 * 1_000;
 
 /**
  * What a dead-lettered job records in `last_error`.
@@ -76,7 +75,7 @@ const CRASH_ATTEMPTS_EXHAUSTED: JobError = {
 };
 
 export interface PostgresJobQueueOptions {
-  /** How long a claim's lease lasts. Defaults to five minutes. */
+  /** How long a claim's lease lasts. Defaults to the centralized safe bound. */
   readonly leaseDurationMs?: number;
   /**
    * The clock. Injectable so tests can advance time deterministically; in
@@ -172,27 +171,41 @@ export class PostgresJobQueue implements Queue, TransactionalJobEnqueuer {
     });
   }
 
-  async complete(jobId: string): Promise<void> {
+  async complete(jobId: string, workerId: string): Promise<void> {
     const updated = await this.db
       .update(jobs)
       .set({ status: 'done', lockedBy: null, leaseExpiresAt: null })
-      .where(and(eq(jobs.id, jobId), eq(jobs.status, 'running'), ...this.tenantScoped()))
+      .where(
+        and(
+          eq(jobs.id, jobId),
+          eq(jobs.status, 'running'),
+          eq(jobs.lockedBy, workerId),
+          ...this.tenantScoped(),
+        ),
+      )
       .returning({ id: jobs.id });
 
     if (updated.length === 0) throw new InvalidJobTransitionError(jobId, 'completed');
   }
 
-  async fail(jobId: string, error: JobError): Promise<void> {
+  async fail(jobId: string, workerId: string, error: JobError): Promise<void> {
     const updated = await this.db
       .update(jobs)
       .set({ status: 'failed', lastError: error, lockedBy: null, leaseExpiresAt: null })
-      .where(and(eq(jobs.id, jobId), eq(jobs.status, 'running'), ...this.tenantScoped()))
+      .where(
+        and(
+          eq(jobs.id, jobId),
+          eq(jobs.status, 'running'),
+          eq(jobs.lockedBy, workerId),
+          ...this.tenantScoped(),
+        ),
+      )
       .returning({ id: jobs.id });
 
     if (updated.length === 0) throw new InvalidJobTransitionError(jobId, 'failed');
   }
 
-  async retry(jobId: string, error: JobError, runAt: Date): Promise<void> {
+  async retry(jobId: string, workerId: string, error: JobError, runAt: Date): Promise<void> {
     // running → pending, deferred until `runAt`, business retry counter bumped,
     // lease cleared. The `status = 'running'` guard makes this a no-op on a lost
     // race (e.g. the reaper requeued the row first): the UPDATE matches nothing
@@ -209,10 +222,54 @@ export class PostgresJobQueue implements Queue, TransactionalJobEnqueuer {
         lockedBy: null,
         leaseExpiresAt: null,
       })
-      .where(and(eq(jobs.id, jobId), eq(jobs.status, 'running'), ...this.tenantScoped()))
+      .where(
+        and(
+          eq(jobs.id, jobId),
+          eq(jobs.status, 'running'),
+          eq(jobs.lockedBy, workerId),
+          ...this.tenantScoped(),
+        ),
+      )
       .returning({ id: jobs.id });
 
     if (updated.length === 0) throw new InvalidJobTransitionError(jobId, 'retried');
+  }
+
+  async release(jobId: string, workerId: string): Promise<ReleaseResult> {
+    return this.db.transaction(async (tx) => {
+      const [released] = await tx
+        .update(jobs)
+        .set({
+          status: 'pending',
+          lockedBy: null,
+          leaseExpiresAt: null,
+        })
+        .where(
+          and(
+            eq(jobs.id, jobId),
+            eq(jobs.status, 'running'),
+            eq(jobs.lockedBy, workerId),
+            ...this.tenantScoped(),
+          ),
+        )
+        .returning({ id: jobs.id });
+
+      if (released !== undefined) {
+        return { outcome: 'released' };
+      }
+
+      const [current] = await tx
+        .select({ status: jobs.status, lockedBy: jobs.lockedBy })
+        .from(jobs)
+        .where(and(eq(jobs.id, jobId), ...this.tenantScoped()))
+        .limit(1);
+
+      if (current === undefined || current.status !== 'running') {
+        return { outcome: 'not_running', status: current?.status ?? null };
+      }
+
+      return { outcome: 'not_owned', lockedBy: current.lockedBy };
+    });
   }
 
   /** Every `running` job whose lease has lapsed, within this queue's tenant view. */

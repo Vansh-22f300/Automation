@@ -60,16 +60,20 @@ class SweepOnlyQueue implements Queue {
     return Promise.reject(new Error('the reaper must not claim'));
   }
 
-  complete(_jobId: string): Promise<never> {
+  complete(_jobId: string, _workerId: string): Promise<never> {
     return Promise.reject(new Error('the reaper must not complete'));
   }
 
-  fail(_jobId: string, _error: JobError): Promise<never> {
+  fail(_jobId: string, _workerId: string, _error: JobError): Promise<never> {
     return Promise.reject(new Error('the reaper must not fail jobs directly'));
   }
 
-  retry(_jobId: string, _error: JobError, _runAt: Date): Promise<never> {
+  retry(_jobId: string, _workerId: string, _error: JobError, _runAt: Date): Promise<never> {
     return Promise.reject(new Error('the reaper must not retry'));
+  }
+
+  release(_jobId: string, _workerId: string): Promise<never> {
+    return Promise.reject(new Error('the reaper must not release'));
   }
 
   requeueExpired(): Promise<ReapResult> {

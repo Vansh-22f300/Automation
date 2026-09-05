@@ -50,7 +50,7 @@ import type { Logger } from '@/observability/logger.js';
 const PROVIDER_NAME = 'claude';
 
 /** Default per-request timeout when neither the request nor the config sets one. */
-const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface ClaudeProviderConfig {
   /**
