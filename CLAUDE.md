@@ -9,13 +9,18 @@ it captures what would otherwise cost many file reads to re-derive.
   branch, PR, or merge. The user drives all git.
 - **Do not auto-advance** to the next build step. Implement only the current step's
   scope, then report and STOP.
-- **Respect the boundary list**: do not implement anything belonging to a later step
-  (LLM/Anthropic, connectors/OAuth, retries/backoff, branching/parallel, scheduling,
-  NL generation, RAG/vector, Redis/Temporal, frontend, billing) until its step.
+- **Respect the active scope**: backend hardening is paused after Step 13 Items 1–3.
+  The active work is Frontend Milestone 1 only; do not resume Step 13 or add later
+  frontend-product scope without a new prompt.
 - **Be token-frugal.** Prefer the file-map below and memory over broad searches.
 
 ## Stack & commands
 Node 24 · pnpm 11 · strict ESM TypeScript · Drizzle ORM + node-postgres · PostgreSQL 13+ · Fastify · pino · vitest · Zod.
+
+The separate `frontend/` package is a Nuxt 3 SPA. Start it with `cd frontend && pnpm dev`.
+It talks to Fastify through the Vite development proxy at `/backend`, using
+`NUXT_PUBLIC_API_KEY` from the uncommitted `frontend/.env`; no Fastify CORS change
+or Nuxt server API is present.
 
 ```bash
 pnpm typecheck   # tsc --noEmit + tools tsconfig
@@ -52,10 +57,16 @@ src/
   test/          unit/ (no deps), integration/ (needs PG, skipped without it)
 ```
 
+frontend/
+  pages/         Nuxt file-based dashboard, collections, and run inspection views
+  components/    app shell, UI states, badges, and run lookup
+  lib/           typed Fastify API client and display formatting
+  composables/   API-client and resource-loading helpers
+
 ## Build-order status
-Tracked in Claude memory (`build-order-status.md`). As of 2026-08-30: Steps 1–5 done;
-Step 6 (workflow execution engine, linear `noop`) implemented and committed by the
-user. Always re-read that memory file at session start to confirm the current step.
+Backend Steps 1–12 and Step 13 Items 1–3 are implemented. Frontend Milestone 1 is
+the active scope. Do not start Step 13 Item 4 or Frontend Prompt 2 without an
+explicit user prompt.
 
 ## What each layer owns
 - **Queue** (`job-queue.ts`): enqueue/claim/complete/fail/retry/release/requeueExpired; `FOR UPDATE SKIP LOCKED`; 15-min lease derived in `domain/timing.ts` from the real step timeouts. Every settlement is guarded on `locked_by`, so a superseded worker cannot touch a re-claimed row.
