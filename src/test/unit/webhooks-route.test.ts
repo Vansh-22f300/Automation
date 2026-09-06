@@ -69,9 +69,27 @@ async function makeApp(): Promise<Harness> {
       throw new Error("not used");
     },
     webhookIngestorFor: () => ingestor,
+    workflowServiceFor: () => ({
+      listWorkflows: async () => ({ items: [], nextCursor: null }),
+    }),
+    connectionServiceFor: () => ({
+      listMetadata: async () => [],
+      listMetadataPage: async () => ({ items: [], nextCursor: null }),
+      create: async () => {
+        throw new Error("not used");
+      },
+      getMetadata: async () => null,
+      updateMetadata: async () => null,
+      disable: async () => null,
+      delete: async () => false,
+      resolveForTool: async () => {
+        throw new Error("not used");
+      },
+    }),
     // Minimal run-inspection reader factory for the routes that expect it.
     runInspectionFor: () => ({
       getRun: async () => null,
+      listRuns: async () => ({ items: [], nextCursor: null }),
     }),
   });
   return { app, ingestor };

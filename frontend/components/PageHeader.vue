@@ -7,11 +7,13 @@ defineProps<{
 
 <template>
   <header class="page-header">
-    <div>
+    <div class="page-header-copy">
       <p class="eyebrow">AI Workforce</p>
       <h1>{{ title }}</h1>
       <p class="page-description">{{ description }}</p>
     </div>
-    <slot name="actions" />
+    <div class="page-header-actions">
+      <slot name="actions" />
+    </div>
   </header>
 </template>

@@ -1,4 +1,11 @@
-import type { ApiErrorResponse, HealthStatus, RunInspection } from '~/types/api';
+import type {
+  ApiErrorResponse,
+  ConnectionListResponse,
+  HealthStatus,
+  RunInspection,
+  RunListResponse,
+  WorkflowListResponse,
+} from '~/types/api';
 
 export class ApiClientError extends Error {
   constructor(
@@ -24,6 +31,27 @@ export class ApiClient {
 
   async getRun(runId: string): Promise<RunInspection> {
     return this.request<RunInspection>(`/v1/runs/${encodeURIComponent(runId)}`, true);
+  }
+
+  async listWorkflows(limit?: number, cursor?: string): Promise<WorkflowListResponse> {
+    return this.request<WorkflowListResponse>(this.withQuery('/v1/workflows', { limit, cursor }), true);
+  }
+
+  async listRuns(options: { limit?: number; cursor?: string; status?: string; workflowId?: string } = {}): Promise<RunListResponse> {
+    return this.request<RunListResponse>(this.withQuery('/v1/runs', options), true);
+  }
+
+  async listConnections(limit?: number, cursor?: string): Promise<ConnectionListResponse> {
+    return this.request<ConnectionListResponse>(this.withQuery('/v1/connections', { limit, cursor }), true);
+  }
+
+  private withQuery(path: string, query: Record<string, string | number | undefined>): string {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== '') params.set(key, String(value));
+    }
+    const rendered = params.toString();
+    return rendered === '' ? path : `${path}?${rendered}`;
   }
 
   private async request<T>(path: string, requiresAuthentication: boolean): Promise<T> {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertCircle, RefreshCw } from '@lucide/vue';
+import { AlertCircle, RefreshCw } from "@lucide/vue";
 
 defineProps<{ message: string }>();
 defineEmits<{ retry: [] }>();
@@ -12,7 +12,11 @@ defineEmits<{ retry: [] }>();
       <h2>Couldn’t load this view</h2>
       <p>{{ message }}</p>
     </div>
-    <button class="button button-secondary" type="button" @click="$emit('retry')">
+    <button
+      class="button button-secondary"
+      type="button"
+      @click="$emit('retry')"
+    >
       <RefreshCw :size="16" aria-hidden="true" />
       Try again
     </button>

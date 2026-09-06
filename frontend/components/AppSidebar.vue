@@ -13,8 +13,12 @@ const navigation = [
   <aside class="sidebar">
     <NuxtLink class="brand" to="/" aria-label="AI Workforce dashboard">
       <span class="brand-mark"><Activity :size="19" /></span>
-      <span>AI Workforce</span>
+      <span class="brand-copy">
+        <strong>AI Workforce</strong>
+        <span>Operations workspace</span>
+      </span>
     </NuxtLink>
+    <p class="sidebar-kicker">Tenant-scoped automation control</p>
     <nav class="sidebar-nav" aria-label="Primary navigation">
       <NuxtLink v-for="item in navigation" :key="item.to" :to="item.to" class="nav-link">
         <component :is="item.icon" :size="18" aria-hidden="true" />
@@ -23,7 +27,10 @@ const navigation = [
     </nav>
     <div class="sidebar-footer">
       <span class="environment-dot" />
-      <span>Local development</span>
+      <div>
+        <strong>Local development</strong>
+        <p>Fastify API via Nuxt proxy</p>
+      </div>
     </div>
   </aside>
 </template>

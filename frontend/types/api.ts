@@ -12,8 +12,9 @@ export interface SafeError {
 }
 
 export interface ValueSummary {
-  readonly byteSize: number;
+  readonly bytes: number;
   readonly preview: string;
+  readonly truncated: boolean;
 }
 
 export interface RunInspection {
@@ -48,6 +49,63 @@ export interface RunInspection {
   readonly llmUsage: readonly LlmUsage[];
   readonly tools: readonly ToolActivity[];
   readonly usageTotals: UsageTotals;
+}
+
+export interface PageEnvelope {
+  readonly limit: number;
+  readonly nextCursor: string | null;
+}
+
+export interface WorkflowListItem {
+  readonly id: string;
+  readonly name: string;
+  readonly status: 'draft' | 'active' | 'disabled';
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly activeVersion: null | {
+    readonly id: string;
+    readonly version: number;
+    readonly triggerType: string;
+  };
+}
+
+export interface WorkflowListResponse {
+  readonly items: readonly WorkflowListItem[];
+  readonly page: PageEnvelope;
+}
+
+export interface RunListItem {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly workflowName: string;
+  readonly workflowVersionId: string;
+  readonly status: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled';
+  readonly currentStepKey: string | null;
+  readonly createdAt: string;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+  readonly error: SafeError | null;
+}
+
+export interface RunListResponse {
+  readonly items: readonly RunListItem[];
+  readonly page: PageEnvelope;
+}
+
+export interface ConnectionListItem {
+  readonly id: string;
+  readonly provider: string;
+  readonly name: string;
+  readonly status: 'active' | 'disabled' | 'error';
+  readonly metadata: Record<string, unknown>;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly lastUsedAt: string | null;
+}
+
+export interface ConnectionListResponse {
+  readonly items: readonly ConnectionListItem[];
+  readonly page: PageEnvelope;
 }
 
 export interface StepRun {

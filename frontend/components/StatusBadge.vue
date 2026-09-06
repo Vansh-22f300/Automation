@@ -6,8 +6,9 @@ const props = defineProps<{ status: string }>();
 const normalized = computed(() => props.status.toLowerCase());
 const tone = computed(() => {
   if (['succeeded', 'active', 'done', 'healthy'].includes(normalized.value)) return 'success';
-  if (['failed', 'error', 'disabled'].includes(normalized.value)) return 'danger';
-  if (['running', 'waiting'].includes(normalized.value)) return 'info';
+  if (['failed', 'error'].includes(normalized.value)) return 'danger';
+  if (['running', 'waiting', 'queued'].includes(normalized.value)) return 'info';
+  if (['disabled', 'draft', 'cancelled'].includes(normalized.value)) return 'neutral';
   return 'neutral';
 });
 </script>

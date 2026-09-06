@@ -24,8 +24,9 @@
  * raises `NotFoundError`, indistinguishable from a genuinely absent row.
  */
 
-import { and, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
 
+import { BadRequestError } from '@/api/errors.js';
 import { NotFoundError } from '@/api/errors.js';
 import { PermanentError } from '@/domain/errors.js';
 import { parseWorkflowDefinition } from '@/domain/workflow-definition.js';
@@ -34,6 +35,28 @@ import type { TriggerType } from '@/domain/workflow-trigger.js';
 import { workflowVersions, workflows } from '@/db/schema.js';
 import type { Workflow, WorkflowVersion } from '@/db/schema.js';
 import { TenantScope, TenantScopedRepository } from '@/repositories/tenant-scope.js';
+
+export interface WorkflowListItem {
+  readonly id: string;
+  readonly name: string;
+  readonly status: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly activeVersion: {
+    readonly id: string;
+    readonly version: number;
+    readonly triggerType: string;
+  } | null;
+}
+
+export interface WorkflowListPage {
+  readonly items: readonly WorkflowListItem[];
+  readonly nextCursor: string | null;
+}
+
+export interface WorkflowListReader {
+  listWorkflows(limit?: number, cursor?: string): Promise<WorkflowListPage>;
+}
 
 /** What a caller supplies to author a brand-new workflow and its first version. */
 export interface CreateWorkflowInput {
@@ -96,9 +119,31 @@ export interface CreatedWorkflow {
  * Construct one per authenticated context from a `TenantScope`; every method is
  * intrinsically pinned to that tenant. There is deliberately no unscoped variant.
  */
-export class WorkflowRepository extends TenantScopedRepository {
+export class WorkflowRepository extends TenantScopedRepository implements WorkflowListReader {
   constructor(scope: TenantScope) {
     super(scope);
+  }
+
+  private static encodeCursor(cursor: { readonly createdAt: string; readonly id: string }): string {
+    return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+  }
+
+  private static decodeCursor(cursor: string): { createdAt: string; id: string } {
+    try {
+      const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+        createdAt?: unknown;
+        id?: unknown;
+      };
+      if (typeof parsed.createdAt !== 'string' || typeof parsed.id !== 'string') {
+        throw new Error('invalid cursor');
+      }
+      if (Number.isNaN(new Date(parsed.createdAt).getTime())) {
+        throw new Error('invalid cursor');
+      }
+      return { createdAt: parsed.createdAt, id: parsed.id };
+    } catch {
+      throw new BadRequestError('Cursor is invalid');
+    }
   }
 
   /**
@@ -304,5 +349,71 @@ export class WorkflowRepository extends TenantScopedRepository {
       );
 
     return version ?? null;
+  }
+
+  async listWorkflows(limit = 20, cursor?: string): Promise<WorkflowListPage> {
+    const pageLimit = Math.max(1, Math.min(limit, 100));
+    const parsedCursor = cursor === undefined ? null : WorkflowRepository.decodeCursor(cursor);
+    const cursorClause =
+      parsedCursor === null
+        ? undefined
+        : or(
+            sql`${workflows.createdAt} < ${new Date(parsedCursor.createdAt)}`,
+            and(
+              eq(workflows.createdAt, new Date(parsedCursor.createdAt)),
+              lt(workflows.id, parsedCursor.id),
+            ),
+          );
+
+    const rows = await this.db
+      .select({
+        workflow: workflows,
+        activeVersionId: workflowVersions.id,
+        activeVersionVersion: workflowVersions.version,
+        activeVersionTriggerType: workflowVersions.triggerType,
+      })
+      .from(workflows)
+      .leftJoin(
+        workflowVersions,
+        and(
+          eq(workflowVersions.workflowId, workflows.id),
+          eq(workflowVersions.tenantId, workflows.tenantId),
+          eq(workflowVersions.isActive, true),
+        ),
+      )
+      .where(
+        cursorClause === undefined
+          ? this.scope.where(workflows.tenantId)
+          : this.scope.where(workflows.tenantId, cursorClause),
+      )
+      .orderBy(desc(workflows.createdAt), desc(workflows.id))
+      .limit(pageLimit + 1);
+
+    const items = rows.slice(0, pageLimit).map((row) => ({
+      id: row.workflow.id,
+      name: row.workflow.name,
+      status: row.workflow.status,
+      createdAt: row.workflow.createdAt.toISOString(),
+      updatedAt: row.workflow.updatedAt.toISOString(),
+      activeVersion:
+        row.activeVersionId === null
+          ? null
+          : {
+              id: row.activeVersionId,
+              version: row.activeVersionVersion!,
+              triggerType: row.activeVersionTriggerType!,
+            },
+    }));
+
+    const lastRow = rows[pageLimit - 1];
+    const nextCursor =
+      rows.length > pageLimit && lastRow !== undefined
+        ? WorkflowRepository.encodeCursor({
+            createdAt: lastRow.workflow.createdAt.toISOString(),
+            id: lastRow.workflow.id,
+          })
+        : null;
+
+    return { items, nextCursor };
   }
 }

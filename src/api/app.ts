@@ -24,10 +24,14 @@ import { registerApiKeyAuth } from '@/api/auth-hook.js';
 import { registerErrorHandling } from '@/api/error-handler.js';
 import { registerApiKeyRoutes } from '@/api/routes/api-keys.js';
 import type { ApiKeyServiceFactory } from '@/api/routes/api-keys.js';
+import { registerConnectionRoutes } from '@/api/routes/connections.js';
+import type { ConnectionServiceFactory } from '@/api/routes/connections.js';
 import { registerHealthRoute } from '@/api/routes/health.js';
 import type { DatabaseHealthCheck } from '@/api/routes/health.js';
 import { registerRunInspectionRoutes } from '@/api/routes/runs.js';
 import type { RunInspectionServiceFactory } from '@/api/routes/runs.js';
+import { registerWorkflowRoutes } from '@/api/routes/workflows.js';
+import type { WorkflowServiceFactory } from '@/api/routes/workflows.js';
 import { registerWebhookRoutes } from '@/api/routes/webhooks.js';
 import type { WebhookIngestorFactory } from '@/api/routes/webhooks.js';
 import type { ApiServer } from '@/api/types.js';
@@ -43,6 +47,10 @@ export interface AppDependencies {
   readonly apiKeyServiceFor: ApiKeyServiceFactory;
   /** Builds a tenant-scoped webhook ingestor for an authenticated request. */
   readonly webhookIngestorFor: WebhookIngestorFactory;
+  /** Builds a tenant-scoped workflow repository for an authenticated request. */
+  readonly workflowServiceFor: WorkflowServiceFactory;
+  /** Builds a tenant-scoped connection repository for an authenticated request. */
+  readonly connectionServiceFor: ConnectionServiceFactory;
   /** Builds a tenant-scoped run-inspection reader for an authenticated request. */
   readonly runInspectionFor: RunInspectionServiceFactory;
   /** Structured logger; Fastify attaches a per-request child of it. */
@@ -126,6 +134,8 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     const protectedScope = rawScope as unknown as ApiServer;
     registerApiKeyAuth(protectedScope, deps.authenticator);
     registerApiKeyRoutes(protectedScope, deps.apiKeyServiceFor);
+    registerWorkflowRoutes(protectedScope, deps.workflowServiceFor);
+    registerConnectionRoutes(protectedScope, deps.connectionServiceFor);
     registerWebhookRoutes(protectedScope, deps.webhookIngestorFor);
     registerRunInspectionRoutes(protectedScope, deps.runInspectionFor);
   });

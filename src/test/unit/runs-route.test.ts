@@ -18,7 +18,7 @@ import type { AuthContext, Authenticator } from '@/auth/context.js';
 import type { Event, Job, Workflow, WorkflowRun, WorkflowStepRun, WorkflowVersion } from '@/db/schema.js';
 import { assembleRunInspection } from '@/domain/run-inspection.js';
 import type { RunInspection } from '@/domain/run-inspection.js';
-import type { RunInspectionOptions, RunInspectionReader } from '@/repositories/run-inspection-repository.js';
+import type { RunInspectionOptions, RunInspectionReader, RunListReader } from '@/repositories/run-inspection-repository.js';
 
 const KEY_T1 = 'key-1';
 const KEY_T2 = 'key-2';
@@ -102,9 +102,60 @@ function fixture(): RunInspection {
 
 const FIXTURE = fixture();
 
-const readerFor = (auth: AuthContext): RunInspectionReader => ({
+const readerFor = (auth: AuthContext): RunInspectionReader & RunListReader => ({
   getRun: async (runId: string, _options?: RunInspectionOptions): Promise<RunInspection | null> =>
     auth.tenantId === 'tenant-1' && runId === OWN_RUN ? FIXTURE : null,
+  listRuns: async (options = {}) => {
+    if (auth.tenantId === 'tenant-2') return { items: [], nextCursor: null };
+    if (options.cursor === 'cursor-1') {
+      return {
+        items: [
+          {
+            id: 'run-3',
+            workflowId: 'wf-1',
+            workflowName: 'WF',
+            workflowVersionId: 'ver-1',
+            status: 'running',
+            currentStepKey: 'b',
+            createdAt: '2026-01-03T00:00:00.000Z',
+            startedAt: '2026-01-03T00:00:01.000Z',
+            finishedAt: null,
+            error: null,
+          },
+        ],
+        nextCursor: null,
+      };
+    }
+    return {
+      items: [
+        {
+          id: 'run-2',
+          workflowId: 'wf-1',
+          workflowName: 'WF',
+          workflowVersionId: 'ver-1',
+          status: 'succeeded',
+          currentStepKey: null,
+          createdAt: '2026-01-02T00:00:00.000Z',
+          startedAt: '2026-01-02T00:00:01.000Z',
+          finishedAt: '2026-01-02T00:05:00.000Z',
+          error: null,
+        },
+        {
+          id: 'run-1',
+          workflowId: 'wf-1',
+          workflowName: 'WF',
+          workflowVersionId: 'ver-1',
+          status: 'failed',
+          currentStepKey: 'a',
+          createdAt: '2026-01-01T00:00:00.000Z',
+          startedAt: '2026-01-01T00:00:01.000Z',
+          finishedAt: '2026-01-01T00:01:00.000Z',
+          error: { code: 'bad_input', message: 'bad input', retryable: false },
+        },
+      ],
+      nextCursor: 'cursor-1',
+    };
+  },
 });
 
 function silentLogger(): pino.Logger {
@@ -117,6 +168,12 @@ async function makeApp(): Promise<ApiServer> {
     authenticator,
     checkDatabase: async () => undefined,
     apiKeyServiceFor: () => {
+      throw new Error('not used');
+    },
+    workflowServiceFor: () => {
+      throw new Error('not used');
+    },
+    connectionServiceFor: () => {
       throw new Error('not used');
     },
     webhookIngestorFor: () => {
@@ -191,5 +248,51 @@ describe('GET /v1/runs/:runId', () => {
     // But the safe, summarized view IS present.
     expect(res.json().run.contextSummary.bytes).toBeGreaterThan(0);
     expect(res.json().jobs[0].leased).toBe(true);
+  });
+});
+
+describe('GET /v1/runs', () => {
+  it('rejects a missing API key with 401', async () => {
+    app = await makeApp();
+    const res = await app.inject({ method: 'GET', url: '/v1/runs' });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('returns the tenant run list with pagination metadata', async () => {
+    app = await makeApp();
+    const res = await app.inject({ method: 'GET', url: '/v1/runs', headers: bearer(KEY_T1) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      items: expect.arrayContaining([
+        expect.objectContaining({ id: 'run-2', workflowName: 'WF', status: 'succeeded' }),
+      ]),
+      page: { limit: 20, nextCursor: 'cursor-1' },
+    });
+  });
+
+  it('returns an empty list for another tenant', async () => {
+    app = await makeApp();
+    const res = await app.inject({ method: 'GET', url: '/v1/runs', headers: bearer(KEY_T2) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ items: [], page: { limit: 20, nextCursor: null } });
+  });
+
+  it('rejects malformed query parameters with 400', async () => {
+    app = await makeApp();
+    const res = await app.inject({ method: 'GET', url: '/v1/runs?status=bogus', headers: bearer(KEY_T1) });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('rejects an oversized limit with 400', async () => {
+    app = await makeApp();
+    const res = await app.inject({ method: 'GET', url: '/v1/runs?limit=101', headers: bearer(KEY_T1) });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('passes the cursor through for pagination', async () => {
+    app = await makeApp();
+    const res = await app.inject({ method: 'GET', url: '/v1/runs?cursor=cursor-1', headers: bearer(KEY_T1) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().page.nextCursor).toBeNull();
   });
 });

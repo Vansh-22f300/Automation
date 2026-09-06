@@ -13,7 +13,8 @@ async function openRun(): Promise<void> {
 
 <template>
   <form class="run-lookup" @submit.prevent="openRun">
-    <label for="run-id">Inspect a run</label>
+    <label for="run-id">Open run details</label>
+    <p class="lookup-hint">Paste any run id to jump straight into the inspection view.</p>
     <div class="lookup-control">
       <Search :size="17" aria-hidden="true" />
       <input id="run-id" v-model="runId" required placeholder="Paste a run ID" autocomplete="off">

@@ -20,23 +20,23 @@
  * not contain "test".
  */
 
-import { eq } from 'drizzle-orm';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { NotFoundError } from '@/api/errors.js';
-import type { DatabaseHandle } from '@/db/client.js';
-import { tenants, workflowVersions } from '@/db/schema.js';
-import { TenantScope } from '@/repositories/tenant-scope.js';
-import { WorkflowRepository } from '@/repositories/workflow-repository.js';
+import { BadRequestError, NotFoundError } from "@/api/errors.js";
+import type { DatabaseHandle } from "@/db/client.js";
+import { tenants, workflowVersions, workflows } from "@/db/schema.js";
+import { TenantScope } from "@/repositories/tenant-scope.js";
+import { WorkflowRepository } from "@/repositories/workflow-repository.js";
 
-import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
+import { TEST_DATABASE_URL, createTestDatabaseHandle } from "./support.js";
 
 const linear = (keys: string[]) => ({
   version: 1,
-  steps: keys.map((key) => ({ key, type: 'noop', config: {} })),
+  steps: keys.map((key) => ({ key, type: "noop", config: {} })),
 });
 
-describe.skipIf(TEST_DATABASE_URL === undefined)('workflow integration', () => {
+describe.skipIf(TEST_DATABASE_URL === undefined)("workflow integration", () => {
   let handle: DatabaseHandle;
   let tenantA: string;
   let tenantB: string;
@@ -50,7 +50,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow integration', () => {
 
     const inserted = await handle.db
       .insert(tenants)
-      .values([{ name: 'Workflow Tenant A' }, { name: 'Workflow Tenant B' }])
+      .values([{ name: "Workflow Tenant A" }, { name: "Workflow Tenant B" }])
       .returning({ id: tenants.id });
     tenantA = inserted[0]!.id;
     tenantB = inserted[1]!.id;
@@ -59,53 +59,54 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow integration', () => {
   afterAll(async () => {
     if (handle === undefined) return;
     for (const id of [tenantA, tenantB]) {
-      if (id !== undefined) await handle.db.delete(tenants).where(eq(tenants.id, id));
+      if (id !== undefined)
+        await handle.db.delete(tenants).where(eq(tenants.id, id));
     }
     await handle.close();
   });
 
-  it('creates a workflow with an active version 1, storing definition and trigger', async () => {
+  it("creates a workflow with an active version 1, storing definition and trigger", async () => {
     const { workflow, version } = await repoFor(tenantA).create({
-      name: 'first workflow',
-      definition: linear(['a', 'b']),
-      triggerType: 'webhook',
-      triggerConfig: { source: 'wf-create' },
+      name: "first workflow",
+      definition: linear(["a", "b"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-create" },
     });
 
     expect(workflow.tenantId).toBe(tenantA);
     expect(version.version).toBe(1);
     expect(version.isActive).toBe(true);
     expect(version.definition).toMatchObject({ version: 1 });
-    expect(version.triggerConfig).toEqual({ source: 'wf-create' });
+    expect(version.triggerConfig).toEqual({ source: "wf-create" });
 
     const active = await repoFor(tenantA).getActiveVersion(workflow.id);
     expect(active?.id).toBe(version.id);
   });
 
-  it('rejects an invalid definition before writing anything', async () => {
+  it("rejects an invalid definition before writing anything", async () => {
     await expect(
       repoFor(tenantA).create({
-        name: 'bad',
+        name: "bad",
         definition: { version: 1, steps: [] },
-        triggerType: 'webhook',
-        triggerConfig: { source: 'wf-invalid' },
+        triggerType: "webhook",
+        triggerConfig: { source: "wf-invalid" },
       }),
-    ).rejects.toMatchObject({ code: 'invalid_definition' });
+    ).rejects.toMatchObject({ code: "invalid_definition" });
   });
 
-  it('creates version 2 as a new row, leaving version 1 unchanged', async () => {
+  it("creates version 2 as a new row, leaving version 1 unchanged", async () => {
     const { workflow, version: v1 } = await repoFor(tenantA).create({
-      name: 'versioned',
-      definition: linear(['a']),
-      triggerType: 'webhook',
-      triggerConfig: { source: 'wf-v2' },
+      name: "versioned",
+      definition: linear(["a"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-v2" },
     });
     const v1Snapshot = { def: v1.definition, created: v1.createdAt.getTime() };
 
     const v2 = await repoFor(tenantA).createVersion(workflow.id, {
-      definition: linear(['a', 'b']),
-      triggerType: 'webhook',
-      triggerConfig: { source: 'wf-v2' },
+      definition: linear(["a", "b"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-v2" },
       activate: true,
     });
 
@@ -124,17 +125,17 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow integration', () => {
     expect(reloadedV1!.isActive).toBe(false);
   });
 
-  it('keeps exactly one active version when v2 is activated', async () => {
+  it("keeps exactly one active version when v2 is activated", async () => {
     const { workflow, version: v1 } = await repoFor(tenantA).create({
-      name: 'promote',
-      definition: linear(['a']),
-      triggerType: 'webhook',
-      triggerConfig: { source: 'wf-activate' },
+      name: "promote",
+      definition: linear(["a"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-activate" },
     });
     const v2 = await repoFor(tenantA).createVersion(workflow.id, {
-      definition: linear(['a', 'b']),
-      triggerType: 'webhook',
-      triggerConfig: { source: 'wf-activate' },
+      definition: linear(["a", "b"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-activate" },
       activate: true,
     });
 
@@ -149,15 +150,17 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow integration', () => {
 
     // v1 is available but inactive; re-activating it flips the single active flag.
     await repoFor(tenantA).activateVersion(workflow.id, v1.id);
-    expect((await repoFor(tenantA).getActiveVersion(workflow.id))?.id).toBe(v1.id);
+    expect((await repoFor(tenantA).getActiveVersion(workflow.id))?.id).toBe(
+      v1.id,
+    );
   });
 
-  it('rejects a duplicate version number at the database', async () => {
+  it("rejects a duplicate version number at the database", async () => {
     const { workflow } = await repoFor(tenantA).create({
-      name: 'dupe-guard',
-      definition: linear(['a']),
-      triggerType: 'webhook',
-      triggerConfig: { source: 'wf-dupe' },
+      name: "dupe-guard",
+      definition: linear(["a"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-dupe" },
     });
 
     // Force a collision with version 1 by inserting directly, bypassing the
@@ -167,37 +170,81 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow integration', () => {
         tenantId: tenantA,
         workflowId: workflow.id,
         version: 1,
-        definition: linear(['x']),
-        triggerType: 'webhook',
-        triggerConfig: { source: 'wf-dupe' },
+        definition: linear(["x"]),
+        triggerType: "webhook",
+        triggerConfig: { source: "wf-dupe" },
         isActive: false,
       }),
     ).rejects.toThrow();
   });
 
-  it('isolates tenants: A cannot read, version, or activate B’s workflow', async () => {
+  it("isolates tenants: A cannot read, version, or activate B’s workflow", async () => {
     const { workflow: bWf, version: bV1 } = await repoFor(tenantB).create({
-      name: 'b-only',
-      definition: linear(['a']),
-      triggerType: 'webhook',
-      triggerConfig: { source: 'wf-iso' },
+      name: "b-only",
+      definition: linear(["a"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-iso" },
     });
 
-    await expect(repoFor(tenantA).getWorkflow(bWf.id)).rejects.toBeInstanceOf(NotFoundError);
-    await expect(
-      repoFor(tenantA).createVersion(bWf.id, {
-        definition: linear(['a', 'b']),
-        triggerType: 'webhook',
-        triggerConfig: { source: 'wf-iso' },
-      }),
-    ).rejects.toBeInstanceOf(NotFoundError);
-    await expect(repoFor(tenantA).activateVersion(bWf.id, bV1.id)).rejects.toBeInstanceOf(
+    await expect(repoFor(tenantA).getWorkflow(bWf.id)).rejects.toBeInstanceOf(
       NotFoundError,
     );
+    await expect(
+      repoFor(tenantA).createVersion(bWf.id, {
+        definition: linear(["a", "b"]),
+        triggerType: "webhook",
+        triggerConfig: { source: "wf-iso" },
+      }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+    await expect(
+      repoFor(tenantA).activateVersion(bWf.id, bV1.id),
+    ).rejects.toBeInstanceOf(NotFoundError);
 
     // B's workflow is untouched: still one version, still active.
     const bVersions = await repoFor(tenantB).listVersions(bWf.id);
     expect(bVersions).toHaveLength(1);
     expect(bVersions[0]!.isActive).toBe(true);
+  });
+
+  it("lists workflows newest first and paginates without duplicates", async () => {
+    const a1 = await repoFor(tenantA).create({
+      name: "wf-a1",
+      definition: linear(["a"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-list-a1" },
+    });
+    const a2 = await repoFor(tenantA).create({
+      name: "wf-a2",
+      definition: linear(["a"]),
+      triggerType: "webhook",
+      triggerConfig: { source: "wf-list-a2" },
+    });
+
+    const sameTime = new Date("2026-01-01T00:00:00.000Z");
+    await handle.db
+      .update(workflows)
+      .set({ createdAt: sameTime, updatedAt: sameTime })
+      .where(eq(workflows.id, a1.workflow.id));
+    await handle.db
+      .update(workflows)
+      .set({ createdAt: sameTime, updatedAt: sameTime })
+      .where(eq(workflows.id, a2.workflow.id));
+
+    const firstPage = await repoFor(tenantA).listWorkflows(1);
+    expect(firstPage.items).toHaveLength(1);
+    expect(firstPage.nextCursor).toBeTruthy();
+
+    const secondPage = await repoFor(tenantA).listWorkflows(
+      1,
+      firstPage.nextCursor ?? undefined,
+    );
+    expect(secondPage.items).toHaveLength(1);
+    expect(secondPage.items[0]!.id).not.toBe(firstPage.items[0]!.id);
+  });
+
+  it("rejects malformed cursors", async () => {
+    await expect(
+      repoFor(tenantA).listWorkflows(20, "not-base64-cursor"),
+    ).rejects.toBeInstanceOf(BadRequestError);
   });
 });

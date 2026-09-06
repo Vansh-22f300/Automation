@@ -35,11 +35,11 @@ an LLM, calling external tools, and keeping a durable audit trail of every step.
 
 ## Prerequisites
 
-| Requirement | Version | Notes |
-| --- | --- | --- |
-| Node.js | **>= 24.0.0, < 25** | Pinned via `engines`. Verified on v24.16.0. |
-| pnpm | **>= 10** | Verified on 11.4.0. `npm install -g pnpm` if missing. |
-| PostgreSQL | **>= 13** | Required from Step 2 on. Local or hosted — see below. |
+| Requirement | Version             | Notes                                                 |
+| ----------- | ------------------- | ----------------------------------------------------- |
+| Node.js     | **>= 24.0.0, < 25** | Pinned via `engines`. Verified on v24.16.0.           |
+| pnpm        | **>= 10**           | Verified on 11.4.0. `npm install -g pnpm` if missing. |
+| PostgreSQL  | **>= 13**           | Required from Step 2 on. Local or hosted — see below. |
 
 PostgreSQL 13 is the floor because the schema relies on `gen_random_uuid()` being
 built in. No Docker, no Redis and no API keys are needed yet.
@@ -78,37 +78,37 @@ pnpm db:migrate
 
 ## Available commands
 
-| Command | What it does |
-| --- | --- |
-| `pnpm dev:api` | Run the API in watch mode (`tsx`), restarting on file changes. |
-| `pnpm dev:worker` | Run the worker in watch mode. |
-| `pnpm tenant:create "<name>"` | Create a tenant; prints its id. Bootstrap step before minting a first key. |
-| `pnpm apikey:create <tenantId> "<name>"` | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again. |
-| `pnpm workflow:create <tenantId> "<name>" [source]` | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids. |
-| `pnpm webhooks:inspect <tenantId>` | List a tenant's recent events, workflow runs, jobs, step runs and `llm_usage` (read-only dev aid to verify ingestion, queueing and execution). |
-| `pnpm runs:inspect <tenantId> <runId> [--detail]` | Assemble one safe, tenant-scoped view of a single run — run/workflow/version, event, ordered step runs, jobs, per-round `llm_usage`, reconstructed tool activity and usage totals. Summaries (byte size + secret-scrubbed preview) by default; `--detail` attaches the raw values, still secret-scrubbed. Shares the **exact** assembler and redaction layer as `GET /v1/runs/:runId`. |
-| `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY`). Never prints the decrypted secret or the key. To keep a token out of shell history, omit the trailing JSON and pass it via the `CONNECTION_CREDENTIAL_JSON` env var instead. |
-| `pnpm connections list <tenantId>` | List a tenant's connections — metadata only (id, provider/name, status, last-used), never the secret. |
-| `pnpm connections disable <tenantId> <connectionId>` | Disable a connection so it can no longer be resolved for a tool run. |
-| `pnpm slack:smoke <tenantId> <connectionId> [channel]` | **Optional live Slack check** (not part of `pnpm test`). Resolves the trusted Slack connection and posts **one** harmless message (`"AI Workforce Slack connector test"`) to the channel (default `#ai-workforce-test`). Prints only safe metadata (tool, provider, connection id, channel, success, latency, Slack `ts`); never the token. Reports "NOT executed" and exits cleanly if the key or an active slack connection is absent. |
-| `pnpm llm:smoke ["question"]` | **Optional live Claude check.** Makes one real API call *only* if a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) is set; prints normalized model/tokens/latency + answer and the endpoint origin (never the key/token). Tests plain then structured output, reporting each separately. Exits cleanly with a message when no credential is set. |
-| `pnpm llm:tool-smoke <tenantId> <connectionId> [channel]` | **Optional live end-to-end tool-calling check** (not part of `pnpm test`). Runs the real `llm` handler with a real Claude provider and the real Slack connector: Claude requests `send_slack_message`, the platform executes it, and the model finalizes. Prints only safe metadata (rounds, per-round token counts, final output); never the API key, auth token, or bot token. Reports "NOT executed" and exits cleanly if the Claude credential, encryption key, or connection is absent. |
-| `pnpm typecheck` | Type-check the project and the tooling configs, without emitting. |
-| `pnpm test` | Run the test suite once (`vitest run`). |
-| `pnpm build` | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths. |
-| `pnpm start:api` | Run the compiled API from `dist/` (production mode). |
-| `pnpm start:worker` | Run the compiled worker from `dist/`. |
+| Command                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm dev:api`                                                              | Run the API in watch mode (`tsx`), restarting on file changes.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `pnpm dev:worker`                                                           | Run the worker in watch mode.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `pnpm tenant:create "<name>"`                                               | Create a tenant; prints its id. Bootstrap step before minting a first key.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `pnpm apikey:create <tenantId> "<name>"`                                    | Mint an API key for a tenant. Prints the plaintext **once** — it is never retrievable again.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `pnpm workflow:create <tenantId> "<name>" [source]`                         | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids.                                                                                                                                                                                                                                                                                                                                                                               |
+| `pnpm webhooks:inspect <tenantId>`                                          | List a tenant's recent events, workflow runs, jobs, step runs and `llm_usage` (read-only dev aid to verify ingestion, queueing and execution).                                                                                                                                                                                                                                                                                                                                               |
+| `pnpm runs:inspect <tenantId> <runId> [--detail]`                           | Assemble one safe, tenant-scoped view of a single run — run/workflow/version, event, ordered step runs, jobs, per-round `llm_usage`, reconstructed tool activity and usage totals. Summaries (byte size + secret-scrubbed preview) by default; `--detail` attaches the raw values, still secret-scrubbed. Shares the **exact** assembler and redaction layer as `GET /v1/runs/:runId`.                                                                                                       |
+| `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY`). Never prints the decrypted secret or the key. To keep a token out of shell history, omit the trailing JSON and pass it via the `CONNECTION_CREDENTIAL_JSON` env var instead.                                                                                                                                                                                  |
+| `pnpm connections list <tenantId>`                                          | List a tenant's connections — metadata only (id, provider/name, status, last-used), never the secret.                                                                                                                                                                                                                                                                                                                                                                                        |
+| `pnpm connections disable <tenantId> <connectionId>`                        | Disable a connection so it can no longer be resolved for a tool run.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `pnpm slack:smoke <tenantId> <connectionId> [channel]`                      | **Optional live Slack check** (not part of `pnpm test`). Resolves the trusted Slack connection and posts **one** harmless message (`"AI Workforce Slack connector test"`) to the channel (default `#ai-workforce-test`). Prints only safe metadata (tool, provider, connection id, channel, success, latency, Slack `ts`); never the token. Reports "NOT executed" and exits cleanly if the key or an active slack connection is absent.                                                     |
+| `pnpm llm:smoke ["question"]`                                               | **Optional live Claude check.** Makes one real API call _only_ if a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) is set; prints normalized model/tokens/latency + answer and the endpoint origin (never the key/token). Tests plain then structured output, reporting each separately. Exits cleanly with a message when no credential is set.                                                                                                                                 |
+| `pnpm llm:tool-smoke <tenantId> <connectionId> [channel]`                   | **Optional live end-to-end tool-calling check** (not part of `pnpm test`). Runs the real `llm` handler with a real Claude provider and the real Slack connector: Claude requests `send_slack_message`, the platform executes it, and the model finalizes. Prints only safe metadata (rounds, per-round token counts, final output); never the API key, auth token, or bot token. Reports "NOT executed" and exits cleanly if the Claude credential, encryption key, or connection is absent. |
+| `pnpm typecheck`                                                            | Type-check the project and the tooling configs, without emitting.                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `pnpm test`                                                                 | Run the test suite once (`vitest run`).                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `pnpm build`                                                                | Compile TypeScript to `dist/` and rewrite `@/*` aliases to relative paths.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `pnpm start:api`                                                            | Run the compiled API from `dist/` (production mode).                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `pnpm start:worker`                                                         | Run the compiled worker from `dist/`.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 ### Database commands
 
-| Command | What it does |
-| --- | --- |
-| `pnpm db:generate` | Diff `src/db/schema.ts` against `drizzle/` and write a new migration. **Needs no database.** |
-| `pnpm db:migrate` | Apply pending migrations. Idempotent. |
-| `pnpm db:migrate:dist` | Same, from the compiled output — what a deploy runs before starting the API. |
-| `pnpm db:check` | Verify the migration files and snapshots are consistent with each other. No database needed. |
-| `pnpm db:push` | Sync the schema straight to the database without a migration. **Dev prototyping only.** |
-| `pnpm db:studio` | Open Drizzle Studio to browse the data. |
+| Command                | What it does                                                                                 |
+| ---------------------- | -------------------------------------------------------------------------------------------- |
+| `pnpm db:generate`     | Diff `src/db/schema.ts` against `drizzle/` and write a new migration. **Needs no database.** |
+| `pnpm db:migrate`      | Apply pending migrations. Idempotent.                                                        |
+| `pnpm db:migrate:dist` | Same, from the compiled output — what a deploy runs before starting the API.                 |
+| `pnpm db:check`        | Verify the migration files and snapshots are consistent with each other. No database needed. |
+| `pnpm db:push`         | Sync the schema straight to the database without a migration. **Dev prototyping only.**      |
+| `pnpm db:studio`       | Open Drizzle Studio to browse the data.                                                      |
 
 The normal loop when changing the schema:
 
@@ -152,21 +152,23 @@ commit a real key. The Nuxt Vite server proxies `/backend/*` to
 `NUXT_BACKEND_URL` (default `http://127.0.0.1:3000`) so browser requests remain
 same-origin and Fastify needs no CORS policy.
 
-The current API exposes `GET /v1/runs/:runId` but deliberately has no workflow,
-run-list, or connection-list endpoint. The dashboard and those collection pages
-show that limitation explicitly; run detail is populated from the existing safe,
-tenant-scoped inspection DTO.
+The current API exposes authenticated tenant-scoped collection reads for
+workflows, runs, and connections, plus detailed run inspection by id. The Nuxt
+dashboard consumes these endpoints directly through the typed frontend API client.
 
 ### Endpoints
 
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/healthz` | none | Liveness + database readiness. `200` healthy, `503` if the DB is unreachable. |
-| `POST` | `/v1/api-keys` | Bearer key | Create a key for the caller's tenant. Returns the plaintext **once**. |
-| `GET` | `/v1/api-keys` | Bearer key | List the caller's own keys (metadata only — never the key). |
-| `POST` | `/v1/api-keys/:id/revoke` | Bearer key | Revoke one of the caller's keys. `204` on success, `404` if it is not theirs. |
-| `POST` | `/v1/webhooks/:source` | Bearer key | Ingest a webhook. Captures the event idempotently and, if `:source` has an active workflow, creates a queued run. |
-| `GET` | `/v1/runs/:runId` | Bearer key | Inspect one of the caller's own runs — the same safe, summarized view the CLI renders. `404` (identical shape) if the run does not exist **or** belongs to another tenant. |
+| Method | Path                      | Auth       | Purpose                                                                                                                                                                    |
+| ------ | ------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/healthz`                | none       | Liveness + database readiness. `200` healthy, `503` if the DB is unreachable.                                                                                              |
+| `POST` | `/v1/api-keys`            | Bearer key | Create a key for the caller's tenant. Returns the plaintext **once**.                                                                                                      |
+| `GET`  | `/v1/api-keys`            | Bearer key | List the caller's own keys (metadata only — never the key).                                                                                                                |
+| `POST` | `/v1/api-keys/:id/revoke` | Bearer key | Revoke one of the caller's keys. `204` on success, `404` if it is not theirs.                                                                                              |
+| `POST` | `/v1/webhooks/:source`    | Bearer key | Ingest a webhook. Captures the event idempotently and, if `:source` has an active workflow, creates a queued run.                                                          |
+| `GET`  | `/v1/workflows`           | Bearer key | List workflows for the caller's tenant, newest first, keyset-paginated (`createdAt DESC, id DESC`).                                                                        |
+| `GET`  | `/v1/runs`                | Bearer key | List runs for the caller's tenant, newest first, keyset-paginated, with optional `status` and `workflowId` filters.                                                        |
+| `GET`  | `/v1/connections`         | Bearer key | List non-secret connection metadata for the caller's tenant, newest first, keyset-paginated (`createdAt DESC, id DESC`).                                                   |
+| `GET`  | `/v1/runs/:runId`         | Bearer key | Inspect one of the caller's own runs — the same safe, summarized view the CLI renders. `404` (identical shape) if the run does not exist **or** belongs to another tenant. |
 
 #### Webhook ingestion (`POST /v1/webhooks/:source`)
 
@@ -175,11 +177,11 @@ idempotent: the dedupe key is the caller's `X-Event-ID` header if present, else 
 SHA-256 of the raw request body — a retried delivery never creates a second event
 or run. The event and (when configured) its run are written in one transaction.
 
-| Outcome | Status | Body |
-| --- | --- | --- |
-| New event, active workflow matched | `202` | `{ event_id, run_id, status: "queued" }` |
-| New event, no workflow for the source | `202` | `{ event_id, run_id: null, status: "accepted", workflow: "not_configured" }` |
-| Duplicate delivery | `200` | `{ event_id, run_id, status: "duplicate" }` |
+| Outcome                               | Status | Body                                                                         |
+| ------------------------------------- | ------ | ---------------------------------------------------------------------------- |
+| New event, active workflow matched    | `202`  | `{ event_id, run_id, status: "queued" }`                                     |
+| New event, no workflow for the source | `202`  | `{ event_id, run_id: null, status: "accepted", workflow: "not_configured" }` |
+| Duplicate delivery                    | `200`  | `{ event_id, run_id, status: "duplicate" }`                                  |
 
 ```bash
 curl -s -X POST http://127.0.0.1:3000/v1/webhooks/github \
@@ -241,10 +243,8 @@ preview size, and bounds scrub depth.
 > arguments are not surfaced. A dedicated tool-execution/idempotency ledger is
 > deferred (see below).
 
-> **Designed but not built: `GET /v1/runs` (list).** A paginated, filterable list
-> of runs was scoped and deliberately left out of Step 12 to keep the surface
-> minimal — there is no list, search, pagination, filtering, or any
-> mutation/cancellation endpoint, and no frontend. Only the single-run read exists.
+> `GET /v1/runs` is intentionally read-only and summary-focused. Mutation and
+> cancellation actions remain out of scope for this phase.
 
 Authentication is a bearer API key:
 
@@ -260,7 +260,7 @@ Keys are cryptographically random. Only a SHA-256 hash and a short lookup prefix
 are stored — the full key is shown exactly once, at creation, and is never
 retrievable or logged afterwards. Every failure to authenticate (missing,
 malformed, unknown, wrong or revoked key) returns the same `401` so a caller
-cannot tell them apart. There is no way to authenticate to create your *first*
+cannot tell them apart. There is no way to authenticate to create your _first_
 key, so the first one per tenant is minted out-of-band:
 
 ```bash
@@ -285,7 +285,7 @@ It verifies the database, logs `worker_started`, then runs two long-lived loops
 against the `jobs` table:
 
 - a **claim loop** that takes one ready job at a time with `SELECT … FOR UPDATE
-  SKIP LOCKED` inside a short transaction, stamps this worker's instance id and a
+SKIP LOCKED` inside a short transaction, stamps this worker's instance id and a
   **15-minute lease** on the row, checks the job's run still exists, and hands it to
   a dispatcher — logging `job_claimed`, then `job_completed`, `job_failed`, or
   `job_retry_scheduled` when a retryable step failure defers the job. The lease is
@@ -298,10 +298,10 @@ against the `jobs` table:
   (incrementing `attempt`, **never** the business `retry_count`), so a job held by
   a crashed worker is never lost — logging `job_requeued` when it recovers any.
   That safety net is **bounded**: a job that has already been recovered
-  `MAX_CRASH_ATTEMPTS` (5) times is *dead-lettered* on its next expiry — moved to
+  `MAX_CRASH_ATTEMPTS` (5) times is _dead-lettered_ on its next expiry — moved to
   `failed` with `last_error.code = "crash_attempts_exhausted"`, never offered to a
   worker again, and logged once at error level as `job_dead_lettered` with its
-  tenant, run, job, step and attempt. Without the ceiling, a job that *causes* the
+  tenant, run, job, step and attempt. Without the ceiling, a job that _causes_ the
   crash (an OOM on a pathological payload, a wedged native dependency) would be
   handed to the next worker forever. Dead-lettering settles the **job** only: the
   run keeps whatever status it had, so it stays inspectable and run-state authority
@@ -365,19 +365,19 @@ FATAL: configuration error — refusing to start.
   See .env.example for the expected values.
 ```
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `DATABASE_URL` | **required** | PostgreSQL connection URL. Add `?sslmode=require` for hosted providers. |
-| `DATABASE_POOL_MAX` | `10` | Max pooled connections **per process**. Two processes run, so the real ceiling is roughly double. |
-| `NODE_ENV` | `development` | `development` enables pretty logs; `production` emits JSON. |
-| `LOG_LEVEL` | `info` | pino level: `fatal`…`trace`, or `silent`. `debug` also logs every SQL statement. |
-| `HOST` | `127.0.0.1` | API bind address. Use `0.0.0.0` in a container or on a PaaS. |
-| `PORT` | `3000` | API port. |
-| `WORKER_SHUTDOWN_TIMEOUT_MS` | `10000` | How long graceful worker shutdown waits for an in-flight job before returning and, if it still owns the lease, releasing that job back to `pending`. This does **not** cancel the underlying external request. |
-| `ANTHROPIC_API_KEY` | *(unset)* | **Optional secret.** Direct-Anthropic credential, sent as `x-api-key`. Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients. |
-| `ANTHROPIC_AUTH_TOKEN` | *(unset)* | **Optional secret.** Bearer token for an Anthropic-*compatible* gateway, sent as `Authorization: Bearer …`. **Mutually exclusive** with `ANTHROPIC_API_KEY` — set exactly one; configuring both is refused at startup. |
-| `ANTHROPIC_BASE_URL` | *(unset)* | Optional. Points the provider at an Anthropic-compatible gateway instead of `https://api.anthropic.com`. Give the **origin only** (optionally with a base path); do **not** include `/v1` — the SDK appends `/v1/messages` itself, so a trailing `/v1` would produce `/v1/v1/messages` (rejected at startup). |
-| `ANTHROPIC_MODEL` | `claude-opus-5` | The model the provider defaults to when a request names none. A deployment decision; any request may override it. Against a gateway, this must be a model id **that gateway accepts** — the default is not guaranteed to be valid there. |
+| Variable                     | Default         | Purpose                                                                                                                                                                                                                                                                                                       |
+| ---------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`               | **required**    | PostgreSQL connection URL. Add `?sslmode=require` for hosted providers.                                                                                                                                                                                                                                       |
+| `DATABASE_POOL_MAX`          | `10`            | Max pooled connections **per process**. Two processes run, so the real ceiling is roughly double.                                                                                                                                                                                                             |
+| `NODE_ENV`                   | `development`   | `development` enables pretty logs; `production` emits JSON.                                                                                                                                                                                                                                                   |
+| `LOG_LEVEL`                  | `info`          | pino level: `fatal`…`trace`, or `silent`. `debug` also logs every SQL statement.                                                                                                                                                                                                                              |
+| `HOST`                       | `127.0.0.1`     | API bind address. Use `0.0.0.0` in a container or on a PaaS.                                                                                                                                                                                                                                                  |
+| `PORT`                       | `3000`          | API port.                                                                                                                                                                                                                                                                                                     |
+| `WORKER_SHUTDOWN_TIMEOUT_MS` | `10000`         | How long graceful worker shutdown waits for an in-flight job before returning and, if it still owns the lease, releasing that job back to `pending`. This does **not** cancel the underlying external request.                                                                                                |
+| `ANTHROPIC_API_KEY`          | _(unset)_       | **Optional secret.** Direct-Anthropic credential, sent as `x-api-key`. Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients.                                                                                                                 |
+| `ANTHROPIC_AUTH_TOKEN`       | _(unset)_       | **Optional secret.** Bearer token for an Anthropic-_compatible_ gateway, sent as `Authorization: Bearer …`. **Mutually exclusive** with `ANTHROPIC_API_KEY` — set exactly one; configuring both is refused at startup.                                                                                        |
+| `ANTHROPIC_BASE_URL`         | _(unset)_       | Optional. Points the provider at an Anthropic-compatible gateway instead of `https://api.anthropic.com`. Give the **origin only** (optionally with a base path); do **not** include `/v1` — the SDK appends `/v1/messages` itself, so a trailing `/v1` would produce `/v1/v1/messages` (rejected at startup). |
+| `ANTHROPIC_MODEL`            | `claude-opus-5` | The model the provider defaults to when a request names none. A deployment decision; any request may override it. Against a gateway, this must be a model id **that gateway accepts** — the default is not guaranteed to be valid there.                                                                      |
 
 `.env` is loaded by Node's built-in `--env-file-if-exists`, so no `dotenv`
 dependency is involved. Validation of `DATABASE_URL` is structural only — scheme,
@@ -447,9 +447,9 @@ the **only** place in the codebase that imports `@anthropic-ai/sdk`. It:
   a `PermanentError` (`llm_structured_parse_failed`); malformed data never reaches
   workflow context.
 - **maps errors by SDK class, never by string** onto the shared taxonomy.
-  *Retryable*: abort/timeout, connection failure, `429`, and transient `408`/`5xx`.
-  *Permanent*: bad key (`401`/`403`), invalid request (`400`/`422`), unknown model
-  (`404`), a refusal `stop_reason`, and — crucially — any *unrecognised* error, so
+  _Retryable_: abort/timeout, connection failure, `429`, and transient `408`/`5xx`.
+  _Permanent_: bad key (`401`/`403`), invalid request (`400`/`422`), unknown model
+  (`404`), a refusal `stop_reason`, and — crucially — any _unrecognised_ error, so
   an unknown failure can never accidentally become retryable. The provider
   **classifies but does not retry**: deciding whether to retry is the engine's job
   (Step 11). The SDK's own retry loop is disabled (`maxRetries: 0`).
@@ -572,10 +572,14 @@ model↔tool rounds are internal to that one step.
   "config": {
     "system": "…static, developer-authored instructions…",
     "input": "{{trigger.payload.text}}",
-    "output_schema": { "type": "object", "properties": { "summary": { "type": "string" } }, "required": ["summary"] },
+    "output_schema": {
+      "type": "object",
+      "properties": { "summary": { "type": "string" } },
+      "required": ["summary"],
+    },
     "tools": [{ "name": "send_slack_message", "connection_id": "<uuid>" }],
-    "max_tool_rounds": 4
-  }
+    "max_tool_rounds": 4,
+  },
 }
 ```
 
@@ -728,7 +732,7 @@ code rather than placeholder files.
   creator owns and closes; there is no exported `db` singleton, so importing a
   module can never open a socket as a side effect.
 - **Errors are classified where they are raised** as either `RetryableError` or
-  `PermanentError`. Unclassified errors are treated as *not* retryable.
+  `PermanentError`. Unclassified errors are treated as _not_ retryable.
 - **Credentials never reach a log.** Connection URLs are reduced to
   host/port/database before being logged, and SQL is logged without its
   parameters.
@@ -749,19 +753,19 @@ at runtime — not a schema migration. Shredding steps into relational tables wo
 buy referential integrity we do not need and cost the ability to treat a
 definition as a single immutable versioned value.
 
-| Table | Holds | Notes |
-| --- | --- | --- |
-| `tenants` | One row per customer organisation | Root of every ownership chain. `suspended` stops execution without deleting history. |
-| `users` | A human, belonging to one tenant | No auth material yet. Unique per tenant on `lower(email)`. |
-| `workflows` | The stable identity of a process | Name, status. Holds no logic itself. |
-| `workflow_versions` | An immutable snapshot of the logic | `definition` jsonb, trigger config, version number. |
-| `events` | A raw external signal captured at the webhook boundary | `source`, `dedupe_key`, `payload` jsonb, `received_at`. Idempotent per `(tenant_id, source, dedupe_key)`. |
-| `workflow_runs` | One execution of a workflow, born from an event | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. Advanced one step per job by the execution engine. |
-| `jobs` | A unit of durable work advancing a run's step | `step_key`, `attempt` (crash/lease recovery) / `retry_count` (business retries) / `max_attempts` (business budget), `status` (`pending`→`running`→`done`/`failed`), `run_at` (a retry's future defer lives here), `locked_by` + `lease_expires_at` (the lease), `last_error`. Claimed with `FOR UPDATE SKIP LOCKED`. |
-| `workflow_step_runs` | One executed step of a run | Records the step's `status`, `output` jsonb and error, one row per step the engine advances. Composite tenant-safe FK to its run. |
-| `llm_usage` | Token/latency accounting for one provider round of an `llm` step | `provider`, `model`, `round`, `input_tokens`/`output_tokens`/`total_tokens`, `latency_ms`. Written atomically with the step-run settle; `UNIQUE(step_run_id, round)`. A no-tools step meters one round; a tool-calling step meters one row per request→execute round. Metadata only — never the prompt, output or credential. |
-| `api_keys` | A tenant's bearer credentials | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one. |
-| `connections` | A tenant's authorization to act against an external provider | `provider`, `name`, `status` (`active`/`disabled`/`error`), `encrypted_credentials` jsonb (a versioned AES-256-GCM envelope — never plaintext), non-secret `metadata`, `last_used_at`. `UNIQUE(tenant_id, id)` for future composite FKs and `UNIQUE(tenant_id, provider, name)` for distinct names. A tenant may hold **many active connections to the same provider** (e.g. two Slack workspaces); which one a tool uses is decided by a trusted `connectionId` in platform/workflow config — never by the model. |
+| Table                | Holds                                                            | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| -------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `tenants`            | One row per customer organisation                                | Root of every ownership chain. `suspended` stops execution without deleting history.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `users`              | A human, belonging to one tenant                                 | No auth material yet. Unique per tenant on `lower(email)`.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `workflows`          | The stable identity of a process                                 | Name, status. Holds no logic itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `workflow_versions`  | An immutable snapshot of the logic                               | `definition` jsonb, trigger config, version number.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `events`             | A raw external signal captured at the webhook boundary           | `source`, `dedupe_key`, `payload` jsonb, `received_at`. Idempotent per `(tenant_id, source, dedupe_key)`.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `workflow_runs`      | One execution of a workflow, born from an event                  | Pins `workflow_id` + `workflow_version_id` + `event_id`; `status` (starts `queued`), `context` jsonb. Advanced one step per job by the execution engine.                                                                                                                                                                                                                                                                                                                                                           |
+| `jobs`               | A unit of durable work advancing a run's step                    | `step_key`, `attempt` (crash/lease recovery) / `retry_count` (business retries) / `max_attempts` (business budget), `status` (`pending`→`running`→`done`/`failed`), `run_at` (a retry's future defer lives here), `locked_by` + `lease_expires_at` (the lease), `last_error`. Claimed with `FOR UPDATE SKIP LOCKED`.                                                                                                                                                                                               |
+| `workflow_step_runs` | One executed step of a run                                       | Records the step's `status`, `output` jsonb and error, one row per step the engine advances. Composite tenant-safe FK to its run.                                                                                                                                                                                                                                                                                                                                                                                  |
+| `llm_usage`          | Token/latency accounting for one provider round of an `llm` step | `provider`, `model`, `round`, `input_tokens`/`output_tokens`/`total_tokens`, `latency_ms`. Written atomically with the step-run settle; `UNIQUE(step_run_id, round)`. A no-tools step meters one round; a tool-calling step meters one row per request→execute round. Metadata only — never the prompt, output or credential.                                                                                                                                                                                      |
+| `api_keys`           | A tenant's bearer credentials                                    | Stores a SHA-256 `key_hash` and a short `prefix`, never the key. `revoked_at` disables one.                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `connections`        | A tenant's authorization to act against an external provider     | `provider`, `name`, `status` (`active`/`disabled`/`error`), `encrypted_credentials` jsonb (a versioned AES-256-GCM envelope — never plaintext), non-secret `metadata`, `last_used_at`. `UNIQUE(tenant_id, id)` for future composite FKs and `UNIQUE(tenant_id, provider, name)` for distinct names. A tenant may hold **many active connections to the same provider** (e.g. two Slack workspaces); which one a tool uses is decided by a trusted `connectionId` in platform/workflow config — never by the model. |
 
 Two constraints are worth calling out because they encode invariants the
 application would otherwise have to remember:
@@ -795,7 +799,7 @@ carries an explicit `UNIQUE(tenant_id, id)`), so a job can never be attached to 
 run in another tenant. Two partial indexes keep the hot paths tight: one on
 `(run_at) WHERE status = 'pending'` for the claim scan, and one on
 `(lease_expires_at) WHERE status = 'running'` for the reaper sweep — neither ever
-scans settled work. The first job of a run is created inside the *same*
+scans settled work. The first job of a run is created inside the _same_
 transaction as the event and the run, so there is never a queued run without a job
 to advance it.
 
@@ -803,11 +807,11 @@ to advance it.
 
 Tenant isolation is enforced in the application layer by a `TenantScope`: a small
 value that binds a database handle to exactly one tenant id. Repositories are
-constructed *from* a scope, never from a bare handle, so an instance is
+constructed _from_ a scope, never from a bare handle, so an instance is
 intrinsically pinned to one tenant and its queries cannot omit the tenant
 predicate. There are no generic "fetch across all tenants" helpers.
 
-The one unavoidable exception — resolving *which* tenant a presented API key
+The one unavoidable exception — resolving _which_ tenant a presented API key
 belongs to, before any tenant is known — is confined to a single narrow
 `ApiKeyStore` used only by the authenticator, and named to make its exceptional
 nature obvious. PostgreSQL Row-Level Security will later back this with a
@@ -913,14 +917,14 @@ summary and detail mode, a cross-tenant or nonexistent run returns `null`, and
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push to `main`, on every pull request,
-and on demand via *Run workflow*. It is two independent jobs, so a failure in one
+and on demand via _Run workflow_. It is two independent jobs, so a failure in one
 never hides the other.
 
 **`verify` (no database)** — `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm db:check`, a schema-drift guard, then `pnpm build`. The drift guard runs
 `pnpm db:generate` (which needs no database) and fails if anything under
-`drizzle/` changed afterwards: on a healthy tree the generator prints *No schema
-changes* and writes nothing, so a new or modified file there means
+`drizzle/` changed afterwards: on a healthy tree the generator prints _No schema
+changes_ and writes nothing, so a new or modified file there means
 `src/db/schema.ts` was edited without committing its migration. stdin is closed
 for that step so a drizzle-kit rename prompt fails fast instead of hanging the
 job.
@@ -935,7 +939,7 @@ satisfies the "name must contain `test`" guard in
 `localhost` can resolve to `::1` first on a runner. `global-setup.ts` applies the
 migrations once before the suites run.
 
-Because `vitest run` exits 0 when every integration suite *skips*, the job
+Because `vitest run` exits 0 when every integration suite _skips_, the job
 asserts `TEST_DATABASE_URL` is non-empty before running the tests. That variable
 is the single gate every integration file reads, so an edit that drops it turns
 CI red instead of quietly reducing the run to unit tests only.
@@ -988,7 +992,7 @@ cannot drift from local development.
   tenant API-key auth: the raw body is preserved for future HMAC, the dedupe key is
   `X-Event-ID` or a SHA-256 of the body, and the event plus (when a source has an
   active workflow) its `queued` run are written in one transaction via `INSERT …
-  ON CONFLICT DO NOTHING`. Idempotency and "one active workflow per (tenant,
+ON CONFLICT DO NOTHING`. Idempotency and "one active workflow per (tenant,
   source)" are both DB-enforced; a run pins its exact version at creation. No
   workflow for a source is a success (event kept, no run), not an error. A
   `webhooks:inspect` CLI lists a tenant's events, runs and jobs.
@@ -1110,7 +1114,7 @@ cannot drift from local development.
   Success normalizes to `{ ok, channel, ts }`. **OAuth is not implemented** — the Slack
   app is installed manually in development and its bot token stored as an encrypted
   connection. Tool calling is now **wired into Claude** (Step 10, below). A `pnpm
-  slack:smoke` command posts one live test message when configured; the automated
+slack:smoke` command posts one live test message when configured; the automated
   suite never touches the live Slack API.
 - **LLM tool calling (Step 10)** — the `llm` step can now offer registered tools to
   the model and execute the ones it requests, closing the loop between AI reasoning
@@ -1146,7 +1150,7 @@ cannot drift from local development.
   `sleep`/`setTimeout`/in-memory loop; the wait lives on the row and is enforced by
   claim's `run_at <= now()` predicate). The delay is **equal-jitter** exponential
   backoff (`raw = min(baseMs·factor^retry_count, maxDelayMs)`, `delay = raw/2 +
-  rand·raw/2`; defaults 1s base, ×2, 5min cap, budget 5), pure and injectable
+rand·raw/2`; defaults 1s base, ×2, 5min cap, budget 5), pure and injectable
   ([`retry-policy.ts`](src/domain/retry-policy.ts)). A **`PermanentError`**, or a
   retryable one whose budget is spent, fails the run terminally on that attempt.
   Crucially the two counters never cross-contaminate: the reaper's crash recovery
@@ -1202,14 +1206,14 @@ development path, not production SaaS onboarding):
 
 Nothing below exists in any form. It is sequenced, not forgotten.
 
-| Area | Arrives in |
-| --- | --- |
-| Additional connectors (Gmail, GitHub, …), OAuth onboarding | later steps / not scheduled |
-| Run inspection endpoints and log redaction | Step 12 |
-| Distributed rate limiting, PostgreSQL RLS, CI | Step 13 |
-| Tool-execution idempotency ledger (exactly-once external effects) | deferred — external effects are at-least-once until then |
-| HMAC / provider signature verification on webhooks | before production webhooks |
-| Agent loops, autonomous multi-step agents, MCP, RAG / embeddings, prompt caching, streaming, model training / fine-tuning, any frontend | not scheduled |
+| Area                                                                                                                                    | Arrives in                                               |
+| --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Additional connectors (Gmail, GitHub, …), OAuth onboarding                                                                              | later steps / not scheduled                              |
+| Run inspection endpoints and log redaction                                                                                              | Step 12                                                  |
+| Distributed rate limiting, PostgreSQL RLS, CI                                                                                           | Step 13                                                  |
+| Tool-execution idempotency ledger (exactly-once external effects)                                                                       | deferred — external effects are at-least-once until then |
+| HMAC / provider signature verification on webhooks                                                                                      | before production webhooks                               |
+| Agent loops, autonomous multi-step agents, MCP, RAG / embeddings, prompt caching, streaming, model training / fine-tuning, any frontend | not scheduled                                            |
 
 The tool / connector foundation (Step 9A), the first concrete connector — **Slack**
 (Step 9B) — **tool calling wired into Claude** (Step 10), and **durable business

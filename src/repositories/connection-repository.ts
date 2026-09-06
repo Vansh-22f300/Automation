@@ -20,20 +20,43 @@
  * without a key (the key is only demanded when an encrypt/decrypt actually runs).
  */
 
-import { desc, eq } from 'drizzle-orm';
+import { and, desc, eq, lt, or } from "drizzle-orm";
 
-import { connections } from '@/db/schema.js';
-import type { Connection } from '@/db/schema.js';
+import { BadRequestError } from "@/api/errors.js";
+import { connections } from "@/db/schema.js";
+import type { Connection } from "@/db/schema.js";
 import type {
   AuthorizedConnection,
   ConnectionMetadata,
   ConnectionRef,
   ConnectionResolver,
   ConnectionStatus,
-} from '@/domain/connection.js';
-import { DisabledConnectionError, MissingConnectionError } from '@/domain/tool-errors.js';
-import { TenantScope, TenantScopedRepository } from '@/repositories/tenant-scope.js';
-import type { CredentialCipher, EncryptedEnvelope } from '@/security/credential-cipher.js';
+} from "@/domain/connection.js";
+import {
+  DisabledConnectionError,
+  MissingConnectionError,
+} from "@/domain/tool-errors.js";
+import {
+  TenantScope,
+  TenantScopedRepository,
+} from "@/repositories/tenant-scope.js";
+import type {
+  CredentialCipher,
+  EncryptedEnvelope,
+} from "@/security/credential-cipher.js";
+
+export interface ConnectionListPage {
+  readonly items: readonly ConnectionMetadata[];
+  readonly nextCursor: string | null;
+}
+
+export interface ConnectionListReader {
+  listMetadata(limit?: number): Promise<ConnectionMetadata[]>;
+  listMetadataPage(options?: {
+    readonly limit?: number;
+    readonly cursor?: string;
+  }): Promise<ConnectionListPage>;
+}
 
 /** What creating a connection needs: the identity plus the secret to encrypt. */
 export interface CreateConnectionInput {
@@ -45,7 +68,10 @@ export interface CreateConnectionInput {
   readonly metadata?: Record<string, unknown>;
 }
 
-export class ConnectionRepository extends TenantScopedRepository implements ConnectionResolver {
+export class ConnectionRepository
+  extends TenantScopedRepository
+  implements ConnectionResolver, ConnectionListReader
+{
   constructor(
     scope: TenantScope,
     private readonly cipher: CredentialCipher,
@@ -85,13 +111,86 @@ export class ConnectionRepository extends TenantScopedRepository implements Conn
 
   /** All connections for this tenant, newest first — metadata only, never secrets. */
   async listMetadata(limit = 100): Promise<ConnectionMetadata[]> {
+    const rows = await this.listMetadataPage({ limit });
+    return [...rows.items];
+  }
+
+  private static encodeCursor(cursor: {
+    readonly createdAt: string;
+    readonly id: string;
+  }): string {
+    return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+  }
+
+  private static decodeCursor(cursor: string): {
+    createdAt: string;
+    id: string;
+  } {
+    try {
+      const parsed = JSON.parse(
+        Buffer.from(cursor, "base64url").toString("utf8"),
+      ) as {
+        createdAt?: unknown;
+        id?: unknown;
+      };
+      if (
+        typeof parsed.createdAt !== "string" ||
+        typeof parsed.id !== "string"
+      ) {
+        throw new Error("invalid cursor");
+      }
+      if (Number.isNaN(new Date(parsed.createdAt).getTime())) {
+        throw new Error("invalid cursor");
+      }
+      return { createdAt: parsed.createdAt, id: parsed.id };
+    } catch {
+      throw new BadRequestError("Cursor is invalid");
+    }
+  }
+
+  async listMetadataPage(
+    options: { readonly limit?: number; readonly cursor?: string } = {},
+  ): Promise<ConnectionListPage> {
+    const pageLimit = Math.max(1, Math.min(options.limit ?? 100, 100));
+    const parsedCursor =
+      options.cursor === undefined
+        ? null
+        : ConnectionRepository.decodeCursor(options.cursor);
+    const cursorDate =
+      parsedCursor === null ? null : new Date(parsedCursor.createdAt);
+    const cursorId = parsedCursor?.id;
+    const cursorClause =
+      cursorDate === null || cursorId === undefined
+        ? undefined
+        : or(
+            lt(connections.createdAt, cursorDate),
+            and(
+              eq(connections.createdAt, cursorDate),
+              lt(connections.id, cursorId),
+            ),
+          );
+
     const rows = await this.db
       .select()
       .from(connections)
-      .where(this.scope.where(connections.tenantId))
-      .orderBy(desc(connections.createdAt))
-      .limit(limit);
-    return rows.map(ConnectionRepository.toMetadata);
+      .where(
+        cursorClause === undefined
+          ? this.scope.where(connections.tenantId)
+          : this.scope.where(connections.tenantId, cursorClause),
+      )
+      .orderBy(desc(connections.createdAt), desc(connections.id))
+      .limit(pageLimit + 1);
+
+    const items = rows.slice(0, pageLimit).map(ConnectionRepository.toMetadata);
+    const lastRow = rows[pageLimit - 1];
+    const nextCursor =
+      rows.length > pageLimit && lastRow !== undefined
+        ? ConnectionRepository.encodeCursor({
+            createdAt: lastRow.createdAt.toISOString(),
+            id: lastRow.id,
+          })
+        : null;
+    return { items, nextCursor };
   }
 
   /** One connection's metadata by id, or null if not in this tenant. Never the secret. */
@@ -104,7 +203,10 @@ export class ConnectionRepository extends TenantScopedRepository implements Conn
   }
 
   /** Replace a connection's non-secret metadata. Returns null if not in this tenant. */
-  async updateMetadata(id: string, metadata: Record<string, unknown>): Promise<ConnectionMetadata | null> {
+  async updateMetadata(
+    id: string,
+    metadata: Record<string, unknown>,
+  ): Promise<ConnectionMetadata | null> {
     const [row] = await this.db
       .update(connections)
       .set({ metadata, updatedAt: new Date() })
@@ -117,7 +219,7 @@ export class ConnectionRepository extends TenantScopedRepository implements Conn
   async disable(id: string): Promise<ConnectionMetadata | null> {
     const [row] = await this.db
       .update(connections)
-      .set({ status: 'disabled', updatedAt: new Date() })
+      .set({ status: "disabled", updatedAt: new Date() })
       .where(this.scope.where(connections.tenantId, eq(connections.id, id)))
       .returning();
     return row ? ConnectionRepository.toMetadata(row) : null;
@@ -141,21 +243,27 @@ export class ConnectionRepository extends TenantScopedRepository implements Conn
   async resolveForTool(ref: ConnectionRef): Promise<AuthorizedConnection> {
     // Resolve either by explicit id (trusted config only) or the active connection
     // for the provider. Both are anchored to this tenant.
-    const [row] = ref.connectionId !== undefined
-      ? await this.db
-          .select()
-          .from(connections)
-          .where(this.scope.where(connections.tenantId, eq(connections.id, ref.connectionId)))
-      : await this.db
-          .select()
-          .from(connections)
-          .where(
-            this.scope.where(
-              connections.tenantId,
-              eq(connections.provider, ref.provider),
-              eq(connections.status, 'active'),
-            ),
-          );
+    const [row] =
+      ref.connectionId !== undefined
+        ? await this.db
+            .select()
+            .from(connections)
+            .where(
+              this.scope.where(
+                connections.tenantId,
+                eq(connections.id, ref.connectionId),
+              ),
+            )
+        : await this.db
+            .select()
+            .from(connections)
+            .where(
+              this.scope.where(
+                connections.tenantId,
+                eq(connections.provider, ref.provider),
+                eq(connections.status, "active"),
+              ),
+            );
 
     if (!row) {
       throw new MissingConnectionError(ref);
@@ -165,20 +273,27 @@ export class ConnectionRepository extends TenantScopedRepository implements Conn
     if (row.provider !== ref.provider) {
       throw new MissingConnectionError(ref);
     }
-    if (row.status !== 'active') {
+    if (row.status !== "active") {
       throw new DisabledConnectionError(row.id, row.status);
     }
 
-    const credential = this.cipher.decrypt(row.encryptedCredentials as EncryptedEnvelope);
+    const credential = this.cipher.decrypt(
+      row.encryptedCredentials as EncryptedEnvelope,
+    );
 
     // Best-effort hygiene: record that the credential was used. Scoped to tenant.
     await this.db
       .update(connections)
       .set({ lastUsedAt: new Date() })
-      .where(this.scope.where(connections.tenantId, eq(connections.id, row.id)));
+      .where(
+        this.scope.where(connections.tenantId, eq(connections.id, row.id)),
+      );
 
     return {
-      metadata: { ...ConnectionRepository.toMetadata(row), lastUsedAt: new Date() },
+      metadata: {
+        ...ConnectionRepository.toMetadata(row),
+        lastUsedAt: new Date(),
+      },
       credential,
     };
   }

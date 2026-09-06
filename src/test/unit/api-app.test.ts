@@ -149,6 +149,37 @@ async function makeApp(): Promise<Harness> {
         throw new Error("connection refused to 10.0.0.9:5432");
     },
     apiKeyServiceFor: backend.serviceFor,
+    workflowServiceFor: () => ({
+      create: async () => {
+        throw new Error('not used');
+      },
+      createVersion: async () => {
+        throw new Error('not used');
+      },
+      activateVersion: async () => {
+        throw new Error('not used');
+      },
+      getWorkflow: async () => {
+        throw new Error('not used');
+      },
+      listVersions: async () => [],
+      getActiveVersion: async () => null,
+      listWorkflows: async () => ({ items: [], nextCursor: null }),
+    }),
+    connectionServiceFor: () => ({
+      create: async () => {
+        throw new Error('not used');
+      },
+      listMetadata: async () => [],
+      listMetadataPage: async () => ({ items: [], nextCursor: null }),
+      getMetadata: async () => null,
+      updateMetadata: async () => null,
+      disable: async () => null,
+      delete: async () => false,
+      resolveForTool: async () => {
+        throw new Error('not used');
+      },
+    }),
     // Not exercised here; the webhook route has its own suite. A no-op ingestor
     // keeps buildApp's dependency satisfied.
     webhookIngestorFor: () => ({
@@ -162,6 +193,7 @@ async function makeApp(): Promise<Harness> {
     // Minimal run-inspection reader factory for the routes that expect it.
     runInspectionFor: () => ({
       getRun: async () => null,
+      listRuns: async () => ({ items: [], nextCursor: null }),
     }),
   });
 
