@@ -59,7 +59,7 @@ export interface PageEnvelope {
 export interface WorkflowListItem {
   readonly id: string;
   readonly name: string;
-  readonly status: 'draft' | 'active' | 'disabled';
+  readonly status: "draft" | "active" | "disabled";
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly activeVersion: null | {
@@ -79,7 +79,13 @@ export interface RunListItem {
   readonly workflowId: string;
   readonly workflowName: string;
   readonly workflowVersionId: string;
-  readonly status: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled';
+  readonly status:
+    | "queued"
+    | "running"
+    | "waiting"
+    | "succeeded"
+    | "failed"
+    | "cancelled";
   readonly currentStepKey: string | null;
   readonly createdAt: string;
   readonly startedAt: string | null;
@@ -96,7 +102,7 @@ export interface ConnectionListItem {
   readonly id: string;
   readonly provider: string;
   readonly name: string;
-  readonly status: 'active' | 'disabled' | 'error';
+  readonly status: "active" | "disabled" | "error";
   readonly metadata: Record<string, unknown>;
   readonly createdAt: string;
   readonly updatedAt: string;

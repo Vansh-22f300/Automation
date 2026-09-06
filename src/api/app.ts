@@ -16,27 +16,27 @@
  * repositories, then `listen` — lives in `server.ts`.
  */
 
-import Fastify from 'fastify';
-import rateLimit from '@fastify/rate-limit';
-import type { Logger } from 'pino';
+import Fastify from "fastify";
+import rateLimit from "@fastify/rate-limit";
+import type { Logger } from "pino";
 
-import { registerApiKeyAuth } from '@/api/auth-hook.js';
-import { registerErrorHandling } from '@/api/error-handler.js';
-import { registerApiKeyRoutes } from '@/api/routes/api-keys.js';
-import type { ApiKeyServiceFactory } from '@/api/routes/api-keys.js';
-import { registerConnectionRoutes } from '@/api/routes/connections.js';
-import type { ConnectionServiceFactory } from '@/api/routes/connections.js';
-import { registerHealthRoute } from '@/api/routes/health.js';
-import type { DatabaseHealthCheck } from '@/api/routes/health.js';
-import { registerRunInspectionRoutes } from '@/api/routes/runs.js';
-import type { RunInspectionServiceFactory } from '@/api/routes/runs.js';
-import { registerWorkflowRoutes } from '@/api/routes/workflows.js';
-import type { WorkflowServiceFactory } from '@/api/routes/workflows.js';
-import { registerWebhookRoutes } from '@/api/routes/webhooks.js';
-import type { WebhookIngestorFactory } from '@/api/routes/webhooks.js';
-import type { ApiServer } from '@/api/types.js';
-import type { Authenticator } from '@/auth/context.js';
-import { newId } from '@/domain/ids.js';
+import { registerApiKeyAuth } from "@/api/auth-hook.js";
+import { registerErrorHandling } from "@/api/error-handler.js";
+import { registerApiKeyRoutes } from "@/api/routes/api-keys.js";
+import type { ApiKeyServiceFactory } from "@/api/routes/api-keys.js";
+import { registerConnectionRoutes } from "@/api/routes/connections.js";
+import type { ConnectionServiceFactory } from "@/api/routes/connections.js";
+import { registerHealthRoute } from "@/api/routes/health.js";
+import type { DatabaseHealthCheck } from "@/api/routes/health.js";
+import { registerRunInspectionRoutes } from "@/api/routes/runs.js";
+import type { RunInspectionServiceFactory } from "@/api/routes/runs.js";
+import { registerWorkflowRoutes } from "@/api/routes/workflows.js";
+import type { WorkflowServiceFactory } from "@/api/routes/workflows.js";
+import { registerWebhookRoutes } from "@/api/routes/webhooks.js";
+import type { WebhookIngestorFactory } from "@/api/routes/webhooks.js";
+import type { ApiServer } from "@/api/types.js";
+import type { Authenticator } from "@/auth/context.js";
+import { newId } from "@/domain/ids.js";
 
 export interface AppDependencies {
   /** Resolves credentials to a tenant. */
@@ -65,7 +65,7 @@ export interface AppDependencies {
  * is called out in the README. No Redis is introduced for this.
  */
 const RATE_LIMIT_MAX = 100;
-const RATE_LIMIT_WINDOW = '1 minute';
+const RATE_LIMIT_WINDOW = "1 minute";
 
 export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
   const app: ApiServer = Fastify({
@@ -89,7 +89,7 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     // Route the 429 through our envelope rather than the plugin's default shape.
     errorResponseBuilder: (request, context) => ({
       error: {
-        code: 'rate_limited',
+        code: "rate_limited",
         message: `Rate limit exceeded, retry in ${Math.ceil(context.ttl / 1000)}s`,
         requestId: request.id,
       },
@@ -103,8 +103,8 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
   // bytes — re-serialising the parsed object would change them. This replaces
   // the default JSON parser for every route; parse failures surface as 400.
   app.addContentTypeParser(
-    'application/json',
-    { parseAs: 'buffer' },
+    "application/json",
+    { parseAs: "buffer" },
     (request, body, done) => {
       const raw = body as Buffer;
       request.rawBody = raw;
@@ -113,7 +113,7 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
         return;
       }
       try {
-        done(null, JSON.parse(raw.toString('utf8')) as unknown);
+        done(null, JSON.parse(raw.toString("utf8")) as unknown);
       } catch (error) {
         const err = error as Error & { statusCode?: number };
         err.statusCode = 400;

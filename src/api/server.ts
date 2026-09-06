@@ -9,28 +9,28 @@
  * which is what lets the whole app be exercised in tests without a network.
  */
 
-import { loadEnv } from '@/config/env.js';
-import { createDatabase } from '@/db/client.js';
-import { createLogger } from '@/observability/logger.js';
-import { buildApp } from '@/api/app.js';
-import { ApiKeyAuthenticator } from '@/auth/api-key-authenticator.js';
-import { DrizzleApiKeyStore } from '@/auth/api-key-store.js';
-import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
-import { ConnectionRepository } from '@/repositories/connection-repository.js';
-import { PostgresJobQueue } from '@/repositories/job-queue.js';
-import { RunInspectionRepository } from '@/repositories/run-inspection-repository.js';
-import { TenantScope } from '@/repositories/tenant-scope.js';
-import { WebhookRepository } from '@/repositories/webhook-repository.js';
-import { WorkflowRepository } from '@/repositories/workflow-repository.js';
-import { createCredentialCipher } from '@/security/credential-cipher.js';
+import { loadEnv } from "@/config/env.js";
+import { createDatabase } from "@/db/client.js";
+import { createLogger } from "@/observability/logger.js";
+import { buildApp } from "@/api/app.js";
+import { ApiKeyAuthenticator } from "@/auth/api-key-authenticator.js";
+import { DrizzleApiKeyStore } from "@/auth/api-key-store.js";
+import { ApiKeyRepository } from "@/repositories/api-key-repository.js";
+import { ConnectionRepository } from "@/repositories/connection-repository.js";
+import { PostgresJobQueue } from "@/repositories/job-queue.js";
+import { RunInspectionRepository } from "@/repositories/run-inspection-repository.js";
+import { TenantScope } from "@/repositories/tenant-scope.js";
+import { WebhookRepository } from "@/repositories/webhook-repository.js";
+import { WorkflowRepository } from "@/repositories/workflow-repository.js";
+import { createCredentialCipher } from "@/security/credential-cipher.js";
 
 /** Time allowed for in-flight requests to drain before we stop waiting. */
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 const env = loadEnv();
-const logger = createLogger(env, { service: 'api' });
+const logger = createLogger(env, { service: "api" });
 
-const database = createDatabase(env, logger, { service: 'api' });
+const database = createDatabase(env, logger, { service: "api" });
 const cipher = createCredentialCipher(env);
 
 // The producer side of the queue. Enqueuing the first job is unscoped here (the
@@ -44,9 +44,15 @@ const app = await buildApp({
   checkDatabase: () => database.ping(),
   // One tenant-scoped service per authenticated request — the repository is
   // pinned to that tenant and cannot reach across tenants.
-  apiKeyServiceFor: (auth) => new ApiKeyRepository(new TenantScope(database.db, auth.tenantId)),
-  workflowServiceFor: (auth) => new WorkflowRepository(new TenantScope(database.db, auth.tenantId)),
-  connectionServiceFor: (auth) => new ConnectionRepository(new TenantScope(database.db, auth.tenantId), cipher),
+  apiKeyServiceFor: (auth) =>
+    new ApiKeyRepository(new TenantScope(database.db, auth.tenantId)),
+  workflowServiceFor: (auth) =>
+    new WorkflowRepository(new TenantScope(database.db, auth.tenantId)),
+  connectionServiceFor: (auth) =>
+    new ConnectionRepository(
+      new TenantScope(database.db, auth.tenantId),
+      cipher,
+    ),
   webhookIngestorFor: (auth) =>
     new WebhookRepository(new TenantScope(database.db, auth.tenantId), queue),
   // Read-only, tenant-scoped run inspection. Same repository (and therefore the
@@ -61,10 +67,13 @@ async function shutdown(reason: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  logger.info({ reason }, 'api shutting down');
+  logger.info({ reason }, "api shutting down");
 
   const timeout = setTimeout(() => {
-    logger.error({ timeout_ms: SHUTDOWN_TIMEOUT_MS }, 'api shutdown timed out; forcing exit');
+    logger.error(
+      { timeout_ms: SHUTDOWN_TIMEOUT_MS },
+      "api shutdown timed out; forcing exit",
+    );
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
   timeout.unref();
@@ -75,28 +84,28 @@ async function shutdown(reason: string): Promise<void> {
     // connection would turn a clean shutdown into a burst of 500s.
     await app.close();
     await database.close();
-    logger.info('api stopped cleanly');
+    logger.info("api stopped cleanly");
   } catch (error) {
-    logger.error({ err: error }, 'api shutdown failed');
+    logger.error({ err: error }, "api shutdown failed");
     process.exitCode = 1;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-process.on('SIGTERM', () => void shutdown('SIGTERM'));
-process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
-process.on('unhandledRejection', (reason) => {
-  logger.fatal({ err: reason }, 'unhandled promise rejection');
+process.on("unhandledRejection", (reason) => {
+  logger.fatal({ err: reason }, "unhandled promise rejection");
   process.exitCode = 1;
-  void shutdown('unhandledRejection');
+  void shutdown("unhandledRejection");
 });
 
-process.on('uncaughtException', (error) => {
-  logger.fatal({ err: error }, 'uncaught exception');
+process.on("uncaughtException", (error) => {
+  logger.fatal({ err: error }, "uncaught exception");
   process.exitCode = 1;
-  void shutdown('uncaughtException');
+  void shutdown("uncaughtException");
 });
 
 try {
@@ -108,10 +117,10 @@ try {
   await app.listen({ host: env.HOST, port: env.PORT });
   logger.info(
     { host: env.HOST, port: env.PORT, node_env: env.NODE_ENV },
-    'api listening',
+    "api listening",
   );
 } catch (error) {
-  logger.fatal({ err: error }, 'api failed to start');
+  logger.fatal({ err: error }, "api failed to start");
   await database.close().catch(() => undefined);
   process.exit(1);
 }

@@ -151,16 +151,16 @@ async function makeApp(): Promise<Harness> {
     apiKeyServiceFor: backend.serviceFor,
     workflowServiceFor: () => ({
       create: async () => {
-        throw new Error('not used');
+        throw new Error("not used");
       },
       createVersion: async () => {
-        throw new Error('not used');
+        throw new Error("not used");
       },
       activateVersion: async () => {
-        throw new Error('not used');
+        throw new Error("not used");
       },
       getWorkflow: async () => {
-        throw new Error('not used');
+        throw new Error("not used");
       },
       listVersions: async () => [],
       getActiveVersion: async () => null,
@@ -168,7 +168,7 @@ async function makeApp(): Promise<Harness> {
     }),
     connectionServiceFor: () => ({
       create: async () => {
-        throw new Error('not used');
+        throw new Error("not used");
       },
       listMetadata: async () => [],
       listMetadataPage: async () => ({ items: [], nextCursor: null }),
@@ -177,7 +177,7 @@ async function makeApp(): Promise<Harness> {
       disable: async () => null,
       delete: async () => false,
       resolveForTool: async () => {
-        throw new Error('not used');
+        throw new Error("not used");
       },
     }),
     // Not exercised here; the webhook route has its own suite. A no-op ingestor

@@ -8,13 +8,13 @@
  * body or query string.
  */
 
-import { z } from 'zod';
+import { z } from "zod";
 
-import { requireAuth } from '@/api/auth-hook.js';
-import { BadRequestError } from '@/api/errors.js';
-import type { ApiServer } from '@/api/types.js';
-import type { AuthContext } from '@/auth/context.js';
-import type { WorkflowListReader } from '@/repositories/workflow-repository.js';
+import { requireAuth } from "@/api/auth-hook.js";
+import { BadRequestError } from "@/api/errors.js";
+import type { ApiServer } from "@/api/types.js";
+import type { AuthContext } from "@/auth/context.js";
+import type { WorkflowListReader } from "@/repositories/workflow-repository.js";
 
 export type WorkflowServiceFactory = (auth: AuthContext) => WorkflowListReader;
 
@@ -26,16 +26,24 @@ const workflowListQuery = z.object({
 function parseQuery(query: unknown) {
   const parsed = workflowListQuery.safeParse(query);
   if (!parsed.success) {
-    throw new BadRequestError(parsed.error.issues[0]?.message ?? 'Invalid query');
+    throw new BadRequestError(
+      parsed.error.issues[0]?.message ?? "Invalid query",
+    );
   }
   return parsed.data;
 }
 
-export function registerWorkflowRoutes(app: ApiServer, workflowFor: WorkflowServiceFactory): void {
-  app.get('/v1/workflows', async (request, reply) => {
+export function registerWorkflowRoutes(
+  app: ApiServer,
+  workflowFor: WorkflowServiceFactory,
+): void {
+  app.get("/v1/workflows", async (request, reply) => {
     const auth = requireAuth(request);
     const query = parseQuery(request.query);
-    const page = await workflowFor(auth).listWorkflows(query.limit, query.cursor);
+    const page = await workflowFor(auth).listWorkflows(
+      query.limit,
+      query.cursor,
+    );
 
     return reply.code(200).send({
       items: page.items,

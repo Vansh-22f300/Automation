@@ -24,17 +24,20 @@
  * raises `NotFoundError`, indistinguishable from a genuinely absent row.
  */
 
-import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, lt, or, sql } from "drizzle-orm";
 
-import { BadRequestError } from '@/api/errors.js';
-import { NotFoundError } from '@/api/errors.js';
-import { PermanentError } from '@/domain/errors.js';
-import { parseWorkflowDefinition } from '@/domain/workflow-definition.js';
-import { parseTriggerConfig } from '@/domain/workflow-trigger.js';
-import type { TriggerType } from '@/domain/workflow-trigger.js';
-import { workflowVersions, workflows } from '@/db/schema.js';
-import type { Workflow, WorkflowVersion } from '@/db/schema.js';
-import { TenantScope, TenantScopedRepository } from '@/repositories/tenant-scope.js';
+import { BadRequestError } from "@/api/errors.js";
+import { NotFoundError } from "@/api/errors.js";
+import { PermanentError } from "@/domain/errors.js";
+import { parseWorkflowDefinition } from "@/domain/workflow-definition.js";
+import { parseTriggerConfig } from "@/domain/workflow-trigger.js";
+import type { TriggerType } from "@/domain/workflow-trigger.js";
+import { workflowVersions, workflows } from "@/db/schema.js";
+import type { Workflow, WorkflowVersion } from "@/db/schema.js";
+import {
+  TenantScope,
+  TenantScopedRepository,
+} from "@/repositories/tenant-scope.js";
 
 export interface WorkflowListItem {
   readonly id: string;
@@ -84,24 +87,38 @@ function validateDefinitionAndTrigger(input: {
   definition: unknown;
   triggerType: TriggerType;
   triggerConfig: unknown;
-}): { definition: Record<string, unknown>; triggerConfig: Record<string, unknown> } {
+}): {
+  definition: Record<string, unknown>;
+  triggerConfig: Record<string, unknown>;
+} {
   let definition: Record<string, unknown>;
   try {
-    definition = parseWorkflowDefinition(input.definition) as Record<string, unknown>;
-  } catch (cause) {
-    throw new PermanentError('invalid_definition', 'Workflow definition is invalid', { cause });
-  }
-
-  let triggerConfig: Record<string, unknown>;
-  try {
-    triggerConfig = parseTriggerConfig(input.triggerType, input.triggerConfig) as Record<
+    definition = parseWorkflowDefinition(input.definition) as Record<
       string,
       unknown
     >;
   } catch (cause) {
-    throw new PermanentError('invalid_trigger_config', 'Trigger configuration is invalid', {
-      cause,
-    });
+    throw new PermanentError(
+      "invalid_definition",
+      "Workflow definition is invalid",
+      { cause },
+    );
+  }
+
+  let triggerConfig: Record<string, unknown>;
+  try {
+    triggerConfig = parseTriggerConfig(
+      input.triggerType,
+      input.triggerConfig,
+    ) as Record<string, unknown>;
+  } catch (cause) {
+    throw new PermanentError(
+      "invalid_trigger_config",
+      "Trigger configuration is invalid",
+      {
+        cause,
+      },
+    );
   }
 
   return { definition, triggerConfig };
@@ -119,30 +136,44 @@ export interface CreatedWorkflow {
  * Construct one per authenticated context from a `TenantScope`; every method is
  * intrinsically pinned to that tenant. There is deliberately no unscoped variant.
  */
-export class WorkflowRepository extends TenantScopedRepository implements WorkflowListReader {
+export class WorkflowRepository
+  extends TenantScopedRepository
+  implements WorkflowListReader
+{
   constructor(scope: TenantScope) {
     super(scope);
   }
 
-  private static encodeCursor(cursor: { readonly createdAt: string; readonly id: string }): string {
-    return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+  private static encodeCursor(cursor: {
+    readonly createdAt: string;
+    readonly id: string;
+  }): string {
+    return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
   }
 
-  private static decodeCursor(cursor: string): { createdAt: string; id: string } {
+  private static decodeCursor(cursor: string): {
+    createdAt: string;
+    id: string;
+  } {
     try {
-      const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+      const parsed = JSON.parse(
+        Buffer.from(cursor, "base64url").toString("utf8"),
+      ) as {
         createdAt?: unknown;
         id?: unknown;
       };
-      if (typeof parsed.createdAt !== 'string' || typeof parsed.id !== 'string') {
-        throw new Error('invalid cursor');
+      if (
+        typeof parsed.createdAt !== "string" ||
+        typeof parsed.id !== "string"
+      ) {
+        throw new Error("invalid cursor");
       }
       if (Number.isNaN(new Date(parsed.createdAt).getTime())) {
-        throw new Error('invalid cursor');
+        throw new Error("invalid cursor");
       }
       return { createdAt: parsed.createdAt, id: parsed.id };
     } catch {
-      throw new BadRequestError('Cursor is invalid');
+      throw new BadRequestError("Cursor is invalid");
     }
   }
 
@@ -197,7 +228,10 @@ export class WorkflowRepository extends TenantScopedRepository implements Workfl
    * Throws `NotFoundError` if the workflow is not this tenant's — the same answer
    * as a genuinely absent workflow, so another tenant's ids are never revealed.
    */
-  async createVersion(workflowId: string, input: CreateVersionInput): Promise<WorkflowVersion> {
+  async createVersion(
+    workflowId: string,
+    input: CreateVersionInput,
+  ): Promise<WorkflowVersion> {
     const { definition, triggerConfig } = validateDefinitionAndTrigger(input);
     const activate = input.activate ?? false;
 
@@ -207,11 +241,16 @@ export class WorkflowRepository extends TenantScopedRepository implements Workfl
       const locked = await tx
         .select({ id: workflows.id })
         .from(workflows)
-        .where(and(eq(workflows.id, workflowId), eq(workflows.tenantId, this.tenantId)))
-        .for('update');
+        .where(
+          and(
+            eq(workflows.id, workflowId),
+            eq(workflows.tenantId, this.tenantId),
+          ),
+        )
+        .for("update");
 
       if (locked.length === 0) {
-        throw new NotFoundError('Workflow not found');
+        throw new NotFoundError("Workflow not found");
       }
 
       const [current] = await tx
@@ -268,11 +307,16 @@ export class WorkflowRepository extends TenantScopedRepository implements Workfl
       const locked = await tx
         .select({ id: workflows.id })
         .from(workflows)
-        .where(and(eq(workflows.id, workflowId), eq(workflows.tenantId, this.tenantId)))
-        .for('update');
+        .where(
+          and(
+            eq(workflows.id, workflowId),
+            eq(workflows.tenantId, this.tenantId),
+          ),
+        )
+        .for("update");
 
       if (locked.length === 0) {
-        throw new NotFoundError('Workflow not found');
+        throw new NotFoundError("Workflow not found");
       }
 
       const [target] = await tx
@@ -287,7 +331,7 @@ export class WorkflowRepository extends TenantScopedRepository implements Workfl
         );
 
       if (!target) {
-        throw new NotFoundError('Workflow version not found');
+        throw new NotFoundError("Workflow version not found");
       }
 
       await tx
@@ -318,10 +362,12 @@ export class WorkflowRepository extends TenantScopedRepository implements Workfl
     const [workflow] = await this.db
       .select()
       .from(workflows)
-      .where(this.scope.where(workflows.tenantId, eq(workflows.id, workflowId)));
+      .where(
+        this.scope.where(workflows.tenantId, eq(workflows.id, workflowId)),
+      );
 
     if (!workflow) {
-      throw new NotFoundError('Workflow not found');
+      throw new NotFoundError("Workflow not found");
     }
     return workflow;
   }
@@ -331,7 +377,12 @@ export class WorkflowRepository extends TenantScopedRepository implements Workfl
     return this.db
       .select()
       .from(workflowVersions)
-      .where(this.scope.where(workflowVersions.tenantId, eq(workflowVersions.workflowId, workflowId)))
+      .where(
+        this.scope.where(
+          workflowVersions.tenantId,
+          eq(workflowVersions.workflowId, workflowId),
+        ),
+      )
       .orderBy(sql`${workflowVersions.version} desc`);
   }
 
@@ -353,7 +404,8 @@ export class WorkflowRepository extends TenantScopedRepository implements Workfl
 
   async listWorkflows(limit = 20, cursor?: string): Promise<WorkflowListPage> {
     const pageLimit = Math.max(1, Math.min(limit, 100));
-    const parsedCursor = cursor === undefined ? null : WorkflowRepository.decodeCursor(cursor);
+    const parsedCursor =
+      cursor === undefined ? null : WorkflowRepository.decodeCursor(cursor);
     const cursorClause =
       parsedCursor === null
         ? undefined
