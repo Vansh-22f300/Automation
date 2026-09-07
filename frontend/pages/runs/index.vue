@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ListFilter, Search } from "@lucide/vue";
+import { ListFilter } from "@lucide/vue";
 import { computed, ref } from "vue";
 
 import { formatDate } from "~/lib/format";
@@ -57,23 +57,8 @@ async function loadPrevious(): Promise<void> {
   <div>
     <PageHeader
       title="Runs"
-      description="Execution history across workflows for the current tenant."
+      description="Execution history across all workflows."
     />
-
-    <section class="panel panel-emphasis">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">Run inspection</p>
-          <h2>Open a specific run</h2>
-        </div>
-        <Search :size="20" aria-hidden="true" />
-      </div>
-      <p class="panel-copy">
-        Paste a run ID to load execution details, step outcomes, queue jobs,
-        usage totals, and safe error metadata.
-      </p>
-      <RunLookup />
-    </section>
 
     <section class="panel table-shell">
       <div class="panel-heading">
@@ -164,7 +149,6 @@ async function loadPrevious(): Promise<void> {
       </div>
 
       <div v-if="items.length > 0" class="pagination-row">
-        <p class="inline-note">Page size {{ pageLimit }}</p>
         <div class="page-toolbar">
           <button
             class="button button-secondary"
@@ -184,6 +168,19 @@ async function loadPrevious(): Promise<void> {
           </button>
         </div>
       </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Run lookup</p>
+          <h2>Open a specific run</h2>
+        </div>
+      </div>
+      <p class="panel-copy">
+        Enter a run ID to view its execution details.
+      </p>
+      <RunLookup />
     </section>
   </div>
 </template>

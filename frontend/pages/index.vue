@@ -46,7 +46,7 @@ const runCountLabel = computed(() => {
   <div class="dashboard-hero">
     <PageHeader
       title="Operations overview"
-      description="Live tenant-scoped workflow, run, and connection visibility from the Fastify API."
+      description="Live workflow, run, and connection visibility."
     />
 
     <section class="dashboard-top" aria-label="Workspace summary">
@@ -183,8 +183,7 @@ const runCountLabel = computed(() => {
           </div>
         </div>
         <p class="panel-copy">
-          Paste a run id to load detailed step, job, usage, and trigger context
-          data.
+          Paste a run id to load detailed step, job, usage, and trigger details.
         </p>
         <RunLookup />
       </article>

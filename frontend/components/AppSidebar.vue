@@ -24,7 +24,7 @@ const navigation = [
         <span>Operations workspace</span>
       </span>
     </NuxtLink>
-    <p class="sidebar-kicker">Tenant-scoped automation control</p>
+    <p class="sidebar-kicker">Operations workspace</p>
     <nav class="sidebar-nav" aria-label="Primary navigation">
       <NuxtLink
         v-for="item in navigation"

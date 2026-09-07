@@ -202,8 +202,8 @@ button:focus:not(:focus-visible) { outline: none; }
   margin: calc(var(--sp-4) * -1 + var(--sp-2)) var(--sp-2) 0;
   color: var(--text-muted);
   font-size: var(--fs-meta);
+  font-weight: var(--fw-medium);
   letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
 }
 .sidebar-nav { display: grid; gap: 2px; }
 .nav-link {
@@ -449,7 +449,7 @@ button:focus:not(:focus-visible) { outline: none; }
   font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
 }
-.lookup-hint { margin: 0 0 var(--sp-3); color: var(--text-muted); font-size: var(--fs-sm); }
+.lookup-hint { margin: 0 0 var(--sp-3); color: var(--text-secondary); font-size: var(--fs-sm); }
 .lookup-control {
   display: flex;
   align-items: center;
@@ -477,20 +477,21 @@ button:focus:not(:focus-visible) { outline: none; }
   font-size: var(--fs-sm);
 }
 .lookup-control input::placeholder { color: var(--text-muted); }
-.icon-button {
+.icon-button-secondary {
   display: grid;
   width: var(--control-h);
   align-self: stretch;
   place-items: center;
   border: 0;
-  background: var(--brand);
-  color: #fff;
-  transition: background-color 0.12s ease;
+  border-left: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-secondary);
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
-.icon-button:hover { background: var(--brand-hover); }
+.icon-button-secondary:hover { background: var(--surface-sunken); color: var(--text); }
 
 .run-lookup { width: 100%; }
-.run-lookup label { display: block; }
+.run-lookup label { display: block; margin-bottom: var(--sp-2); color: var(--text-secondary); font-size: var(--fs-sm); font-weight: var(--fw-medium); }
 
 /* Filters / toolbars -------------------------------------------------------- */
 .table-shell { display: grid; gap: var(--sp-4); }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowRight, Search } from "@lucide/vue";
+import { ArrowRight } from "@lucide/vue";
 import { ref } from "vue";
 
 const runId = ref("");
@@ -13,21 +13,17 @@ async function openRun(): Promise<void> {
 
 <template>
   <form class="run-lookup" @submit.prevent="openRun">
-    <label for="run-id">Open run details</label>
-    <p class="lookup-hint">
-      Paste any run id to jump straight into the inspection view.
-    </p>
+    <label for="run-id">Run ID</label>
     <div class="lookup-control">
-      <Search :size="17" aria-hidden="true" />
       <input
         id="run-id"
         v-model="runId"
         required
-        placeholder="Paste a run ID"
+        placeholder="e.g. 01993a8b-..."
         autocomplete="off"
       />
       <button
-        class="icon-button"
+        class="icon-button-secondary"
         type="submit"
         aria-label="Open run details"
         title="Open run details"
