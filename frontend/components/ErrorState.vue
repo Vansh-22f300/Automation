@@ -7,7 +7,7 @@ defineEmits<{ retry: [] }>();
 
 <template>
   <div class="state-panel state-error" role="alert">
-    <AlertCircle :size="24" aria-hidden="true" />
+    <AlertCircle :size="20" aria-hidden="true" />
     <div>
       <h2>Couldn’t load this view</h2>
       <p>{{ message }}</p>

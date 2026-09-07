@@ -98,7 +98,10 @@ const { data: inspection, error, pending, refresh } = useResource(() => api.getR
           <div class="panel-heading"><div><p class="eyebrow">Tool activity</p><h2>LLM tools</h2></div><Wrench :size="20" /></div>
           <EmptyState v-if="inspection.tools.length === 0" title="No tool activity" description="No LLM step has used an external tool in this run." />
           <div v-else class="activity-list">
-            <div v-for="tool in inspection.tools" :key="tool.stepKey" class="activity-row"><div><strong>{{ tool.stepKey }}</strong><p>{{ tool.rounds }} model rounds</p></div><StatusBadge :status="tool.usedTools ? `${tool.toolRounds} tool rounds` : 'No tools'" /></div>
+            <div v-for="tool in inspection.tools" :key="tool.stepKey" class="activity-row">
+              <div><strong>{{ tool.stepKey }}</strong><p>{{ tool.rounds }} model rounds</p></div>
+              <span class="activity-meta">{{ tool.usedTools ? `${tool.toolRounds} tool rounds` : "No tools" }}</span>
+            </div>
           </div>
         </article>
       </section>

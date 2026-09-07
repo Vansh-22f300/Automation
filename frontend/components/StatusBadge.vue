@@ -3,16 +3,13 @@ import { computed } from "vue";
 
 const props = defineProps<{ status: string }>();
 
-const normalized = computed(() => props.status.toLowerCase());
+const normalized = computed(() => props.status.toLowerCase().trim());
 const tone = computed(() => {
-  if (["succeeded", "active", "done", "healthy"].includes(normalized.value))
-    return "success";
-  if (["failed", "error"].includes(normalized.value)) return "danger";
-  if (["running", "waiting", "queued"].includes(normalized.value))
-    return "info";
-  if (["disabled", "draft", "cancelled"].includes(normalized.value))
-    return "neutral";
-  return "neutral";
+  if (["succeeded", "success", "active", "done", "completed", "healthy", "ok"].includes(normalized.value)) return "success";
+  if (["failed", "error", "dead"].includes(normalized.value)) return "danger";
+  if (["running", "in_progress", "processing"].includes(normalized.value)) return "info";
+  if (["waiting", "queued", "pending", "retrying"].includes(normalized.value)) return "warning";
+  return "neutral"; // cancelled, draft, disabled, paused, and anything unrecognized
 });
 </script>
 
