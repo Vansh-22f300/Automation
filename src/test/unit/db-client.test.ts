@@ -12,7 +12,11 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseEnv } from '@/config/env.js';
-import { createDatabase, describeDatabaseUrl } from '@/db/client.js';
+import {
+  createDatabase,
+  DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+  describeDatabaseUrl,
+} from '@/db/client.js';
 import type { DatabaseHandle } from '@/db/client.js';
 import { RetryableError, isRetryable } from '@/domain/errors.js';
 import { createLogger } from '@/observability/logger.js';
@@ -118,6 +122,41 @@ describe('createDatabase', () => {
 
     await expect(handle.close()).resolves.toBeUndefined();
     await expect(handle.close()).resolves.toBeUndefined();
+  });
+
+  it('configures idle_in_transaction_session_timeout as a bounded session guard', () => {
+    const handle = open({ DATABASE_URL: UNREACHABLE_URL });
+
+    // Centralized, not scattered magic — and bounded (30s) so legitimate short
+    // transactions (beginStep/settleStep) are never at risk, but a stuck
+    // transaction holding locks is reclaimed.
+    expect(DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS).toBe(30_000);
+    expect(DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000);
+    expect(DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS).toBeLessThanOrEqual(300_000);
+
+    // The pool is the single place the value is applied; it is sent as a
+    // startup parameter (`idle_in_transaction_session_timeout`) and therefore
+    // covers every session/transaction the pool creates, without per-query
+    // scattering.
+    const opts = handle.pool.options as unknown as Record<string, unknown>;
+    expect(opts.idle_in_transaction_session_timeout).toBe(30_000);
+    // Existing statement timeout is preserved — we protect idle, not long queries.
+    expect(opts.statement_timeout).toBe(30_000);
+  });
+
+  it('keeps idle_in_transaction timeout deterministic across services', () => {
+    const api = createDatabase(parseEnv({ DATABASE_URL: UNREACHABLE_URL }), silentLogger, {
+      service: 'api',
+    });
+    const worker = createDatabase(parseEnv({ DATABASE_URL: UNREACHABLE_URL }), silentLogger, {
+      service: 'worker',
+    });
+    opened.push(api, worker);
+
+    const apiOpts = api.pool.options as unknown as Record<string, unknown>;
+    const workerOpts = worker.pool.options as unknown as Record<string, unknown>;
+    expect(apiOpts.idle_in_transaction_session_timeout).toBe(workerOpts.idle_in_transaction_session_timeout);
+    expect(apiOpts.idle_in_transaction_session_timeout).toBe(DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS);
   });
 });
 
