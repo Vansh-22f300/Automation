@@ -231,6 +231,12 @@ describe("GET /healthz", () => {
     const res = await current.app.inject({ method: "GET", url: "/healthz" });
 
     expect(res.statusCode).toBe(200);
+    expect(res.headers).toMatchObject({
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "permissions-policy": "geolocation=(), microphone=(), camera=()",
+    });
     expect(res.json()).toEqual({
       status: "ok",
       checks: { process: "ok", database: "ok" },
@@ -279,6 +285,12 @@ describe("authentication failures", () => {
     });
 
     expect(res.statusCode).toBe(401);
+    expect(res.headers).toMatchObject({
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "permissions-policy": "geolocation=(), microphone=(), camera=()",
+    });
     expect(res.json()).toEqual({
       error: {
         code: "unauthorized",
