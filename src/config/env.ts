@@ -245,6 +245,52 @@ const trustProxySchema = z
   })
   .pipe(z.union([z.boolean(), z.string().min(1)]));
 
+/**
+ * Extract a normalized Postgres target (host, port, database) from a connection
+ * string for semantic comparison. Reuses the same `URL` parsing as `postgresUrl`
+ * and `describeDatabaseUrl` so formatting differences (user, password, query
+ * string like `?sslmode=require`) do not bypass isolation checks. Returns null
+ * if the string cannot be parsed.
+ */
+function postgresIdentity(raw: string): { host: string; port: string; database: string } | null {
+  try {
+    const url = new URL(raw);
+    let host = url.hostname.toLowerCase();
+    // `URL.hostname` keeps brackets for IPv6 literals (e.g. "[::1]") and may
+    // normalize IPv4-mapped addresses (127.0.0.1 → 7f00:1). Strip brackets for
+    // semantic comparison so different URL forms of the same target match.
+    if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+    const port = url.port === '' ? '5432' : url.port;
+    const rawDb = url.pathname.replace(/^\//, '').split('/')[0] ?? '';
+    let database: string;
+    try {
+      database = decodeURIComponent(rawDb);
+    } catch {
+      database = rawDb;
+    }
+    return { host, port, database };
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackHost(host: string): boolean {
+  let lower = host.toLowerCase();
+  if (lower.startsWith('[') && lower.endsWith(']')) lower = lower.slice(1, -1);
+  // Covers the common localhost forms without overengineering the full 127/8 range.
+  // Handles both the dotted IPv4-mapped form and the hex-normalized form that
+  // `URL` produces (127.0.0.1 → 7f00:1, so ::ffff:127.0.0.1 → ::ffff:7f00:1).
+  return (
+    lower === 'localhost' ||
+    lower === '127.0.0.1' ||
+    lower === '::1' ||
+    lower === '::ffff:127.0.0.1' ||
+    lower === '::ffff:7f00:1' ||
+    lower === '0:0:0:0:0:ffff:127.0.0.1' ||
+    lower === '0:0:0:0:0:ffff:7f00:1'
+  );
+}
+
 const envSchema = z
   .object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -261,6 +307,14 @@ const envSchema = z
    * the URL itself (`?sslmode=require`), not a separate variable.
    */
   DATABASE_URL: postgresUrl,
+
+  /**
+   * Test database URL used only by the integration suites. Never used at runtime
+   * by the API or worker. Optional so the app boots without it, but when present
+   * it must be a valid PostgreSQL URL — and it must not resolve to the same
+   * database as `DATABASE_URL`, otherwise destructive tests could target production.
+   */
+  TEST_DATABASE_URL: postgresUrl.optional(),
 
   /**
    * Maximum pooled connections *per process*. Two processes run (api, worker),
@@ -337,6 +391,106 @@ const envSchema = z
         path: ['ANTHROPIC_AUTH_TOKEN'],
         message:
           'set either ANTHROPIC_API_KEY (direct Anthropic, x-api-key) or ANTHROPIC_AUTH_TOKEN (gateway bearer), not both',
+      });
+    }
+
+    // Invariant 3a: a gateway base URL without any credential is never valid.
+    // The provider (createClaudeProvider) would throw llm_missing_api_key at the
+    // first LLM call; failing at env validation gives a clearer, earlier error.
+    if (
+      env.ANTHROPIC_BASE_URL !== undefined &&
+      env.ANTHROPIC_API_KEY === undefined &&
+      env.ANTHROPIC_AUTH_TOKEN === undefined
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['ANTHROPIC_BASE_URL'],
+        message:
+          'ANTHROPIC_BASE_URL is set but no credential is set — set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN',
+      });
+    }
+
+    // Invariant 3b: in production a gateway must be reached over TLS.
+    if (env.NODE_ENV === 'production' && env.ANTHROPIC_BASE_URL !== undefined) {
+      try {
+        const url = new URL(env.ANTHROPIC_BASE_URL);
+        if (url.protocol !== 'https:') {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['ANTHROPIC_BASE_URL'],
+            message: 'must use https:// in production',
+          });
+        }
+      } catch {
+        // Leave to the base schema's URL error; no additional issue needed.
+      }
+    }
+
+    // Invariant 1: production must not point at a development/test database.
+    // Hostname checks use URL.hostname normalization (lowercased, brackets stripped)
+    // and database checks decode the pathname then look for \"test\" case-insensitively.
+    if (env.NODE_ENV === 'production') {
+      const identity = postgresIdentity(env.DATABASE_URL);
+      if (identity !== null) {
+        if (isLoopbackHost(identity.host)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['DATABASE_URL'],
+            message: 'must not point to localhost in production — use a hosted PostgreSQL URL',
+          });
+        }
+        if (identity.database.toLowerCase().includes('test')) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['DATABASE_URL'],
+            message: 'must not use a test database in production (database name must not contain \"test\")',
+          });
+        }
+      }
+    }
+
+    // Invariant 2: the test database must not resolve to the same database as
+    // the runtime database. Semantic comparison reuses URL parsing (host/port/database)
+    // so harmless formatting differences (different user, password, query string,
+    // trailing slash) cannot bypass the check.
+    if (env.DATABASE_URL !== undefined && env.TEST_DATABASE_URL !== undefined) {
+      const main = postgresIdentity(env.DATABASE_URL);
+      const test = postgresIdentity(env.TEST_DATABASE_URL);
+      if (main !== null && test !== null) {
+        if (
+          main.host === test.host &&
+          main.port === test.port &&
+          main.database.toLowerCase() === test.database.toLowerCase()
+        ) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['TEST_DATABASE_URL'],
+            message:
+              'must not resolve to the same database as DATABASE_URL — use a separate test database (host, port and database must differ; query strings are ignored)',
+          });
+        }
+      } else if (env.DATABASE_URL === env.TEST_DATABASE_URL) {
+        // Fallback for unparsable URLs that already failed base validation;
+        // ensures raw equality is still caught without duplicating secret values.
+        ctx.addIssue({
+          code: 'custom',
+          path: ['TEST_DATABASE_URL'],
+          message:
+            'must not be the same as DATABASE_URL — use a separate test database',
+        });
+      }
+    }
+
+    // Invariant 4: production must bind a non-loopback address.
+    // The dev default 127.0.0.1 would start yet be unreachable on a PaaS/container,
+    // looking healthy to a supervisor. Force an explicit HOST. Reuse the same
+    // loopback check as DATABASE_URL so bracketed and hex-normalized forms are covered.
+    if (env.NODE_ENV === 'production' && isLoopbackHost(env.HOST)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['HOST'],
+        message:
+          'must not be 127.0.0.1 in production — set HOST=0.0.0.0 for containers/PaaS (or another non-loopback address)',
       });
     }
   });
