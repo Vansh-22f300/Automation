@@ -14,6 +14,7 @@
  *   testable as the system grows.
  */
 
+import { isIP } from 'node:net';
 import { z } from 'zod';
 
 import { DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS } from '@/domain/timing.js';
@@ -145,6 +146,105 @@ const credentialEncryptionKey = z
     });
   });
 
+/**
+ * Trusted proxy configuration for Fastify's `trustProxy` option.
+ *
+ * Controls whether `request.ip` (and thus the rate limiter's key) is derived
+ * from `X-Forwarded-For` headers. The value is deliberately explicit and
+ * defaults to `false` so local development is safe by default:
+ *
+ * - `false` / `0` / unset → do not trust forwarding headers; `request.ip` is
+ *   always the socket's remote address. A forged `X-Forwarded-For` cannot
+ *   change the rate-limit bucket.
+ * - `true` / `1` → trust `X-Forwarded-For` (Fastify `trustProxy: true`).
+ *   Enable **only** when the API is deployed behind a trusted reverse
+ *   proxy/PaaS that is the sole ingress and that correctly appends the real
+ *   client IP. In that deployment the limiter keys by the forwarded client IP
+ *   rather than the proxy's IP.
+ * - A comma-separated list of trusted proxy addresses, CIDR ranges, or the
+ *   predefined names `loopback`, `linklocal`, `uniquelocal` (as understood by
+ *   `@fastify/proxy-addr`) is also accepted and passed directly to Fastify
+ *   for more precise control (e.g. `TRUST_PROXY=loopback` or
+ *   `TRUST_PROXY=10.0.0.0/8,172.16.0.0/12`). This lets the deployment
+ *   explicitly name the proxy rather than trusting all hops.
+ *
+ * The validation below rejects obvious nonsense (empty value, unknown token)
+ * with a clear message without echoing the raw value when it might be sensitive,
+ * but intentionally stays permissive for CIDR/IP syntax — the underlying
+ * `@fastify/proxy-addr` will throw at boot if the compiled trust is invalid,
+ * which is fail-fast enough for deployment.
+ */
+const trustProxySchema = z
+  .string()
+  .default('false')
+  .superRefine((value, ctx) => {
+    const trimmed = value.trim();
+    if (trimmed === '') {
+      ctx.addIssue({ code: 'custom', message: 'must not be empty' });
+      return;
+    }
+    const lower = trimmed.toLowerCase();
+    if (lower === 'true' || lower === 'false' || trimmed === '0' || trimmed === '1') return;
+
+    // Comma-separated list: each token must be a known range or an IP/CIDR.
+    const parts = trimmed
+      .split(',')
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+    if (parts.length === 0) {
+      ctx.addIssue({ code: 'custom', message: 'must be true, false, 1, 0 or a comma-separated list of IPs/CIDRs/ranges' });
+      return;
+    }
+    for (const part of parts) {
+      const lowerPart = part.toLowerCase();
+      if (lowerPart === 'loopback' || lowerPart === 'linklocal' || lowerPart === 'uniquelocal') continue;
+      const slashIdx = part.indexOf('/');
+      if (slashIdx !== -1) {
+        const ipPart = part.slice(0, slashIdx);
+        const prefixPart = part.slice(slashIdx + 1);
+        if (isIP(ipPart) === 0) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `"${part}" is not a valid IP/CIDR — expected like 10.0.0.0/8 or loopback`,
+          });
+          return;
+        }
+        const prefixNum = Number(prefixPart);
+        if (!Number.isInteger(prefixNum)) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `"${part}" has a non-integer CIDR prefix`,
+          });
+          return;
+        }
+        const max = isIP(ipPart) === 6 ? 128 : 32;
+        if (prefixNum < 0 || prefixNum > max) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `"${part}" has an out-of-range CIDR prefix (0–${max})`,
+          });
+          return;
+        }
+      } else {
+        if (isIP(part) === 0) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `"${part}" is not a valid IP, CIDR, or known range (loopback/linklocal/uniquelocal)`,
+          });
+          return;
+        }
+      }
+    }
+  })
+  .transform((value) => {
+    const trimmed = value.trim();
+    const lower = trimmed.toLowerCase();
+    if (lower === 'false' || trimmed === '0') return false as const;
+    if (lower === 'true' || trimmed === '1') return true as const;
+    return trimmed;
+  })
+  .pipe(z.union([z.boolean(), z.string().min(1)]));
+
 const envSchema = z
   .object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -218,6 +318,14 @@ const envSchema = z
    * to encrypt/decrypt fail clearly when it is missing. Never logged or persisted.
    */
   CREDENTIAL_ENCRYPTION_KEY: credentialEncryptionKey.optional(),
+
+  /**
+   * Trusted proxy configuration for Fastify `trustProxy`.
+   *
+   * See `trustProxySchema` above for the allowed values and security notes.
+   * Defaults to `false` so local/dev is safe without any extra config.
+   */
+  TRUST_PROXY: trustProxySchema,
   })
   .superRefine((env, ctx) => {
     // Reject ambiguous credentials rather than silently picking one. An API key

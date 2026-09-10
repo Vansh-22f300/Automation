@@ -268,9 +268,14 @@ TENANT_ID=$(pnpm -s tenant:create "Acme Inc")
 pnpm apikey:create "$TENANT_ID" "bootstrap"   # prints the plaintext once
 ```
 
-A conservative in-memory rate limit (100 requests/minute per IP) blunts
-credential stuffing on a single instance. It is per-process and resets on
-restart; distributed, per-tenant rate limiting with a shared store arrives later.
+A conservative in-memory rate limit (100 requests/minute per IP, proxy-aware via `TRUST_PROXY`) blunts
+credential stuffing on a single instance. By default `TRUST_PROXY=false` (local/dev safe) the
+limiter keys by the socket remote address and ignores `X-Forwarded-For`; when
+deployed behind a trusted reverse proxy / PaaS the operator explicitly sets
+`TRUST_PROXY=true` (or a list of trusted proxy CIDRs / `loopback`) so the
+limiter keys by the forwarded client IP instead of the proxy's IP. It is
+per-process and resets on restart; distributed, per-tenant rate limiting with a
+shared store arrives later.
 
 Stop the server with `Ctrl+C`; it drains in-flight requests, closes the pool, and
 logs `api stopped cleanly`.
@@ -373,6 +378,7 @@ FATAL: configuration error — refusing to start.
 | `LOG_LEVEL`                  | `info`          | pino level: `fatal`…`trace`, or `silent`. `debug` also logs every SQL statement.                                                                                                                                                                                                                              |
 | `HOST`                       | `127.0.0.1`     | API bind address. Use `0.0.0.0` in a container or on a PaaS.                                                                                                                                                                                                                                                  |
 | `PORT`                       | `3000`          | API port.                                                                                                                                                                                                                                                                                                     |
+| `TRUST_PROXY`                | `false`         | Whether `request.ip` (and the per-IP rate limiter) trusts `X-Forwarded-For`. `false` (default, safe for local/dev) ignores forwarding headers; `true` trusts the proxy (use only when behind a trusted PaaS/reverse proxy that is the sole ingress); a comma-separated list of proxy IPs/CIDRs or `loopback`/`linklocal`/`uniquelocal` trusts only those. Do not set `true` unless you are actually behind a trusted proxy. |
 | `WORKER_SHUTDOWN_TIMEOUT_MS` | `10000`         | How long graceful worker shutdown waits for an in-flight job before returning and, if it still owns the lease, releasing that job back to `pending`. This does **not** cancel the underlying external request.                                                                                                |
 | `ANTHROPIC_API_KEY`          | _(unset)_       | **Optional secret.** Direct-Anthropic credential, sent as `x-api-key`. Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients.                                                                                                                 |
 | `ANTHROPIC_AUTH_TOKEN`       | _(unset)_       | **Optional secret.** Bearer token for an Anthropic-_compatible_ gateway, sent as `Authorization: Bearer …`. **Mutually exclusive** with `ANTHROPIC_API_KEY` — set exactly one; configuring both is refused at startup.                                                                                        |

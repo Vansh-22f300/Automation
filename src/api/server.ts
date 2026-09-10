@@ -40,6 +40,11 @@ const queue = new PostgresJobQueue(database.db);
 
 const app = await buildApp({
   logger,
+  // `TRUST_PROXY` is validated in `src/config/env.ts`; `false` by default so
+  // local/dev never trusts `X-Forwarded-For`. When the deployment is behind a
+  // trusted reverse proxy / PaaS the operator sets `TRUST_PROXY=true` (or a
+  // list of proxy CIDRs) and the limiter then keys by the forwarded client IP.
+  trustProxy: env.TRUST_PROXY,
   authenticator: new ApiKeyAuthenticator(new DrizzleApiKeyStore(database.db)),
   checkDatabase: () => database.ping(),
   // One tenant-scoped service per authenticated request — the repository is

@@ -34,6 +34,7 @@ describe('parseEnv', () => {
       DATABASE_POOL_MAX: 10,
       WORKER_SHUTDOWN_TIMEOUT_MS: 10_000,
       ANTHROPIC_MODEL: 'claude-opus-5',
+      TRUST_PROXY: false,
     });
   });
 
@@ -285,6 +286,49 @@ describe('parseEnv / ANTHROPIC_BASE_URL', () => {
       expect(offendingVariables(() => parseEnv({ ...base, CREDENTIAL_ENCRYPTION_KEY: '' }))).toContain(
         'CREDENTIAL_ENCRYPTION_KEY',
       );
+    });
+  });
+
+  describe('TRUST_PROXY', () => {
+    it('defaults to false (safe for local/dev)', () => {
+      expect(parseEnv({ ...base }).TRUST_PROXY).toBe(false);
+    });
+
+    it('accepts false and 0 as false', () => {
+      expect(parseEnv({ ...base, TRUST_PROXY: 'false' }).TRUST_PROXY).toBe(false);
+      expect(parseEnv({ ...base, TRUST_PROXY: '0' }).TRUST_PROXY).toBe(false);
+    });
+
+    it('accepts true and 1 as true', () => {
+      expect(parseEnv({ ...base, TRUST_PROXY: 'true' }).TRUST_PROXY).toBe(true);
+      expect(parseEnv({ ...base, TRUST_PROXY: '1' }).TRUST_PROXY).toBe(true);
+    });
+
+    it('accepts known proxy range names', () => {
+      expect(parseEnv({ ...base, TRUST_PROXY: 'loopback' }).TRUST_PROXY).toBe('loopback');
+      expect(parseEnv({ ...base, TRUST_PROXY: 'uniquelocal' }).TRUST_PROXY).toBe('uniquelocal');
+    });
+
+    it('accepts IP addresses and CIDR ranges', () => {
+      expect(parseEnv({ ...base, TRUST_PROXY: '127.0.0.1' }).TRUST_PROXY).toBe('127.0.0.1');
+      expect(parseEnv({ ...base, TRUST_PROXY: '10.0.0.0/8' }).TRUST_PROXY).toBe('10.0.0.0/8');
+      expect(parseEnv({ ...base, TRUST_PROXY: '10.0.0.0/8, 172.16.0.0/12' }).TRUST_PROXY).toBe(
+        '10.0.0.0/8, 172.16.0.0/12',
+      );
+    });
+
+    it('rejects nonsense values', () => {
+      expect(offendingVariables(() => parseEnv({ ...base, TRUST_PROXY: 'maybe' }))).toContain('TRUST_PROXY');
+      expect(offendingVariables(() => parseEnv({ ...base, TRUST_PROXY: '999.999.999.999' }))).toContain(
+        'TRUST_PROXY',
+      );
+      expect(offendingVariables(() => parseEnv({ ...base, TRUST_PROXY: '10.0.0.0/999' }))).toContain(
+        'TRUST_PROXY',
+      );
+    });
+
+    it('rejects an empty string', () => {
+      expect(offendingVariables(() => parseEnv({ ...base, TRUST_PROXY: '' }))).toContain('TRUST_PROXY');
     });
   });
 });

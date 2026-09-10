@@ -86,6 +86,12 @@ export class NotFoundError extends ApiError {
   }
 }
 
+export class RateLimitedError extends ApiError {
+  override readonly statusCode = 429;
+  override readonly code = 'rate_limited';
+}
+
+/** Type guard for `ApiError` subclasses (including `RateLimitedError`). */
 export function isApiError(error: unknown): error is ApiError {
   return error instanceof ApiError;
 }
