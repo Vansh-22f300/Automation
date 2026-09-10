@@ -146,16 +146,29 @@ export function createDatabase(
   logger: Logger,
   options: DatabaseOptions,
 ): DatabaseHandle {
+  const effectiveStatementTimeout = options.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS;
+  const effectiveIdleTimeout = DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS;
+
   const config: PoolConfig = {
     connectionString: env.DATABASE_URL,
     max: env.DATABASE_POOL_MAX,
     connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
     idleTimeoutMillis: IDLE_TIMEOUT_MS,
     application_name: `ai-workforce-${options.service}`,
-    statement_timeout: options.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS,
+    statement_timeout: effectiveStatementTimeout,
     // `pg` forwards this as a startup parameter in Client#getStartupConf();
     // PostgreSQL aborts an idle-in-transaction session with `25P03` after this.
-    idle_in_transaction_session_timeout: DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    idle_in_transaction_session_timeout: effectiveIdleTimeout,
+    // Pooled Neon (PgBouncer transaction mode) ignores unsupported startup GUCs.
+    // `pg-pool` awaits `onConnect` before handing the client out; a rejection
+    // quarantines the connection rather than exposing an unconfigured one.
+    // Values are internal validated numbers, never user input.
+    // `onConnect` is typed as `() => void` in @types/pg but runtime supports Promise
+    // (pg-pool `_promiseTry`), so `async` is safe and correctly awaited.
+    onConnect: async (client: { query: (sql: string) => Promise<unknown> }) => {
+      await client.query(`SET statement_timeout = ${effectiveStatementTimeout}`);
+      await client.query(`SET idle_in_transaction_session_timeout = ${effectiveIdleTimeout}`);
+    },
   };
 
   const pool = new pg.Pool(config);

@@ -158,6 +158,65 @@ describe('createDatabase', () => {
     expect(apiOpts.idle_in_transaction_session_timeout).toBe(workerOpts.idle_in_transaction_session_timeout);
     expect(apiOpts.idle_in_transaction_session_timeout).toBe(DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS);
   });
+
+  it('registers explicit session initialization that mirrors the effective PoolConfig values', async () => {
+    const handle = open({ DATABASE_URL: UNREACHABLE_URL });
+    const opts = handle.pool.options as unknown as {
+      onConnect?: (client: { query: (sql: string) => Promise<unknown> }) => Promise<void>;
+      statement_timeout?: number;
+      idle_in_transaction_session_timeout?: number;
+    };
+    expect(typeof opts.onConnect).toBe('function');
+
+    const queries: string[] = [];
+    await opts.onConnect!({ query: async (sql: string) => { queries.push(sql); } });
+
+    // Must SET both GUCs, using the effective values from PoolConfig (default 30s)
+    expect(queries).toEqual([
+      `SET statement_timeout = ${opts.statement_timeout}`,
+      `SET idle_in_transaction_session_timeout = ${opts.idle_in_transaction_session_timeout}`,
+    ]);
+    expect(opts.statement_timeout).toBe(30_000);
+    expect(opts.idle_in_transaction_session_timeout).toBe(DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS);
+  });
+
+  it('session initialization uses the effective statement_timeout override and 30s idle', async () => {
+    const handle = createDatabase(
+      parseEnv({ DATABASE_URL: UNREACHABLE_URL }),
+      silentLogger,
+      { service: 'test', statementTimeoutMs: 60_000 },
+    );
+    opened.push(handle);
+
+    const opts = handle.pool.options as unknown as {
+      onConnect?: (client: { query: (sql: string) => Promise<unknown> }) => Promise<void>;
+      statement_timeout?: number;
+      idle_in_transaction_session_timeout?: number;
+    };
+    expect(opts.statement_timeout).toBe(60_000);
+    expect(opts.idle_in_transaction_session_timeout).toBe(30_000);
+
+    const queries: string[] = [];
+    await opts.onConnect!({ query: async (sql: string) => { queries.push(sql); } });
+
+    expect(queries[0]).toBe('SET statement_timeout = 60000');
+    expect(queries[1]).toBe('SET idle_in_transaction_session_timeout = 30000');
+  });
+
+  it('session initialization failure rejects so the connection is quarantined, not silently usable', async () => {
+    const handle = open({ DATABASE_URL: UNREACHABLE_URL });
+    const opts = handle.pool.options as unknown as {
+      onConnect?: (client: { query: (sql: string) => Promise<unknown> }) => Promise<void>;
+    };
+
+    const failingClient = {
+      query: async () => { throw new Error('SET failed'); },
+    };
+
+    await expect(opts.onConnect!(failingClient)).rejects.toThrow('SET failed');
+    // pg-pool's onConnect rejection path removes the client and propagates the error,
+    // so the pool never hands an unconfigured connection to application code.
+  });
 });
 
 describe('verifyConnection (unreachable database)', () => {
