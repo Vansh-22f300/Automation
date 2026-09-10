@@ -67,6 +67,19 @@ export interface AppDependencies {
 const RATE_LIMIT_MAX = 100;
 const RATE_LIMIT_WINDOW = "1 minute";
 
+/**
+ * Baseline headers for an API response. These are deliberately limited to
+ * transport/content-sniffing/frame/referrer controls that do not assume the API
+ * serves browser documents. CSP is intentionally absent: this service returns
+ * JSON and does not own a browser execution context.
+ */
+const API_SECURITY_HEADERS = {
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "referrer-policy": "no-referrer",
+  "permissions-policy": "geolocation=(), microphone=(), camera=()",
+} as const;
+
 export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
   const app: ApiServer = Fastify({
     loggerInstance: deps.logger,
@@ -97,6 +110,16 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
   });
 
   registerErrorHandling(app);
+
+  // Apply the same baseline headers to successful responses and error responses.
+  // `onSend` runs after route/error handling, so this does not alter response
+  // bodies, status codes, authentication, or route-specific behaviour.
+  app.addHook("onSend", async (_request, reply, payload) => {
+    for (const [name, value] of Object.entries(API_SECURITY_HEADERS)) {
+      reply.header(name, value);
+    }
+    return payload;
+  });
 
   // Preserve the exact request bytes before JSON parsing. Webhook signature
   // verification (HMAC) will need the raw body, and it must be the untouched
