@@ -34,6 +34,7 @@ import { registerWorkflowRoutes } from "@/api/routes/workflows.js";
 import type { WorkflowServiceFactory } from "@/api/routes/workflows.js";
 import { registerWebhookRoutes } from "@/api/routes/webhooks.js";
 import type { WebhookIngestorFactory } from "@/api/routes/webhooks.js";
+import type { WebhookSignatureResolverFactory } from "@/api/routes/webhooks.js";
 import type { ApiServer } from "@/api/types.js";
 import type { Authenticator } from "@/auth/context.js";
 import { RateLimitedError } from "@/api/errors.js";
@@ -48,6 +49,14 @@ export interface AppDependencies {
   readonly apiKeyServiceFor: ApiKeyServiceFactory;
   /** Builds a tenant-scoped webhook ingestor for an authenticated request. */
   readonly webhookIngestorFor: WebhookIngestorFactory;
+  /**
+   * Builds a tenant-scoped webhook signature resolver — looks up the active
+   * workflow version's `signature` config (if any) for a `(tenant, source)`
+   * pair and resolves the signing secret from the configured connection.
+   * Returns null when no signature is required for the source, so the legacy
+   * behavior is preserved for sources without a configured signature.
+   */
+  readonly webhookSignatureResolverFor: WebhookSignatureResolverFactory;
   /** Builds a tenant-scoped workflow repository for an authenticated request. */
   readonly workflowServiceFor: WorkflowServiceFactory;
   /** Builds a tenant-scoped connection repository for an authenticated request. */
@@ -202,7 +211,11 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     registerApiKeyRoutes(protectedScope, deps.apiKeyServiceFor);
     registerWorkflowRoutes(protectedScope, deps.workflowServiceFor);
     registerConnectionRoutes(protectedScope, deps.connectionServiceFor);
-    registerWebhookRoutes(protectedScope, deps.webhookIngestorFor);
+    registerWebhookRoutes(
+      protectedScope,
+      deps.webhookIngestorFor,
+      deps.webhookSignatureResolverFor,
+    );
     registerRunInspectionRoutes(protectedScope, deps.runInspectionFor);
   });
 

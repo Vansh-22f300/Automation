@@ -72,6 +72,9 @@ async function makeApp(opts: {
     webhookIngestorFor: () => {
       throw new Error("not used");
     },
+    webhookSignatureResolverFor: () => {
+      throw new Error("not used");
+    },
     runInspectionFor: () => ({
       getRun: async () => null,
       listRuns: async () => ({ items: [], nextCursor: null }),

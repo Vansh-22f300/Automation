@@ -190,6 +190,11 @@ async function makeApp(): Promise<Harness> {
         workflowConfigured: false,
       }),
     }),
+    // The webhook route requires this factory; a no-op resolver returns null
+    // (no signature required) for sources that have no configured signature.
+    webhookSignatureResolverFor: () => ({
+      resolveForSource: async () => null,
+    }),
     // Minimal run-inspection reader factory for the routes that expect it.
     runInspectionFor: () => ({
       getRun: async () => null,

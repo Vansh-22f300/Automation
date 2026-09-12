@@ -133,6 +133,10 @@ async function makeApp(): Promise<Harness> {
         workflowConfigured: false,
       }),
     }),
+    // Not exercised here; the webhook route has its own suite.
+    webhookSignatureResolverFor: () => ({
+      resolveForSource: async () => null,
+    }),
     runInspectionFor: () => ({
       getRun: async () => null,
       listRuns: async () => ({ items: [], nextCursor: null }),

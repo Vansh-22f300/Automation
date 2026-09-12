@@ -21,6 +21,7 @@ import { PostgresJobQueue } from "@/repositories/job-queue.js";
 import { RunInspectionRepository } from "@/repositories/run-inspection-repository.js";
 import { TenantScope } from "@/repositories/tenant-scope.js";
 import { WebhookRepository } from "@/repositories/webhook-repository.js";
+import { WebhookSignatureRepository } from "@/repositories/webhook-signature-resolver.js";
 import { WorkflowRepository } from "@/repositories/workflow-repository.js";
 import { createCredentialCipher } from "@/security/credential-cipher.js";
 
@@ -60,6 +61,14 @@ const app = await buildApp({
     ),
   webhookIngestorFor: (auth) =>
     new WebhookRepository(new TenantScope(database.db, auth.tenantId), queue),
+  // Per-source signature verification. Tenant-scoped; reads the active webhook
+  // version's signature config and resolves the secret from the named connection.
+  // A configured-but-unavailable secret becomes a verification-refused 401.
+  webhookSignatureResolverFor: (auth) =>
+    new WebhookSignatureRepository(
+      new TenantScope(database.db, auth.tenantId),
+      cipher,
+    ),
   // Read-only, tenant-scoped run inspection. Same repository (and therefore the
   // same DTO + redaction) the CLI uses — the API adds no query or shaping logic.
   runInspectionFor: (auth) =>

@@ -196,11 +196,151 @@ via a partial unique index on `(tenant_id, trigger_config->>'source') WHERE
 is_active`. A created run pins the exact `workflow_version_id` at creation, so
 activating a newer version never changes runs already in flight.
 
-> **HMAC signature verification is not implemented yet.** A bearer key is the only
-> authentication. The raw request body is preserved (`request.rawBody`) precisely
-> so per-provider signature verification can be added at this boundary without a
-> rewrite. **Provider webhooks must not be enabled in production before that
-> lands.**
+> **HMAC signature verification is implemented and on by default for every configured
+> source.** When the active workflow version for `(tenant, source)` carries a
+> `signature` config block (see "Webhook signature verification" below), every
+> delivery is verified — and failed verification is a hard `401` before any event
+> is persisted, dedupe-key computed, or transaction started. Sources without a
+> `signature` block continue to authenticate on the bearer key only; this is the
+> legacy behaviour and exists so smoke-test sources and the `inspect-webhooks`
+> CLI keep working. **Provider webhooks exposed to the internet must carry a
+> `signature` block.**
+
+#### Webhook signature verification
+
+A signature is required for any provider webhook exposed to the internet. The
+shared secret is stored once as a **Connection** (encrypted, tenant-scoped, can
+be rotated independently of the workflow) and referenced by `secret_connection_id`
+on the workflow's `webhook` trigger. The signature config is a discriminated
+union on `signing_input`; the verifier does not negotiate.
+
+| `signing_input`         | HMAC input bytes (exactly)                                       |
+| ----------------------- | ---------------------------------------------------------------- |
+| `raw_body`              | `rawBody`                                                        |
+| `timestamp_and_body`    | `canonicalTimestamp || 0x2E || rawBody`                          |
+
+- `rawBody` is the **exact** bytes captured by the JSON content-type parser
+  before any parse, re-serialise, or trim. Re-serialising the parsed object
+  will not produce the same bytes.
+- `canonicalTimestamp` is the integer value of the timestamp header formatted
+  as `String(n)` — the **single** form the verifier uses in the HMAC input.
+  Leading zeros are stripped; surrounding whitespace is removed. A sender who
+  signs the literal header text (with leading zeros or whitespace) will see
+  their signature rejected as `signature_mismatch`.
+- `0x2E` is a single literal `.` byte. **It is not configurable.** Adding a
+  new scheme (e.g. a different separator) is a code change with a new
+  `signing_input` mode, not a config knob, so an operator cannot author a
+  signing config the verifier cannot justify.
+
+##### `raw_body` mode
+
+```
+HMAC-SHA256(key=secret, msg=rawBody)
+```
+
+The signature header value, after `signature_prefix` is stripped (if configured),
+is the HMAC encoded as `signature_encoding` (`hex` or `base64`). No timestamp,
+no separator, no other bytes.
+
+##### `timestamp_and_body` mode
+
+```
+HMAC-SHA256(key=secret, msg=canonicalTimestamp || 0x2E || rawBody)
+```
+
+- `canonicalTimestamp` is the integer value of the timestamp header,
+  formatted as `String(n)` — the **single** form the verifier uses in the
+  HMAC input. Leading zeros are stripped; surrounding whitespace is removed.
+  A sender who signs the literal header text (with leading zeros or
+  whitespace) will see their signature rejected as `signature_mismatch`
+  because the verifier's canonical bytes differ.
+- `0x2E` is a single literal `.` byte. **It is not configurable.** Adding a
+  new scheme (e.g. a different separator) is a code change with a new
+  `signing_input` mode, not a config knob, so an operator cannot author a
+  signing config the verifier cannot justify.
+- `tolerance_seconds` is the maximum difference (in seconds) between the
+  parsed timestamp and the verifier's clock; bounded `1..3600` so a
+  misconfiguration cannot quietly disable the check.
+- The header is parsed as a non-negative decimal integer. `+`, `-`, `.`,
+  hex prefixes, decimal points, and any other non-decimal shape are rejected
+  as `timestamp_malformed` before the HMAC is computed.
+
+###### What this mode guarantees, and what it does not
+
+`timestamp_and_body` provides **three** properties:
+
+1. **Authenticated timestamp.** The timestamp is part of the HMAC input. An
+   attacker cannot substitute a fresh timestamp without invalidating the
+   signature — the verifier's recomputed HMAC over `(attackerTs || . || body)`
+   will not equal a captured signature that was computed over the original
+   timestamp.
+2. **Freshness / tolerance enforcement.** The parsed integer is checked
+   against `tolerance_seconds` of the verifier's clock. Stale and
+   far-future timestamps are rejected as `timestamp_out_of_tolerance`. This
+   bounds the window in which an attacker could replay a captured delivery
+   by adjusting timing alone (and even that is bounded because the timestamp
+   is authenticated — see point 1).
+3. **Replay-window protection.** A captured delivery cannot be replayed
+   *outside* the configured tolerance window. Within the window, an
+   exact-duplicate replay of the same `(timestamp, body, signature)` is
+   **not** rejected by signature verification — suppression of such
+   duplicates is the responsibility of the route's `X-Event-ID` dedupe layer,
+   which is caller-controlled and is a known separate concern.
+
+This mode does **not** provide universal one-time replay prevention on its
+own. Operators who need strict one-time semantics should layer an
+application-level nonce store on top.
+
+##### Config schema (Zod, strict)
+
+```ts
+type SignatureConfig =
+  | {
+      signing_input: "raw_body";
+      algorithm: "hmac-sha256";
+      secret_connection_id: string;     // UUIDv7 — connection holding the shared secret
+      signature_header: string;         // 1-64 [a-z0-9-]
+      signature_encoding: "hex" | "base64";
+      signature_prefix?: string;        // 1-64 printable ASCII, no whitespace
+    }
+  | {
+      signing_input: "timestamp_and_body";
+      algorithm: "hmac-sha256";
+      secret_connection_id: string;
+      signature_header: string;
+      signature_encoding: "hex" | "base64";
+      signature_prefix?: string;
+      timestamp_header: string;         // 1-64 [a-z0-9-]
+      tolerance_seconds: number;        // int, 1..3600
+    }
+```
+
+Unknown fields are rejected at parse time (`.strict()`). The algorithm is locked
+to `hmac-sha256`; there is no `none`/empty value and no per-request algorithm
+override.
+
+##### What gets logged
+
+The verifier itself does not log. On a failed verification the route emits one
+structured log line:
+
+```json
+{
+  "level": "warn",
+  "msg": "webhook signature verification refused",
+  "source": "github",
+  "reason": "signature_mismatch",
+  "signing_input": "timestamp_and_body",
+  "raw_body_length": 42
+}
+```
+
+— `reason` is a stable code (`signature_header_missing`, `signature_malformed`,
+`timestamp_header_missing`, `timestamp_malformed`, `timestamp_out_of_tolerance`,
+`signature_mismatch`); `signing_input` records which mode was active; only
+**lengths** of the inputs are recorded, never the body, signature, or secret.
+The HTTP response is a single generic `401` regardless of reason so a caller
+cannot probe by response text.
 
 #### Inspecting a run (`GET /v1/runs/:runId`)
 

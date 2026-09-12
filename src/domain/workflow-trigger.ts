@@ -13,6 +13,8 @@
 
 import { z } from 'zod';
 
+import { webhookSignatureConfigSchema } from '@/domain/webhook-signature.js';
+
 /** The trigger kinds that exist. Only `webhook` today; mirrors the DB enum. */
 export const SUPPORTED_TRIGGER_TYPES = ['webhook'] as const;
 export type TriggerType = (typeof SUPPORTED_TRIGGER_TYPES)[number];
@@ -37,9 +39,20 @@ export const webhookSourceSchema = z
     'source must be a lowercase identifier (a-z, 0-9, _, -), starting with a letter',
   );
 
+/**
+ * Per-source webhook configuration. The `signature` field is optional: a source
+ * without it behaves exactly as before (no signature verification at the boundary,
+ * bearer-key remains the only authentication). When present, the route layer
+ * loads the secret from the configured connection and verifies the request
+ * signature per `src/domain/webhook-signature.ts`.
+ *
+ * `.strict()` rejects unknown fields so a misspelled key does not silently fall
+ * back to a verifier with a relaxed policy.
+ */
 export const webhookTriggerConfigSchema = z
   .object({
     source: webhookSourceSchema,
+    signature: webhookSignatureConfigSchema.optional(),
   })
   .strict();
 
