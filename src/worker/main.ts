@@ -20,6 +20,25 @@
  * and owns process concerns: startup verification, signal handling, and a
  * time-bounded shutdown that stops claiming, drains the loops (handing back the
  * lease of anything still in flight when the wait runs out) and closes the pool.
+ *
+ * Testability: this file is intentionally *not* unit-tested. Its responsibilities
+ * are process bootstrap (loadEnv → real PG pool → real `process.on` signal
+ * handlers → `process.exit`), and the only realistic way to cover those without
+ * mocking the runtime is an end-to-end test that boots a real worker process
+ * against a real Postgres — which is the integration suite's job and is out of
+ * scope for Item 11's hardening pass. The classes wired up here
+ * (`Worker`, `Reaper`, `WorkerHeartbeat`, `PostgresJobQueue`, `WorkflowExecutor`)
+ * are each independently exercised in `src/test/unit/` with fakes. The shutdown
+ * sequence (worker.stop → reaper.stop → database.close → exit) is the only
+ * coordination logic owned by this file, and the parts of it that have
+ * observable failure modes (`Worker.stop` draining in-flight work, `Worker.stop`
+ * timing out and handing back its lease, the unhandled-rejection / uncaught-
+ * exception guards) are already covered by `worker.test.ts > Worker.stop` and
+ * `reaper.test.ts`. Lifting the composition into a `createWorkerProcess(deps)`
+ * function just so it could be unit-tested is rejected here on purpose: a
+ * composition root that has been factored into injectable dependencies is
+ * rarely the same code as the one a process actually boots from, and the value
+ * of a unit test that mocks the runtime is small.
  */
 
 import { and, eq } from 'drizzle-orm';
@@ -44,11 +63,15 @@ import { createCredentialCipher } from '@/security/credential-cipher.js';
 import { Reaper } from '@/worker/reaper.js';
 import { Worker } from '@/worker/worker.js';
 import type { RunExistenceCheck } from '@/worker/worker.js';
+import { POLL_INTERVAL_MS, REAPER_INTERVAL_MS, WorkerHeartbeat } from '@/worker/heartbeat.js';
 
-/** How long to wait after finding no work before polling again. */
-const POLL_INTERVAL_MS = 1_000;
-/** How often the reaper sweeps for expired leases. */
-const REAPER_INTERVAL_MS = 30_000;
+/**
+ * How often the worker process emits a `worker_heartbeat` summary log line.
+ * Independent of the heartbeat *stale* threshold inside `WorkerHeartbeat`,
+ * which is derived from poll + reaper intervals. This one is just the cadence
+ * at which the operator gets a fresh snapshot in logs.
+ */
+const HEARTBEAT_LOG_INTERVAL_MS = 30_000;
 /**
  * Extra time the force-exit watchdog allows *beyond* `WORKER_SHUTDOWN_TIMEOUT_MS`.
  *
@@ -76,6 +99,13 @@ const workerId = `worker-${process.pid}-${newId().slice(0, 8)}`;
 
 const database = createDatabase(env, logger, { service: 'worker' });
 const queue = new PostgresJobQueue(database.db);
+
+// In-memory heartbeat / lifecycle tracker for this worker process. The same
+// instance is shared by the Worker, the Reaper and the periodic summary log
+// below, so the snapshot an operator sees is the union of all three. There is
+// no DB table, no Redis, no shared file — the state lives only in this
+// process and is exposed via structured logs.
+const heartbeat = new WorkerHeartbeat();
 
 // Build the LLM provider from config if a credential is present. The worker must
 // boot without one — nothing constructs a provider until an `llm` step runs — so
@@ -134,9 +164,34 @@ const worker = new Worker({
   pollIntervalMs: POLL_INTERVAL_MS,
   runExists,
   shutdownTimeoutMs: env.WORKER_SHUTDOWN_TIMEOUT_MS,
+  heartbeat,
 });
 
-const reaper = new Reaper({ queue, logger, intervalMs: REAPER_INTERVAL_MS });
+const reaper = new Reaper({ queue, logger, intervalMs: REAPER_INTERVAL_MS, heartbeat });
+
+/**
+ * Emit one summary log line per `HEARTBEAT_LOG_INTERVAL_MS`. The fields mirror
+ * the Worker's `WorkerHeartbeatSnapshot` exactly so a log-shipping consumer
+ * can match on shape. Identifiers-only: no tenant id, no run id, no payload,
+ * no credential. `.unref()` so the timer never holds the process open past
+ * shutdown — `clearInterval` in `shutdown()` is the primary teardown.
+ */
+const heartbeatTimer = setInterval(() => {
+  const snap = heartbeat.snapshot();
+  logger.info(
+    {
+      heartbeat_state: snap.state,
+      uptime_seconds: snap.uptimeSeconds,
+      last_tick_at: snap.lastTickAt,
+      last_tick_age_ms: snap.lastTickAgeMs,
+      stale: snap.isStale,
+      in_flight: snap.inFlight,
+      counts: snap.counts,
+    },
+    'worker_heartbeat',
+  );
+}, HEARTBEAT_LOG_INTERVAL_MS);
+heartbeatTimer.unref();
 
 let shuttingDown = false;
 
@@ -175,6 +230,7 @@ async function shutdown(reason: string): Promise<void> {
     // Stop claiming new work first, then stop the reaper, then release the pool.
     // Draining the loops before closing the pool avoids tearing a connection out
     // from under an in-flight claim or sweep.
+    clearInterval(heartbeatTimer);
     await worker.stop();
     await reaper.stop();
     await database.close();

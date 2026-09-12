@@ -365,6 +365,47 @@ describe("proxy-aware rate limiting", () => {
     }
   });
 
+  it("preserves existing rate-limit limits — readyz remains exempt alongside healthz", async () => {
+    // Mirrors the /healthz exemption test above. Readiness probes are load-
+    // balancer traffic and must never share a bucket with the protected API
+    // routes — a busy probe must not cause a healthy API to start returning
+    // 429s, and conversely an aggressive API client must not be able to make
+    // a load balancer conclude "the API is not ready" by exhausting the
+    // probe's bucket.
+    app = await makeApp({ trustProxy: false, max: 2 });
+
+    // Exhaust the protected bucket.
+    for (let i = 0; i < 2; i++) {
+      const res = await app.inject({
+        method: "GET",
+        url: "/v1/api-keys",
+        headers: bearer(VALID_KEY),
+        remoteAddress: "10.0.0.21",
+      });
+      expect(res.statusCode).toBe(200);
+    }
+    const limited = await app.inject({
+      method: "GET",
+      url: "/v1/api-keys",
+      headers: bearer(VALID_KEY),
+      remoteAddress: "10.0.0.21",
+    });
+    expect(limited.statusCode).toBe(429);
+
+    // Readiness probes must keep returning 200 even when the API bucket is
+    // exhausted — and the body must still be the readyz shape (no error
+    // envelope has leaked into a probe response).
+    for (let i = 0; i < 5; i++) {
+      const ready = await app.inject({
+        method: "GET",
+        url: "/readyz",
+        remoteAddress: "10.0.0.21",
+      });
+      expect(ready.statusCode).toBe(200);
+      expect(ready.json()).toMatchObject({ status: "ready" });
+    }
+  });
+
   it("respects explicit string trust values (proxy addresses / ranges) — only named proxies are trusted", async () => {
     // Trust only loopback. An inject from 10.0.0.1 (non-loopback) must ignore XFF.
     const a = await makeApp({ trustProxy: "loopback", max: 2 });

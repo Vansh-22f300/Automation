@@ -28,6 +28,7 @@ import { registerConnectionRoutes } from "@/api/routes/connections.js";
 import type { ConnectionServiceFactory } from "@/api/routes/connections.js";
 import { registerHealthRoute } from "@/api/routes/health.js";
 import type { DatabaseHealthCheck } from "@/api/routes/health.js";
+import { registerReadyzRoute } from "@/api/routes/readyz.js";
 import { registerRunInspectionRoutes } from "@/api/routes/runs.js";
 import type { RunInspectionServiceFactory } from "@/api/routes/runs.js";
 import { registerWorkflowRoutes } from "@/api/routes/workflows.js";
@@ -43,7 +44,7 @@ import { newId } from "@/domain/ids.js";
 export interface AppDependencies {
   /** Resolves credentials to a tenant. */
   readonly authenticator: Authenticator;
-  /** Probes database reachability for `/healthz`. */
+  /** Probes database reachability for `/readyz`. */
   readonly checkDatabase: DatabaseHealthCheck;
   /** Builds a tenant-scoped API-key service for an authenticated request. */
   readonly apiKeyServiceFor: ApiKeyServiceFactory;
@@ -197,9 +198,12 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     },
   );
 
-  // Public, unauthenticated route. Registered at the top level so no auth hook
-  // applies to it; it exempts itself from the rate limiter internally.
-  registerHealthRoute(app, deps.checkDatabase);
+  // Public, unauthenticated routes. Registered at the top level so no auth hook
+  // applies to them; each exempts itself from the rate limiter internally.
+  // `/healthz` proves the process is alive (no dependency check); `/readyz`
+  // proves the process can serve traffic by probing the database.
+  registerHealthRoute(app);
+  registerReadyzRoute(app, deps.checkDatabase);
 
   // Everything below requires a valid API key. Encapsulated so the auth hook does
   // not touch the public route above. The plugin callback's instance is typed

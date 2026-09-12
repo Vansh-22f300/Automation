@@ -160,7 +160,8 @@ dashboard consumes these endpoints directly through the typed frontend API clien
 
 | Method | Path                      | Auth       | Purpose                                                                                                                                                                    |
 | ------ | ------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET`  | `/healthz`                | none       | Liveness + database readiness. `200` healthy, `503` if the DB is unreachable.                                                                                              |
+| `GET`  | `/healthz`                | none       | Process liveness. `200` while the event loop is turning — does not query the database.                                                                                       |
+| `GET`  | `/readyz`                 | none       | Process readiness. `200` only when the database is reachable (`select 1`), `503` otherwise. Leaks no connection detail.                                                     |
 | `POST` | `/v1/api-keys`            | Bearer key | Create a key for the caller's tenant. Returns the plaintext **once**.                                                                                                      |
 | `GET`  | `/v1/api-keys`            | Bearer key | List the caller's own keys (metadata only — never the key).                                                                                                                |
 | `POST` | `/v1/api-keys/:id/revoke` | Bearer key | Revoke one of the caller's keys. `204` on success, `404` if it is not theirs.                                                                                              |
@@ -494,6 +495,59 @@ closes; the process force-exits 5 s past the shutdown timeout if any of that han
 The two processes are independent — neither requires the other to run. Both
 refuse to start if the database is unreachable, because a process that is
 listening but cannot reach its database looks healthy to whatever is watching it.
+
+### Operations: liveness, readiness, and worker observability
+
+The two HTTP probes answer two different questions, and a load balancer / orchestrator
+should treat them differently:
+
+| Endpoint  | Question it answers             | Depends on the database? | When to act on failure                                                                                                                  |
+| --------- | ------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `/healthz` | "Is the Node process alive?"    | No                       | Restart the process. A failing `/healthz` means the event loop is not turning — usually a crash or hang, never a transient DB blip.       |
+| `/readyz`  | "Can this process serve traffic?" | Yes (`select 1`)         | Stop routing new traffic to this instance. A failing `/readyz` is expected during DB failover or pool exhaustion and recovers on its own. |
+
+Both endpoints are public, unauthenticated, exempt from the rate limiter, and
+inherit the four baseline security headers (`x-content-type-options`,
+`x-frame-options`, `referrer-policy`, `permissions-policy`) from the root
+`onSend` hook. Neither response includes the connection string, the host,
+the error message, or any configuration — only the binary status, the
+sub-check, and uptime. The real reason for a failed `/readyz` is logged
+server-side (`request.log.warn({ err }, ...)`).
+
+Worker process observability is in-memory and exposed through structured
+logs only — no HTTP listener, no shared file, no Redis, no database table.
+[`src/worker/heartbeat.ts`](src/worker/heartbeat.ts) tracks lifecycle state
+(`starting` / `running` / `stopping` / `stopped`), the wall-clock and monotonic
+timestamp of the most recent poll tick, the in-flight slot, and cumulative
+settlement counters (`claimed`, `completed`, `failed`, `released`, `reaped`).
+The worker process emits a `worker_heartbeat` summary log line every 30 s
+with the same shape, so a log-shipping consumer can graph any field without
+adapting to a different schema. The snapshot is redaction-free by
+construction: no tenant id, run id, job id, step key, prompt, payload,
+secret, or raw error ever enters it.
+
+Stale detection is derived from existing timing rather than invented:
+`STALE_HEARTBEAT_MS = max(3 * POLL_INTERVAL_MS, REAPER_INTERVAL_MS)` —
+30 s. A worker that has missed one reaper sweep AND at least three poll
+cycles is stale; the reaper itself would have detected stuck leases by
+then, so the loop is clearly not healthy. This is an in-process notion
+only — the API process has no view of it, by design (see below).
+
+The three operational states an operator needs are visible at three
+independent observability points, not collapsed into one:
+
+1. **API ready** — `GET /readyz` returns 200 on the API process.
+2. **Worker running** — the worker process exists, its logs show
+   `worker_heartbeat` lines, and `heartbeat_state` is `running`.
+3. **Worker stopped** — no `worker_heartbeat` lines for >30 s, or the
+   process has exited and structured logs show `worker_shutdown` /
+   `worker_stopped_cleanly`.
+
+The API `/readyz` deliberately does NOT include a worker section: the
+worker runs in a separate process, the API has no way to read its state,
+and coupling API readiness to worker activity would make a healthy API
+report "not ready" because the worker is down — which is a separate
+operational signal that belongs at a separate observability point.
 
 ## Configuration
 
@@ -1138,8 +1192,8 @@ cannot drift from local development.
   workflow that needs no database to generate or verify
 - Database connectivity verified at startup before the API opens its port
 - **Fastify API** with clean shutdown on `SIGTERM`/`SIGINT`:
-  - `GET /healthz` — liveness + database readiness (`select 1`), leaking no
-    connection detail
+  - `GET /healthz` — process liveness, no DB dependency; `GET /readyz` —
+    database readiness (`select 1`); neither leaks connection detail
   - **Tenant API-key authentication** — cryptographically random keys, SHA-256
     hash + short prefix stored (never the plaintext), constant-time verification,
     revocation, and a framework-free `Authenticator` seam yielding

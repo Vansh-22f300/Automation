@@ -231,7 +231,7 @@ async function bootstrapKey(
 }
 
 describe("GET /healthz", () => {
-  it("reports 200 and ok when the database check passes", async () => {
+  it("reports 200 with the process liveness shape", async () => {
     current = await makeApp();
     const res = await current.app.inject({ method: "GET", url: "/healthz" });
 
@@ -244,34 +244,23 @@ describe("GET /healthz", () => {
     });
     expect(res.json()).toEqual({
       status: "ok",
-      checks: { process: "ok", database: "ok" },
       uptimeSeconds: expect.any(Number),
     });
   });
 
-  it("reports 503 and degraded when the database check fails", async () => {
+  it("succeeds even when the database check is failing", async () => {
+    // /healthz is process-liveness only. A DB blip must not make the load
+    // balancer tear down an instance whose Node process is healthy — that
+    // is exactly what /readyz is for.
     current = await makeApp();
     current.dbHealthy.value = false;
 
     const res = await current.app.inject({ method: "GET", url: "/healthz" });
-
-    expect(res.statusCode).toBe(503);
-    expect(res.json()).toMatchObject({
-      status: "degraded",
-      checks: { process: "ok", database: "down" },
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      status: "ok",
+      uptimeSeconds: expect.any(Number),
     });
-  });
-
-  it("leaks no connection detail even when the database is down", async () => {
-    current = await makeApp();
-    current.dbHealthy.value = false;
-
-    const res = await current.app.inject({ method: "GET", url: "/healthz" });
-    const body = res.body;
-
-    expect(body).not.toContain("5432");
-    expect(body).not.toContain("connection refused");
-    expect(body).not.toContain("10.0.0.9");
   });
 
   it("requires no credential", async () => {
