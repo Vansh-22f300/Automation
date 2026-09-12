@@ -69,6 +69,7 @@ import {
   generateCredentialKey,
   parseCredentialKey,
 } from '@/security/credential-cipher.js';
+import { KeyRing } from '@/security/keyring.js';
 
 import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
 
@@ -106,7 +107,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
     let handle: DatabaseHandle;
     let tenantA: string;
     let tenantB: string;
-    const cipher = new CredentialCipher(parseCredentialKey(generateCredentialKey()));
+    const cipherKey = parseCredentialKey(generateCredentialKey());
+    const cipher = new CredentialCipher(cipherKey, KeyRing.fromLegacyKey(cipherKey));
 
     // Per-tenant repository factories.
     const apiKeysFor = (tenantId: string) =>

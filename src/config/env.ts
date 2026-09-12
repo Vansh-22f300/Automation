@@ -374,6 +374,28 @@ const envSchema = z
   CREDENTIAL_ENCRYPTION_KEY: credentialEncryptionKey.optional(),
 
   /**
+   * Multi-key credential keyring (`CREDENTIAL_ENCRYPTION_KEYS`).
+   *
+   * Format: comma-separated `<kid>:<base64key>` pairs. The **first** entry is the
+   * active encrypt key; every subsequent entry is decrypt-only. The literal kid
+   * `legacy-v1` is reserved and is always decrypt-only (the parser rejects a
+   * keyring whose first entry is `legacy-v1`).
+   *
+   * Optional: an existing single-key deployment can continue to set only
+   * `CREDENTIAL_ENCRYPTION_KEY` (the legacy key is auto-imported as a single
+   * `legacy-v1` decrypt-only ring entry, with the same bytes backing the v1
+   * write path). Setting both vars is permitted: the keyring is the source of
+   * truth for decryption; the legacy var is honoured as the v1 writer only
+   * when the keyring itself lacks a `legacy-v1` entry.
+   *
+   * Detailed shape validation (kid regex, key bytes, reserved-kid rules) lives
+   * in `KeyRing.parse` and surfaces as a typed `CredentialKeyInvalidError` at
+   * boot. The check is intentionally duplicated at config-time and at
+   * cipher-time so the factory and the cipher agree on the contract.
+   */
+  CREDENTIAL_ENCRYPTION_KEYS: z.string().min(1, 'must not be empty when set').optional(),
+
+  /**
    * Trusted proxy configuration for Fastify `trustProxy`.
    *
    * See `trustProxySchema` above for the allowed values and security notes.

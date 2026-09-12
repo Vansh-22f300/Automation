@@ -145,6 +145,7 @@ export class WebhookSignatureRepository implements WebhookSignatureResolver {
 
     const decrypted = this.cipher.decrypt(
       connection.encryptedCredentials as EncryptedEnvelope,
+      { tenantId: this.scope.tenantId, connectionId: connection.id },
     );
     const secretValue = decrypted.secret;
     if (typeof secretValue !== 'string' || secretValue.length === 0) {

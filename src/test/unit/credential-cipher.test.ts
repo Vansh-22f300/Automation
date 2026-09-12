@@ -1,10 +1,16 @@
 /**
- * Credential cipher unit tests.
+ * Credential cipher unit tests — v1 envelope shape and capability split.
  *
  * These prove the properties that make the store trustworthy, not just that it
  * "runs": a true round-trip, non-deterministic ciphertext, and — the two that
  * matter most — that tampering and the wrong key are *detected* rather than
- * silently yielding forged plaintext.
+ * silently yielding forged plaintext. The v2 envelope shape, AAD binding, and
+ * the `encryptWithActive` / `kid` resolution paths are covered by the sibling
+ * file `credential-cipher-v2.test.ts`.
+ *
+ * The constructor takes `(legacyV1Writer, ring)`. For tests that only care
+ * about the v1 read/write path, the same KEY is registered in both places: as
+ * the legacy writer and as the ring's `legacy-v1` decrypt-only entry.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -13,13 +19,14 @@ import {
   CredentialCipher,
   CredentialDecryptionError,
   CredentialKeyInvalidError,
-  CredentialKeyMissingError,
+  CredentialLegacyV1WriterMissingError,
   generateCredentialKey,
   parseCredentialKey,
 } from '@/security/credential-cipher.js';
+import { KeyRing } from '@/security/keyring.js';
 
 const KEY = parseCredentialKey(generateCredentialKey());
-const cipher = () => new CredentialCipher(KEY);
+const cipher = () => new CredentialCipher(KEY, KeyRing.fromLegacyKey(KEY));
 
 describe('CredentialCipher round-trip', () => {
   it('decrypt(encrypt(x)) deep-equals x', () => {
@@ -28,7 +35,7 @@ describe('CredentialCipher round-trip', () => {
     expect(cipher().decrypt(envelope)).toEqual(secret);
   });
 
-  it('produces a versioned, self-describing envelope', () => {
+  it('produces a versioned, self-describing envelope (v: 1)', () => {
     const envelope = cipher().encrypt({ a: 1 });
     expect(envelope.v).toBe(1);
     expect(envelope.alg).toBe('aes-256-gcm');
@@ -72,14 +79,16 @@ describe('CredentialCipher tamper & key detection', () => {
 
   it('fails to decrypt with the wrong key', () => {
     const envelope = cipher().encrypt({ token: 'x' });
-    const other = new CredentialCipher(parseCredentialKey(generateCredentialKey()));
+    const otherKey = parseCredentialKey(generateCredentialKey());
+    const other = new CredentialCipher(otherKey, KeyRing.fromLegacyKey(otherKey));
     expect(() => other.decrypt(envelope)).toThrow(CredentialDecryptionError);
   });
 
-  it('rejects an unsupported envelope version/algorithm', () => {
+  it('rejects an unsupported envelope algorithm', () => {
     const envelope = cipher().encrypt({ token: 'x' });
-    expect(() => cipher().decrypt({ ...envelope, v: 2 })).toThrow(CredentialDecryptionError);
-    expect(() => cipher().decrypt({ ...envelope, alg: 'rot13' })).toThrow(CredentialDecryptionError);
+    expect(() => cipher().decrypt({ ...envelope, alg: 'rot13' as 'aes-256-gcm' })).toThrow(
+      CredentialDecryptionError,
+    );
   });
 
   it('rejects a malformed iv/tag length', () => {
@@ -90,21 +99,21 @@ describe('CredentialCipher tamper & key detection', () => {
   });
 });
 
-describe('CredentialCipher missing key', () => {
-  const keyless = new CredentialCipher(null);
+describe('CredentialCipher missing key (v1 writer split)', () => {
+  const keyless = new CredentialCipher(null, KeyRing.empty());
 
-  it('reports no key', () => {
+  it('reports no key when neither capability is configured', () => {
     expect(keyless.hasKey).toBe(false);
     expect(cipher().hasKey).toBe(true);
   });
 
-  it('throws CredentialKeyMissingError when encryption is requested', () => {
-    expect(() => keyless.encrypt({ a: 1 })).toThrow(CredentialKeyMissingError);
+  it('throws CredentialLegacyV1WriterMissingError on encrypt with no v1 writer', () => {
+    expect(() => keyless.encrypt({ a: 1 })).toThrow(CredentialLegacyV1WriterMissingError);
   });
 
-  it('throws CredentialKeyMissingError when decryption is requested', () => {
+  it('throws CredentialDecryptionError("legacy_v1_key_missing") on decrypt of v1 envelope with no ring entry', () => {
     const envelope = cipher().encrypt({ a: 1 });
-    expect(() => keyless.decrypt(envelope)).toThrow(CredentialKeyMissingError);
+    expect(() => keyless.decrypt(envelope)).toThrow(CredentialDecryptionError);
   });
 });
 

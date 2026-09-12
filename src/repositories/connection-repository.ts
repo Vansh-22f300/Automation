@@ -20,7 +20,7 @@
  * without a key (the key is only demanded when an encrypt/decrypt actually runs).
  */
 
-import { and, desc, eq, lt, or } from "drizzle-orm";
+import { and, desc, eq, lt, or, sql } from "drizzle-orm";
 
 import { BadRequestError } from "@/api/errors.js";
 import { connections } from "@/db/schema.js";
@@ -47,6 +47,29 @@ import type {
 
 export interface ConnectionListPage {
   readonly items: readonly ConnectionMetadata[];
+  readonly nextCursor: string | null;
+}
+
+/**
+ * A connection row that is "rotatable": its stored envelope's `kid` is not the
+ * current active kid (or it has no `kid`, i.e. it is a v1 envelope). The
+ * encrypted envelope is included so a dry-run can validate the same key
+ * resolution and AAD a real rotation would perform, without re-fetching.
+ */
+export interface RotatableConnection {
+  readonly id: string;
+  readonly provider: string;
+  readonly name: string;
+  readonly status: ConnectionStatus;
+  readonly metadata: Record<string, unknown>;
+  readonly encryptedCredentials: EncryptedEnvelope;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+  readonly lastUsedAt: Date | null;
+}
+
+export interface RotatableListPage {
+  readonly items: readonly RotatableConnection[];
   readonly nextCursor: string | null;
 }
 
@@ -279,6 +302,7 @@ export class ConnectionRepository
 
     const credential = this.cipher.decrypt(
       row.encryptedCredentials as EncryptedEnvelope,
+      { tenantId: this.tenantId, connectionId: row.id },
     );
 
     // Best-effort hygiene: record that the credential was used. Scoped to tenant.
@@ -296,5 +320,139 @@ export class ConnectionRepository
       },
       credential,
     };
+  }
+
+  /**
+   * Page through this tenant's connections whose envelope `kid` is not the
+   * current active kid. v1 envelopes (no `kid` field) match because the
+   * jsonb `->>` extraction returns NULL, which is DISTINCT FROM any string.
+   * Already-rotated rows (kid = activeKid) are excluded at the SQL layer;
+   * re-running rotation on the same tenant is a no-op.
+   *
+   * The query is a plain SELECT (no FOR UPDATE). A dry-run that calls this
+   * method does not contend with a concurrent real rotation; a real
+   * rotation re-checks the predicate under the row lock inside
+   * {@link rotateCredentials}.
+   *
+   * Ordering and keyset pagination reuse {@link listMetadataPage}'s contract
+   * verbatim: `(created_at DESC, id DESC)` with a base64url-encoded cursor.
+   */
+  async listRotatable(
+    activeKid: string,
+    options: { readonly limit?: number; readonly cursor?: string } = {},
+  ): Promise<RotatableListPage> {
+    const pageLimit = Math.max(1, Math.min(options.limit ?? 100, 100));
+    const parsedCursor =
+      options.cursor === undefined
+        ? null
+        : ConnectionRepository.decodeCursor(options.cursor);
+    const cursorDate =
+      parsedCursor === null ? null : new Date(parsedCursor.createdAt);
+    const cursorId = parsedCursor?.id;
+    const cursorClause =
+      cursorDate === null || cursorId === undefined
+        ? undefined
+        : or(
+            lt(connections.createdAt, cursorDate),
+            and(
+              eq(connections.createdAt, cursorDate),
+              lt(connections.id, cursorId),
+            ),
+          );
+
+    const kidMismatch = sql`(${connections.encryptedCredentials} ->> 'kid') IS DISTINCT FROM ${activeKid}`;
+    const whereClause =
+      cursorClause === undefined
+        ? this.scope.where(connections.tenantId, kidMismatch)
+        : this.scope.where(connections.tenantId, cursorClause, kidMismatch);
+
+    const rows = await this.db
+      .select()
+      .from(connections)
+      .where(whereClause)
+      .orderBy(desc(connections.createdAt), desc(connections.id))
+      .limit(pageLimit + 1);
+
+    const items = rows.slice(0, pageLimit).map((row) => ({
+      id: row.id,
+      provider: row.provider,
+      name: row.name,
+      status: row.status as ConnectionStatus,
+      metadata: (row.metadata ?? {}) as Record<string, unknown>,
+      encryptedCredentials: row.encryptedCredentials as EncryptedEnvelope,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      lastUsedAt: row.lastUsedAt,
+    }));
+    const lastRow = rows[pageLimit - 1];
+    const nextCursor =
+      rows.length > pageLimit && lastRow !== undefined
+        ? ConnectionRepository.encodeCursor({
+            createdAt: lastRow.createdAt.toISOString(),
+            id: lastRow.id,
+          })
+        : null;
+    return { items, nextCursor };
+  }
+
+  /**
+   * Per-row rotation transaction. Locks the row, re-checks the rotatable
+   * predicate under the lock (compare-and-set: a concurrent rotation that
+   * just committed on this row will see kid = activeKid and return null),
+   * decrypts the existing envelope, re-encrypts under the active kid with
+   * the row's AAD binding, and bumps `updated_at` to `now()`.
+   *
+   * Returns:
+   *   - the row's metadata, with the new envelope, when the row was rotated;
+   *   - `null` when the row is not in this tenant, has been deleted, or is
+   *     already on the active kid at the moment the row lock is acquired.
+   *
+   * The transaction is intentionally short and scoped to one row. It does
+   * NOT touch `last_used_at` — only `encrypted_credentials` and `updated_at`.
+   * Concurrent reads (e.g. `resolveForTool`) take MVCC snapshots at SELECT
+   * start and never block on rotation's row lock; concurrent `UPDATE` paths
+   * (`updateMetadata`, `disable`, `delete`) serialize with rotation by row
+   * lock acquisition order, applying to the rotated row atomically.
+   */
+  async rotateCredentials(
+    id: string,
+    activeKid: string,
+  ): Promise<ConnectionMetadata | null> {
+    return this.db.transaction(async (tx) => {
+      const kidMismatch = sql`(${connections.encryptedCredentials} ->> 'kid') IS DISTINCT FROM ${activeKid}`;
+      const [row] = await tx
+        .select()
+        .from(connections)
+        .where(
+          and(
+            eq(connections.tenantId, this.tenantId),
+            eq(connections.id, id),
+            kidMismatch,
+          ),
+        )
+        .for('update');
+      if (!row) return null;
+
+      const envelope = row.encryptedCredentials as EncryptedEnvelope;
+      const aad = Buffer.from(`${this.tenantId}:${row.id}`, 'utf8');
+      const plaintext = this.cipher.decrypt(envelope, {
+        tenantId: this.tenantId,
+        connectionId: row.id,
+        aad,
+      });
+
+      const newEnvelope = this.cipher.encryptWithActive(plaintext, aad);
+      const [updated] = await tx
+        .update(connections)
+        .set({ encryptedCredentials: newEnvelope, updatedAt: new Date() })
+        .where(
+          and(
+            eq(connections.tenantId, this.tenantId),
+            eq(connections.id, id),
+          ),
+        )
+        .returning();
+      return updated ? ConnectionRepository.toMetadata(updated) : null;
+    });
   }
 }
