@@ -970,6 +970,28 @@ itself sits behind a framework-free `Authenticator` seam that yields
 `request.auth.tenantId`, so it can be swapped for sessions, OAuth or RBAC later
 without touching route code.
 
+Tenant isolation is verified by three complementary layers:
+
+- **Per-domain integration suites** (`connections.test.ts`, `jobs.test.ts`,
+  `api-keys.test.ts`, `workflows.test.ts`, `webhooks.test.ts`, `execution.test.ts`,
+  `run-inspection.test.ts`) assert the per-repository view: each one proves its
+  own tenant-scoped reads/writes are blind to other tenants.
+- **A consolidated cross-tenant security suite** in
+  `src/test/integration/tenant-isolation.test.ts` exercises every tenant-facing
+  surface end-to-end against a real PostgreSQL across eight categories (A–H):
+  API keys, workflows, runs, events/jobs, connections, webhook HMAC, execution,
+  and a negative data-shape sweep that checks A's responses for any of B's
+  distinguishing markers.
+- **A static architecture test** in
+  `src/test/unit/tenant-isolation-architecture.test.ts` reads every file in
+  `src/repositories/` and enforces that every class operating on a tenant-scoped
+  table either extends `TenantScopedRepository`, takes a `TenantScope`
+  directly, or uses one of a small number of named alternative mechanisms
+  (`PostgresJobQueue`'s optional `tenantId` option, `WorkflowExecutor`'s
+  per-`ClaimedJob` tenant id, or the legacy auth-only `DrizzleApiKeyStore`). It
+  fails the build when a future repository or service bypasses the scope, and
+  its named allow-list makes the rationale for each exception explicit.
+
 ## Testing
 
 ```bash
