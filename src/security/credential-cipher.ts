@@ -29,9 +29,11 @@
  *
  * Two parallel capabilities back the cipher:
  *
- *   - **legacyV1Writer** — the bytes that produce v1 envelopes. Set from either
- *     the legacy env var (`CREDENTIAL_ENCRYPTION_KEY`) or the keyring's
- *     `legacy-v1` entry. Null means `encrypt()` throws `legacy_v1_writer_missing`.
+ *   - **legacyV1Writer** — the bytes that produce v1 envelopes. Always the
+ *     keyring's `legacy-v1` entry (the same entry v1 reads resolve), fed either
+ *     by an explicit keyring entry or by auto-import of the legacy env var
+ *     (`CREDENTIAL_ENCRYPTION_KEY`) when no keyring is configured. Null means
+ *     `encrypt()` throws `legacy_v1_writer_missing`.
  *   - **ring** — the keyring carrying zero-or-more keys, the first of which is the
  *     **v2 active key**. Null active means `encryptWithActive()` throws
  *     `active_key_missing`. Encryption via the ring goes through the cipher (so AAD
@@ -417,10 +419,11 @@ export class CredentialCipher {
  *   When absent but `CREDENTIAL_ENCRYPTION_KEY` is set, the legacy key is auto-
  *   imported as a single decrypt-only `legacy-v1` entry. When both are absent, the
  *   ring is empty (use-time failures surface typed errors).
- * - `legacyV1Writer` is set from the legacy env var when present, OR from the
- *   ring's `legacy-v1` entry when the new var was set without one (the
- *   "keyring-first" deployment). Null when neither source provides it (the
- *   "keyring without legacy" deployment), and `encrypt()` fails at first use.
+ * - `legacyV1Writer` is always the ring's `legacy-v1` entry — the same entry
+ *   `decrypt` resolves for v1 envelopes — so a v1 write capability always has
+ *   a matching v1 read capability. It is null unless the ring carries
+ *   `legacy-v1` (via an explicit keyring entry, or the auto-import when only
+ *   the legacy env var is set), and `encrypt()` fails at first use otherwise.
  *
  * See the env × behaviour matrix in §7 of the architectural plan for the exact
  * contract this factory implements.
@@ -440,20 +443,15 @@ export function createCredentialCipher(env: Env): CredentialCipher {
     ring = KeyRing.empty();
   }
 
-  // Build the legacyV1Writer: keyring's legacy-v1 entry wins over the legacy
-  // env var. The §7 matrix row "present / present, keyring contains legacy-v1"
-  // is explicit: when both sources exist, the keyring's bytes are authoritative
-  // for the v1 writer. The legacy env var only acts as a backstop when the
-  // keyring lacks a legacy-v1 entry — that is the "keyring-first deployment
-  // keeps create working" case.
-  let legacyV1Writer: Buffer | null;
-  if (ring.hasLegacyV1) {
-    legacyV1Writer = ring.legacyV1Key;
-  } else if (legacyKey !== null) {
-    legacyV1Writer = legacyKey;
-  } else {
-    legacyV1Writer = null;
-  }
+  // The v1 writer is the ring's `legacy-v1` entry — the exact entry the v1
+  // reader resolves — so a v1 write capability always has a matching v1 read
+  // capability. When CREDENTIAL_ENCRYPTION_KEYS is absent, the legacy env var
+  // reaches this entry through the auto-import above; once a keyring is
+  // configured it is the single source of truth and the legacy var is ignored.
+  // A keyring without a `legacy-v1` entry therefore has NO v1 writer: `encrypt`
+  // fails with `credential_legacy_v1_writer_missing` instead of writing v1
+  // envelopes that nothing could ever read back.
+  const legacyV1Writer = ring.legacyV1Key;
 
   return new CredentialCipher(legacyV1Writer, ring);
 }

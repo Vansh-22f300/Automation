@@ -384,9 +384,10 @@ const envSchema = z
    * Optional: an existing single-key deployment can continue to set only
    * `CREDENTIAL_ENCRYPTION_KEY` (the legacy key is auto-imported as a single
    * `legacy-v1` decrypt-only ring entry, with the same bytes backing the v1
-   * write path). Setting both vars is permitted: the keyring is the source of
-   * truth for decryption; the legacy var is honoured as the v1 writer only
-   * when the keyring itself lacks a `legacy-v1` entry.
+   * write path). Setting both vars is permitted: once a keyring is configured
+   * it is the single source of truth — the legacy var is ignored, and a v1
+   * writer exists only when the keyring carries a `legacy-v1` entry (a v1
+   * write capability always has a matching v1 read capability).
    *
    * Detailed shape validation (kid regex, key bytes, reserved-kid rules) lives
    * in `KeyRing.parse` and surfaces as a typed `CredentialKeyInvalidError` at

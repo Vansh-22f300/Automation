@@ -24,6 +24,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CredentialCipher,
   CredentialKeyInvalidError,
+  CredentialLegacyV1WriterMissingError,
   createCredentialCipher,
   generateCredentialKey,
   parseCredentialKey,
@@ -216,12 +217,17 @@ describe('createCredentialCipher — env × behaviour matrix', () => {
     expect(reference.decrypt(v1)).toEqual({ a: 1 });
   });
 
-  it('new present (no legacy-v1) / legacy present → writer from legacy var; keyring has active only', () => {
+  it('new present (no legacy-v1) / legacy present → legacy var ignored; no v1 writer; v2 active present', () => {
     const c = make(K1.toString('base64'), `${kidA}:${kidA_b64}`);
-    const v1 = c.encrypt({ a: 1 });
-    expect(v1.v).toBe(1);
-    // The ring has no legacy-v1, so v1 decrypt fails.
-    expect(() => c.decrypt(v1)).toThrow();
+    expect(c.hasKey).toBe(true);
+    // Once a keyring is configured it is the single source of truth: without a
+    // `legacy-v1` entry there is no v1 writer. The legacy var must NOT back the
+    // writer here — a v1 write capability always has a matching v1 read
+    // capability, and the ring could never read those envelopes back.
+    expect(() => c.encrypt({ a: 1 })).toThrow(CredentialLegacyV1WriterMissingError);
+    // v2 write + read works.
+    const env = c.encryptWithActive({ a: 1 }, Buffer.from('a:b'));
+    expect(c.decrypt(env, { tenantId: 't', connectionId: 'c', aad: Buffer.from('a:b') })).toEqual({ a: 1 });
   });
 
   it('legacy absent / new absent → ring empty, writer null, hasKey = false', () => {
