@@ -37,6 +37,7 @@ import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WebhookRepository } from '@/repositories/webhook-repository.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
 import { CredentialCipher, generateCredentialKey, parseCredentialKey } from '@/security/credential-cipher.js';
+import { KeyRing } from '@/security/keyring.js';
 import { StepFailedError } from '@/worker/dispatcher.js';
 
 import { FakeLlmProvider } from '../support/fake-llm-provider.js';
@@ -321,7 +322,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('llm workflow step integration'
 
   it('runs a tool-calling llm step end to end: Slack tool executes, per-round usage persists', async () => {
     // A cipher with a real key so the encrypted bot token round-trips through the DB.
-    const cipher = new CredentialCipher(parseCredentialKey(generateCredentialKey()));
+    const cipherKey = parseCredentialKey(generateCredentialKey());
+    const cipher = new CredentialCipher(cipherKey, KeyRing.fromLegacyKey(cipherKey));
     const connectionsRepo = new ConnectionRepository(new TenantScope(handle.db, tenantA), cipher);
     const connection = await connectionsRepo.create({
       provider: SLACK_PROVIDER,

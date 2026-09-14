@@ -14,6 +14,7 @@
  *   testable as the system grows.
  */
 
+import { isIP } from 'node:net';
 import { z } from 'zod';
 
 import { DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS } from '@/domain/timing.js';
@@ -145,6 +146,151 @@ const credentialEncryptionKey = z
     });
   });
 
+/**
+ * Trusted proxy configuration for Fastify's `trustProxy` option.
+ *
+ * Controls whether `request.ip` (and thus the rate limiter's key) is derived
+ * from `X-Forwarded-For` headers. The value is deliberately explicit and
+ * defaults to `false` so local development is safe by default:
+ *
+ * - `false` / `0` / unset → do not trust forwarding headers; `request.ip` is
+ *   always the socket's remote address. A forged `X-Forwarded-For` cannot
+ *   change the rate-limit bucket.
+ * - `true` / `1` → trust `X-Forwarded-For` (Fastify `trustProxy: true`).
+ *   Enable **only** when the API is deployed behind a trusted reverse
+ *   proxy/PaaS that is the sole ingress and that correctly appends the real
+ *   client IP. In that deployment the limiter keys by the forwarded client IP
+ *   rather than the proxy's IP.
+ * - A comma-separated list of trusted proxy addresses, CIDR ranges, or the
+ *   predefined names `loopback`, `linklocal`, `uniquelocal` (as understood by
+ *   `@fastify/proxy-addr`) is also accepted and passed directly to Fastify
+ *   for more precise control (e.g. `TRUST_PROXY=loopback` or
+ *   `TRUST_PROXY=10.0.0.0/8,172.16.0.0/12`). This lets the deployment
+ *   explicitly name the proxy rather than trusting all hops.
+ *
+ * The validation below rejects obvious nonsense (empty value, unknown token)
+ * with a clear message without echoing the raw value when it might be sensitive,
+ * but intentionally stays permissive for CIDR/IP syntax — the underlying
+ * `@fastify/proxy-addr` will throw at boot if the compiled trust is invalid,
+ * which is fail-fast enough for deployment.
+ */
+const trustProxySchema = z
+  .string()
+  .default('false')
+  .superRefine((value, ctx) => {
+    const trimmed = value.trim();
+    if (trimmed === '') {
+      ctx.addIssue({ code: 'custom', message: 'must not be empty' });
+      return;
+    }
+    const lower = trimmed.toLowerCase();
+    if (lower === 'true' || lower === 'false' || trimmed === '0' || trimmed === '1') return;
+
+    // Comma-separated list: each token must be a known range or an IP/CIDR.
+    const parts = trimmed
+      .split(',')
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+    if (parts.length === 0) {
+      ctx.addIssue({ code: 'custom', message: 'must be true, false, 1, 0 or a comma-separated list of IPs/CIDRs/ranges' });
+      return;
+    }
+    for (const part of parts) {
+      const lowerPart = part.toLowerCase();
+      if (lowerPart === 'loopback' || lowerPart === 'linklocal' || lowerPart === 'uniquelocal') continue;
+      const slashIdx = part.indexOf('/');
+      if (slashIdx !== -1) {
+        const ipPart = part.slice(0, slashIdx);
+        const prefixPart = part.slice(slashIdx + 1);
+        if (isIP(ipPart) === 0) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `"${part}" is not a valid IP/CIDR — expected like 10.0.0.0/8 or loopback`,
+          });
+          return;
+        }
+        const prefixNum = Number(prefixPart);
+        if (!Number.isInteger(prefixNum)) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `"${part}" has a non-integer CIDR prefix`,
+          });
+          return;
+        }
+        const max = isIP(ipPart) === 6 ? 128 : 32;
+        if (prefixNum < 0 || prefixNum > max) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `"${part}" has an out-of-range CIDR prefix (0–${max})`,
+          });
+          return;
+        }
+      } else {
+        if (isIP(part) === 0) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `"${part}" is not a valid IP, CIDR, or known range (loopback/linklocal/uniquelocal)`,
+          });
+          return;
+        }
+      }
+    }
+  })
+  .transform((value) => {
+    const trimmed = value.trim();
+    const lower = trimmed.toLowerCase();
+    if (lower === 'false' || trimmed === '0') return false as const;
+    if (lower === 'true' || trimmed === '1') return true as const;
+    return trimmed;
+  })
+  .pipe(z.union([z.boolean(), z.string().min(1)]));
+
+/**
+ * Extract a normalized Postgres target (host, port, database) from a connection
+ * string for semantic comparison. Reuses the same `URL` parsing as `postgresUrl`
+ * and `describeDatabaseUrl` so formatting differences (user, password, query
+ * string like `?sslmode=require`) do not bypass isolation checks. Returns null
+ * if the string cannot be parsed.
+ */
+function postgresIdentity(raw: string): { host: string; port: string; database: string } | null {
+  try {
+    const url = new URL(raw);
+    let host = url.hostname.toLowerCase();
+    // `URL.hostname` keeps brackets for IPv6 literals (e.g. "[::1]") and may
+    // normalize IPv4-mapped addresses (127.0.0.1 → 7f00:1). Strip brackets for
+    // semantic comparison so different URL forms of the same target match.
+    if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+    const port = url.port === '' ? '5432' : url.port;
+    const rawDb = url.pathname.replace(/^\//, '').split('/')[0] ?? '';
+    let database: string;
+    try {
+      database = decodeURIComponent(rawDb);
+    } catch {
+      database = rawDb;
+    }
+    return { host, port, database };
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackHost(host: string): boolean {
+  let lower = host.toLowerCase();
+  if (lower.startsWith('[') && lower.endsWith(']')) lower = lower.slice(1, -1);
+  // Covers the common localhost forms without overengineering the full 127/8 range.
+  // Handles both the dotted IPv4-mapped form and the hex-normalized form that
+  // `URL` produces (127.0.0.1 → 7f00:1, so ::ffff:127.0.0.1 → ::ffff:7f00:1).
+  return (
+    lower === 'localhost' ||
+    lower === '127.0.0.1' ||
+    lower === '::1' ||
+    lower === '::ffff:127.0.0.1' ||
+    lower === '::ffff:7f00:1' ||
+    lower === '0:0:0:0:0:ffff:127.0.0.1' ||
+    lower === '0:0:0:0:0:ffff:7f00:1'
+  );
+}
+
 const envSchema = z
   .object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -161,6 +307,14 @@ const envSchema = z
    * the URL itself (`?sslmode=require`), not a separate variable.
    */
   DATABASE_URL: postgresUrl,
+
+  /**
+   * Test database URL used only by the integration suites. Never used at runtime
+   * by the API or worker. Optional so the app boots without it, but when present
+   * it must be a valid PostgreSQL URL — and it must not resolve to the same
+   * database as `DATABASE_URL`, otherwise destructive tests could target production.
+   */
+  TEST_DATABASE_URL: postgresUrl.optional(),
 
   /**
    * Maximum pooled connections *per process*. Two processes run (api, worker),
@@ -218,6 +372,37 @@ const envSchema = z
    * to encrypt/decrypt fail clearly when it is missing. Never logged or persisted.
    */
   CREDENTIAL_ENCRYPTION_KEY: credentialEncryptionKey.optional(),
+
+  /**
+   * Multi-key credential keyring (`CREDENTIAL_ENCRYPTION_KEYS`).
+   *
+   * Format: comma-separated `<kid>:<base64key>` pairs. The **first** entry is the
+   * active encrypt key; every subsequent entry is decrypt-only. The literal kid
+   * `legacy-v1` is reserved and is always decrypt-only (the parser rejects a
+   * keyring whose first entry is `legacy-v1`).
+   *
+   * Optional: an existing single-key deployment can continue to set only
+   * `CREDENTIAL_ENCRYPTION_KEY` (the legacy key is auto-imported as a single
+   * `legacy-v1` decrypt-only ring entry, with the same bytes backing the v1
+   * write path). Setting both vars is permitted: once a keyring is configured
+   * it is the single source of truth — the legacy var is ignored, and a v1
+   * writer exists only when the keyring carries a `legacy-v1` entry (a v1
+   * write capability always has a matching v1 read capability).
+   *
+   * Detailed shape validation (kid regex, key bytes, reserved-kid rules) lives
+   * in `KeyRing.parse` and surfaces as a typed `CredentialKeyInvalidError` at
+   * boot. The check is intentionally duplicated at config-time and at
+   * cipher-time so the factory and the cipher agree on the contract.
+   */
+  CREDENTIAL_ENCRYPTION_KEYS: z.string().min(1, 'must not be empty when set').optional(),
+
+  /**
+   * Trusted proxy configuration for Fastify `trustProxy`.
+   *
+   * See `trustProxySchema` above for the allowed values and security notes.
+   * Defaults to `false` so local/dev is safe without any extra config.
+   */
+  TRUST_PROXY: trustProxySchema,
   })
   .superRefine((env, ctx) => {
     // Reject ambiguous credentials rather than silently picking one. An API key
@@ -229,6 +414,106 @@ const envSchema = z
         path: ['ANTHROPIC_AUTH_TOKEN'],
         message:
           'set either ANTHROPIC_API_KEY (direct Anthropic, x-api-key) or ANTHROPIC_AUTH_TOKEN (gateway bearer), not both',
+      });
+    }
+
+    // Invariant 3a: a gateway base URL without any credential is never valid.
+    // The provider (createClaudeProvider) would throw llm_missing_api_key at the
+    // first LLM call; failing at env validation gives a clearer, earlier error.
+    if (
+      env.ANTHROPIC_BASE_URL !== undefined &&
+      env.ANTHROPIC_API_KEY === undefined &&
+      env.ANTHROPIC_AUTH_TOKEN === undefined
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['ANTHROPIC_BASE_URL'],
+        message:
+          'ANTHROPIC_BASE_URL is set but no credential is set — set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN',
+      });
+    }
+
+    // Invariant 3b: in production a gateway must be reached over TLS.
+    if (env.NODE_ENV === 'production' && env.ANTHROPIC_BASE_URL !== undefined) {
+      try {
+        const url = new URL(env.ANTHROPIC_BASE_URL);
+        if (url.protocol !== 'https:') {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['ANTHROPIC_BASE_URL'],
+            message: 'must use https:// in production',
+          });
+        }
+      } catch {
+        // Leave to the base schema's URL error; no additional issue needed.
+      }
+    }
+
+    // Invariant 1: production must not point at a development/test database.
+    // Hostname checks use URL.hostname normalization (lowercased, brackets stripped)
+    // and database checks decode the pathname then look for \"test\" case-insensitively.
+    if (env.NODE_ENV === 'production') {
+      const identity = postgresIdentity(env.DATABASE_URL);
+      if (identity !== null) {
+        if (isLoopbackHost(identity.host)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['DATABASE_URL'],
+            message: 'must not point to localhost in production — use a hosted PostgreSQL URL',
+          });
+        }
+        if (identity.database.toLowerCase().includes('test')) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['DATABASE_URL'],
+            message: 'must not use a test database in production (database name must not contain \"test\")',
+          });
+        }
+      }
+    }
+
+    // Invariant 2: the test database must not resolve to the same database as
+    // the runtime database. Semantic comparison reuses URL parsing (host/port/database)
+    // so harmless formatting differences (different user, password, query string,
+    // trailing slash) cannot bypass the check.
+    if (env.DATABASE_URL !== undefined && env.TEST_DATABASE_URL !== undefined) {
+      const main = postgresIdentity(env.DATABASE_URL);
+      const test = postgresIdentity(env.TEST_DATABASE_URL);
+      if (main !== null && test !== null) {
+        if (
+          main.host === test.host &&
+          main.port === test.port &&
+          main.database.toLowerCase() === test.database.toLowerCase()
+        ) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['TEST_DATABASE_URL'],
+            message:
+              'must not resolve to the same database as DATABASE_URL — use a separate test database (host, port and database must differ; query strings are ignored)',
+          });
+        }
+      } else if (env.DATABASE_URL === env.TEST_DATABASE_URL) {
+        // Fallback for unparsable URLs that already failed base validation;
+        // ensures raw equality is still caught without duplicating secret values.
+        ctx.addIssue({
+          code: 'custom',
+          path: ['TEST_DATABASE_URL'],
+          message:
+            'must not be the same as DATABASE_URL — use a separate test database',
+        });
+      }
+    }
+
+    // Invariant 4: production must bind a non-loopback address.
+    // The dev default 127.0.0.1 would start yet be unreachable on a PaaS/container,
+    // looking healthy to a supervisor. Force an explicit HOST. Reuse the same
+    // loopback check as DATABASE_URL so bracketed and hex-normalized forms are covered.
+    if (env.NODE_ENV === 'production' && isLoopbackHost(env.HOST)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['HOST'],
+        message:
+          'must not be 127.0.0.1 in production — set HOST=0.0.0.0 for containers/PaaS (or another non-loopback address)',
       });
     }
   });

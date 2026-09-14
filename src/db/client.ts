@@ -58,6 +58,28 @@ const IDLE_TIMEOUT_MS = 30_000;
  */
 const DEFAULT_STATEMENT_TIMEOUT_MS = 30_000;
 
+/**
+ * How long a session may sit idle *inside* a transaction with no query.
+ *
+ * Once exceeded, PostgreSQL aborts the transaction with
+ * `ERROR: idle_in_transaction_session_timeout` and returns the connection to
+ * the pool's idle state. This bounds the blast radius of application code that
+ * becomes stuck or accidentally leaves a transaction open (e.g. an await that
+ * never resolves between `BEGIN` and `COMMIT`).
+ *
+ * The execution engine runs handlers *outside* any DB transaction (two-transaction
+ * model — beginStep / settleStep), so legitimate transactions are only the
+ * short bookkeeping around the handler: lock row, insert/update, commit. Those
+ * complete in milliseconds, so 30s is generous for normal operation but tight
+ * enough to reclaim a leaked transaction before it can hold row locks or bloat
+ * `pg_stat_activity` indefinitely.
+ *
+ * Centralized here (not an env var) so production is always bounded without
+ * relying on operator configuration — consistent with `statement_timeout` above.
+ * Neon and vanilla PostgreSQL both honor it as a session startup parameter.
+ */
+export const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = 30_000;
+
 export interface DatabaseOptions {
   /** Identifies this process in `pg_stat_activity`. */
   readonly service: string;
@@ -124,13 +146,29 @@ export function createDatabase(
   logger: Logger,
   options: DatabaseOptions,
 ): DatabaseHandle {
+  const effectiveStatementTimeout = options.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS;
+  const effectiveIdleTimeout = DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS;
+
   const config: PoolConfig = {
     connectionString: env.DATABASE_URL,
     max: env.DATABASE_POOL_MAX,
     connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
     idleTimeoutMillis: IDLE_TIMEOUT_MS,
     application_name: `ai-workforce-${options.service}`,
-    statement_timeout: options.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS,
+    statement_timeout: effectiveStatementTimeout,
+    // `pg` forwards this as a startup parameter in Client#getStartupConf();
+    // PostgreSQL aborts an idle-in-transaction session with `25P03` after this.
+    idle_in_transaction_session_timeout: effectiveIdleTimeout,
+    // Pooled Neon (PgBouncer transaction mode) ignores unsupported startup GUCs.
+    // `pg-pool` awaits `onConnect` before handing the client out; a rejection
+    // quarantines the connection rather than exposing an unconfigured one.
+    // Values are internal validated numbers, never user input.
+    // `onConnect` is typed as `() => void` in @types/pg but runtime supports Promise
+    // (pg-pool `_promiseTry`), so `async` is safe and correctly awaited.
+    onConnect: async (client: { query: (sql: string) => Promise<unknown> }) => {
+      await client.query(`SET statement_timeout = ${effectiveStatementTimeout}`);
+      await client.query(`SET idle_in_transaction_session_timeout = ${effectiveIdleTimeout}`);
+    },
   };
 
   const pool = new pg.Pool(config);

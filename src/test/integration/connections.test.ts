@@ -33,6 +33,7 @@ import {
   generateCredentialKey,
   parseCredentialKey,
 } from "@/security/credential-cipher.js";
+import { KeyRing } from "@/security/keyring.js";
 import {
   DisabledConnectionError,
   MissingConnectionError,
@@ -47,9 +48,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
     let tenantA: string;
     let tenantB: string;
     // A test-only key, generated here — never a real deployment key.
-    const cipher = new CredentialCipher(
-      parseCredentialKey(generateCredentialKey()),
-    );
+    const cipherKey = parseCredentialKey(generateCredentialKey());
+    const cipher = new CredentialCipher(cipherKey, KeyRing.fromLegacyKey(cipherKey));
 
     const repoFor = (tenantId: string): ConnectionRepository =>
       new ConnectionRepository(new TenantScope(handle.db, tenantId), cipher);

@@ -23,18 +23,29 @@
 import { MAX_CRASH_ATTEMPTS } from '@/domain/queue.js';
 import type { Logger } from '@/observability/logger.js';
 import type { Queue, ReapResult } from '@/domain/queue.js';
+import type { WorkerHeartbeat } from '@/worker/heartbeat.js';
 
 export interface ReaperOptions {
   readonly queue: Queue;
   readonly logger: Logger;
   /** How often to sweep for expired leases. */
   readonly intervalMs: number;
+  /**
+   * Optional in-memory heartbeat tracker. When supplied, the reaper counts
+   * every job it recovers (both requeued and dead-lettered) into the same
+   * shared counter, so an operator looking at a single snapshot sees the
+   * worker process's overall throughput, not just the worker-loop half of
+   * it. Omitting it is safe — production wiring in `main.ts` always supplies
+   * one.
+   */
+  readonly heartbeat?: WorkerHeartbeat;
 }
 
 export class Reaper {
   private readonly queue: Queue;
   private readonly logger: Logger;
   private readonly intervalMs: number;
+  private readonly heartbeat: WorkerHeartbeat | undefined;
 
   private running = false;
   private timer: NodeJS.Timeout | undefined;
@@ -44,6 +55,7 @@ export class Reaper {
     this.queue = options.queue;
     this.logger = options.logger;
     this.intervalMs = options.intervalMs;
+    this.heartbeat = options.heartbeat;
   }
 
   start(): void {
@@ -91,6 +103,12 @@ export class Reaper {
           'job_dead_lettered',
         );
       }
+
+      // Count both kinds of recovery under one reaped counter — operators
+      // looking at the snapshot want the total jobs the reaper had to mop up,
+      // not the requeued-vs-dead-lettered split (which the per-job logs above
+      // already make visible).
+      this.heartbeat?.recordReaped(result.requeued + result.deadLettered.length);
 
       return result;
     } catch (error) {

@@ -1,2 +1,6 @@
+# pnpm settings for the frontend package. Same allowBuilds rationale as the
+# root pnpm-workspace.yaml: esbuild's postinstall links the platform binary
+# that vite needs. (This file previously held an unedited template
+# placeholder; it now carries the real, valid configuration.)
 allowBuilds:
   esbuild: true

@@ -31,6 +31,7 @@ import { ToolRegistry } from '@/domain/tool-registry.js';
 import { ConnectionRepository } from '@/repositories/connection-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { CredentialCipher, generateCredentialKey, parseCredentialKey } from '@/security/credential-cipher.js';
+import { KeyRing } from '@/security/keyring.js';
 import { FakeSlackTransport } from '@/test/support/fake-slack-transport.js';
 
 import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
@@ -39,7 +40,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('slack connector integration', 
   let handle: DatabaseHandle;
   let tenantA: string;
   let tenantB: string;
-  const cipher = new CredentialCipher(parseCredentialKey(generateCredentialKey()));
+  const cipherKey = parseCredentialKey(generateCredentialKey());
+  const cipher = new CredentialCipher(cipherKey, KeyRing.fromLegacyKey(cipherKey));
 
   const repoFor = (tenantId: string): ConnectionRepository =>
     new ConnectionRepository(new TenantScope(handle.db, tenantId), cipher);

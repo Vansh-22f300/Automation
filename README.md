@@ -87,9 +87,10 @@ pnpm db:migrate
 | `pnpm workflow:create <tenantId> "<name>" [source]`                         | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids.                                                                                                                                                                                                                                                                                                                                                                               |
 | `pnpm webhooks:inspect <tenantId>`                                          | List a tenant's recent events, workflow runs, jobs, step runs and `llm_usage` (read-only dev aid to verify ingestion, queueing and execution).                                                                                                                                                                                                                                                                                                                                               |
 | `pnpm runs:inspect <tenantId> <runId> [--detail]`                           | Assemble one safe, tenant-scoped view of a single run — run/workflow/version, event, ordered step runs, jobs, per-round `llm_usage`, reconstructed tool activity and usage totals. Summaries (byte size + secret-scrubbed preview) by default; `--detail` attaches the raw values, still secret-scrubbed. Shares the **exact** assembler and redaction layer as `GET /v1/runs/:runId`.                                                                                                       |
-| `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY`). Never prints the decrypted secret or the key. To keep a token out of shell history, omit the trailing JSON and pass it via the `CONNECTION_CREDENTIAL_JSON` env var instead.                                                                                                                                                                                  |
+| `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY` or a `legacy-v1` entry in `CREDENTIAL_ENCRYPTION_KEYS`). Never prints the decrypted secret or the key. To keep a token out of shell history, omit the trailing JSON and pass it via the `CONNECTION_CREDENTIAL_JSON` env var instead.                                                                                                                                                                                  |
 | `pnpm connections list <tenantId>`                                          | List a tenant's connections — metadata only (id, provider/name, status, last-used), never the secret.                                                                                                                                                                                                                                                                                                                                                                                        |
 | `pnpm connections disable <tenantId> <connectionId>`                        | Disable a connection so it can no longer be resolved for a tool run.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `pnpm connections rotate <tenantId> [--connectionId <id>] [--dry-run] [--batch-size <N>]` | **Operator-only.** Re-encrypt every connection whose envelope `kid` is not the current active kid under the active key with `${tenantId}:${connectionId}` AAD binding. Pages via keyset cursors; each row is a short transaction (`SELECT … FOR UPDATE` + re-checked predicate + decrypt + re-encrypt + commit). `--dry-run` enumerates the same rows and performs the same cryptographic validation but writes **nothing**; per-row output is `would-rotate` or `would-fail <reason>` (`decrypt_failed`, `unknown_kid`, `legacy_v1_key_missing`, `malformed_envelope`). Exit codes: `0` clean, `1` partial, `2` total failure or misconfiguration. Requires `CREDENTIAL_ENCRYPTION_KEYS` with a real active kid; the legacy var alone is not enough. Never prints the decrypted secret or the key. |
 | `pnpm slack:smoke <tenantId> <connectionId> [channel]`                      | **Optional live Slack check** (not part of `pnpm test`). Resolves the trusted Slack connection and posts **one** harmless message (`"AI Workforce Slack connector test"`) to the channel (default `#ai-workforce-test`). Prints only safe metadata (tool, provider, connection id, channel, success, latency, Slack `ts`); never the token. Reports "NOT executed" and exits cleanly if the key or an active slack connection is absent.                                                     |
 | `pnpm llm:smoke ["question"]`                                               | **Optional live Claude check.** Makes one real API call _only_ if a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) is set; prints normalized model/tokens/latency + answer and the endpoint origin (never the key/token). Tests plain then structured output, reporting each separately. Exits cleanly with a message when no credential is set.                                                                                                                                 |
 | `pnpm llm:tool-smoke <tenantId> <connectionId> [channel]`                   | **Optional live end-to-end tool-calling check** (not part of `pnpm test`). Runs the real `llm` handler with a real Claude provider and the real Slack connector: Claude requests `send_slack_message`, the platform executes it, and the model finalizes. Prints only safe metadata (rounds, per-round token counts, final output); never the API key, auth token, or bot token. Reports "NOT executed" and exits cleanly if the Claude credential, encryption key, or connection is absent. |
@@ -177,7 +178,8 @@ The current API exposes authenticated tenant-scoped collection reads for workflo
 
 | Method | Path                      | Auth       | Purpose                                                                                                                                                                    |
 | ------ | ------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET`  | `/healthz`                | none       | Liveness + database readiness. `200` healthy, `503` if the DB is unreachable.                                                                                              |
+| `GET`  | `/healthz`                | none       | Process liveness. `200` while the event loop is turning — does not query the database.                                                                                       |
+| `GET`  | `/readyz`                 | none       | Process readiness. `200` only when the database is reachable (`select 1`), `503` otherwise. Leaks no connection detail.                                                     |
 | `POST` | `/v1/api-keys`            | Bearer key | Create a key for the caller's tenant. Returns the plaintext **once**.                                                                                                      |
 | `GET`  | `/v1/api-keys`            | Bearer key | List the caller's own keys (metadata only — never the key).                                                                                                                |
 | `POST` | `/v1/api-keys/:id/revoke` | Bearer key | Revoke one of the caller's keys. `204` on success, `404` if it is not theirs.                                                                                              |
@@ -213,11 +215,151 @@ via a partial unique index on `(tenant_id, trigger_config->>'source') WHERE
 is_active`. A created run pins the exact `workflow_version_id` at creation, so
 activating a newer version never changes runs already in flight.
 
-> **HMAC signature verification is not implemented yet.** A bearer key is the only
-> authentication. The raw request body is preserved (`request.rawBody`) precisely
-> so per-provider signature verification can be added at this boundary without a
-> rewrite. **Provider webhooks must not be enabled in production before that
-> lands.**
+> **HMAC signature verification is implemented and on by default for every configured
+> source.** When the active workflow version for `(tenant, source)` carries a
+> `signature` config block (see "Webhook signature verification" below), every
+> delivery is verified — and failed verification is a hard `401` before any event
+> is persisted, dedupe-key computed, or transaction started. Sources without a
+> `signature` block continue to authenticate on the bearer key only; this is the
+> legacy behaviour and exists so smoke-test sources and the `inspect-webhooks`
+> CLI keep working. **Provider webhooks exposed to the internet must carry a
+> `signature` block.**
+
+#### Webhook signature verification
+
+A signature is required for any provider webhook exposed to the internet. The
+shared secret is stored once as a **Connection** (encrypted, tenant-scoped, can
+be rotated independently of the workflow) and referenced by `secret_connection_id`
+on the workflow's `webhook` trigger. The signature config is a discriminated
+union on `signing_input`; the verifier does not negotiate.
+
+| `signing_input`         | HMAC input bytes (exactly)                                       |
+| ----------------------- | ---------------------------------------------------------------- |
+| `raw_body`              | `rawBody`                                                        |
+| `timestamp_and_body`    | `canonicalTimestamp || 0x2E || rawBody`                          |
+
+- `rawBody` is the **exact** bytes captured by the JSON content-type parser
+  before any parse, re-serialise, or trim. Re-serialising the parsed object
+  will not produce the same bytes.
+- `canonicalTimestamp` is the integer value of the timestamp header formatted
+  as `String(n)` — the **single** form the verifier uses in the HMAC input.
+  Leading zeros are stripped; surrounding whitespace is removed. A sender who
+  signs the literal header text (with leading zeros or whitespace) will see
+  their signature rejected as `signature_mismatch`.
+- `0x2E` is a single literal `.` byte. **It is not configurable.** Adding a
+  new scheme (e.g. a different separator) is a code change with a new
+  `signing_input` mode, not a config knob, so an operator cannot author a
+  signing config the verifier cannot justify.
+
+##### `raw_body` mode
+
+```
+HMAC-SHA256(key=secret, msg=rawBody)
+```
+
+The signature header value, after `signature_prefix` is stripped (if configured),
+is the HMAC encoded as `signature_encoding` (`hex` or `base64`). No timestamp,
+no separator, no other bytes.
+
+##### `timestamp_and_body` mode
+
+```
+HMAC-SHA256(key=secret, msg=canonicalTimestamp || 0x2E || rawBody)
+```
+
+- `canonicalTimestamp` is the integer value of the timestamp header,
+  formatted as `String(n)` — the **single** form the verifier uses in the
+  HMAC input. Leading zeros are stripped; surrounding whitespace is removed.
+  A sender who signs the literal header text (with leading zeros or
+  whitespace) will see their signature rejected as `signature_mismatch`
+  because the verifier's canonical bytes differ.
+- `0x2E` is a single literal `.` byte. **It is not configurable.** Adding a
+  new scheme (e.g. a different separator) is a code change with a new
+  `signing_input` mode, not a config knob, so an operator cannot author a
+  signing config the verifier cannot justify.
+- `tolerance_seconds` is the maximum difference (in seconds) between the
+  parsed timestamp and the verifier's clock; bounded `1..3600` so a
+  misconfiguration cannot quietly disable the check.
+- The header is parsed as a non-negative decimal integer. `+`, `-`, `.`,
+  hex prefixes, decimal points, and any other non-decimal shape are rejected
+  as `timestamp_malformed` before the HMAC is computed.
+
+###### What this mode guarantees, and what it does not
+
+`timestamp_and_body` provides **three** properties:
+
+1. **Authenticated timestamp.** The timestamp is part of the HMAC input. An
+   attacker cannot substitute a fresh timestamp without invalidating the
+   signature — the verifier's recomputed HMAC over `(attackerTs || . || body)`
+   will not equal a captured signature that was computed over the original
+   timestamp.
+2. **Freshness / tolerance enforcement.** The parsed integer is checked
+   against `tolerance_seconds` of the verifier's clock. Stale and
+   far-future timestamps are rejected as `timestamp_out_of_tolerance`. This
+   bounds the window in which an attacker could replay a captured delivery
+   by adjusting timing alone (and even that is bounded because the timestamp
+   is authenticated — see point 1).
+3. **Replay-window protection.** A captured delivery cannot be replayed
+   *outside* the configured tolerance window. Within the window, an
+   exact-duplicate replay of the same `(timestamp, body, signature)` is
+   **not** rejected by signature verification — suppression of such
+   duplicates is the responsibility of the route's `X-Event-ID` dedupe layer,
+   which is caller-controlled and is a known separate concern.
+
+This mode does **not** provide universal one-time replay prevention on its
+own. Operators who need strict one-time semantics should layer an
+application-level nonce store on top.
+
+##### Config schema (Zod, strict)
+
+```ts
+type SignatureConfig =
+  | {
+      signing_input: "raw_body";
+      algorithm: "hmac-sha256";
+      secret_connection_id: string;     // UUIDv7 — connection holding the shared secret
+      signature_header: string;         // 1-64 [a-z0-9-]
+      signature_encoding: "hex" | "base64";
+      signature_prefix?: string;        // 1-64 printable ASCII, no whitespace
+    }
+  | {
+      signing_input: "timestamp_and_body";
+      algorithm: "hmac-sha256";
+      secret_connection_id: string;
+      signature_header: string;
+      signature_encoding: "hex" | "base64";
+      signature_prefix?: string;
+      timestamp_header: string;         // 1-64 [a-z0-9-]
+      tolerance_seconds: number;        // int, 1..3600
+    }
+```
+
+Unknown fields are rejected at parse time (`.strict()`). The algorithm is locked
+to `hmac-sha256`; there is no `none`/empty value and no per-request algorithm
+override.
+
+##### What gets logged
+
+The verifier itself does not log. On a failed verification the route emits one
+structured log line:
+
+```json
+{
+  "level": "warn",
+  "msg": "webhook signature verification refused",
+  "source": "github",
+  "reason": "signature_mismatch",
+  "signing_input": "timestamp_and_body",
+  "raw_body_length": 42
+}
+```
+
+— `reason` is a stable code (`signature_header_missing`, `signature_malformed`,
+`timestamp_header_missing`, `timestamp_malformed`, `timestamp_out_of_tolerance`,
+`signature_mismatch`); `signing_input` records which mode was active; only
+**lengths** of the inputs are recorded, never the body, signature, or secret.
+The HTTP response is a single generic `401` regardless of reason so a caller
+cannot probe by response text.
 
 #### Inspecting a run (`GET /v1/runs/:runId`)
 
@@ -285,9 +427,14 @@ TENANT_ID=$(pnpm -s tenant:create "Acme Inc")
 pnpm apikey:create "$TENANT_ID" "bootstrap"   # prints the plaintext once
 ```
 
-A conservative in-memory rate limit (100 requests/minute per IP) blunts
-credential stuffing on a single instance. It is per-process and resets on
-restart; distributed, per-tenant rate limiting with a shared store arrives later.
+A conservative in-memory rate limit (100 requests/minute per IP, proxy-aware via `TRUST_PROXY`) blunts
+credential stuffing on a single instance. By default `TRUST_PROXY=false` (local/dev safe) the
+limiter keys by the socket remote address and ignores `X-Forwarded-For`; when
+deployed behind a trusted reverse proxy / PaaS the operator explicitly sets
+`TRUST_PROXY=true` (or a list of trusted proxy CIDRs / `loopback`) so the
+limiter keys by the forwarded client IP instead of the proxy's IP. It is
+per-process and resets on restart; distributed, per-tenant rate limiting with a
+shared store arrives later.
 
 Stop the server with `Ctrl+C`; it drains in-flight requests, closes the pool, and
 logs `api stopped cleanly`.
@@ -367,6 +514,59 @@ The two processes are independent — neither requires the other to run. Both
 refuse to start if the database is unreachable, because a process that is
 listening but cannot reach its database looks healthy to whatever is watching it.
 
+### Operations: liveness, readiness, and worker observability
+
+The two HTTP probes answer two different questions, and a load balancer / orchestrator
+should treat them differently:
+
+| Endpoint  | Question it answers             | Depends on the database? | When to act on failure                                                                                                                  |
+| --------- | ------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `/healthz` | "Is the Node process alive?"    | No                       | Restart the process. A failing `/healthz` means the event loop is not turning — usually a crash or hang, never a transient DB blip.       |
+| `/readyz`  | "Can this process serve traffic?" | Yes (`select 1`)         | Stop routing new traffic to this instance. A failing `/readyz` is expected during DB failover or pool exhaustion and recovers on its own. |
+
+Both endpoints are public, unauthenticated, exempt from the rate limiter, and
+inherit the four baseline security headers (`x-content-type-options`,
+`x-frame-options`, `referrer-policy`, `permissions-policy`) from the root
+`onSend` hook. Neither response includes the connection string, the host,
+the error message, or any configuration — only the binary status, the
+sub-check, and uptime. The real reason for a failed `/readyz` is logged
+server-side (`request.log.warn({ err }, ...)`).
+
+Worker process observability is in-memory and exposed through structured
+logs only — no HTTP listener, no shared file, no Redis, no database table.
+[`src/worker/heartbeat.ts`](src/worker/heartbeat.ts) tracks lifecycle state
+(`starting` / `running` / `stopping` / `stopped`), the wall-clock and monotonic
+timestamp of the most recent poll tick, the in-flight slot, and cumulative
+settlement counters (`claimed`, `completed`, `failed`, `released`, `reaped`).
+The worker process emits a `worker_heartbeat` summary log line every 30 s
+with the same shape, so a log-shipping consumer can graph any field without
+adapting to a different schema. The snapshot is redaction-free by
+construction: no tenant id, run id, job id, step key, prompt, payload,
+secret, or raw error ever enters it.
+
+Stale detection is derived from existing timing rather than invented:
+`STALE_HEARTBEAT_MS = max(3 * POLL_INTERVAL_MS, REAPER_INTERVAL_MS)` —
+30 s. A worker that has missed one reaper sweep AND at least three poll
+cycles is stale; the reaper itself would have detected stuck leases by
+then, so the loop is clearly not healthy. This is an in-process notion
+only — the API process has no view of it, by design (see below).
+
+The three operational states an operator needs are visible at three
+independent observability points, not collapsed into one:
+
+1. **API ready** — `GET /readyz` returns 200 on the API process.
+2. **Worker running** — the worker process exists, its logs show
+   `worker_heartbeat` lines, and `heartbeat_state` is `running`.
+3. **Worker stopped** — no `worker_heartbeat` lines for >30 s, or the
+   process has exited and structured logs show `worker_shutdown` /
+   `worker_stopped_cleanly`.
+
+The API `/readyz` deliberately does NOT include a worker section: the
+worker runs in a separate process, the API has no way to read its state,
+and coupling API readiness to worker activity would make a healthy API
+report "not ready" because the worker is down — which is a separate
+operational signal that belongs at a separate observability point.
+
 ## Configuration
 
 Environment variables are validated at startup by
@@ -384,17 +584,23 @@ FATAL: configuration error — refusing to start.
 
 | Variable                     | Default         | Purpose                                                                                                                                                                                                                                                                                                       |
 | ---------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`               | **required**    | PostgreSQL connection URL. Add `?sslmode=require` for hosted providers.                                                                                                                                                                                                                                       |
+| `DATABASE_URL`               | **required**    | PostgreSQL connection URL. Add `?sslmode=require` for hosted providers. In `production` must not point to `localhost`/`127.0.0.1`/`::1`/`::ffff:127.0.0.1` and database name (URL-decoded, case-insensitive) must not contain `test`.                                                                           |
+| `TEST_DATABASE_URL`          | _(unset)_       | **Test-only.** PostgreSQL URL for the integration suite — never used at runtime. When set, must be valid and must not resolve to same database as `DATABASE_URL` (host/port/database compared semantically; user, password and `?sslmode` differences are ignored). Suite additionally requires database name to contain `test`. |
 | `DATABASE_POOL_MAX`          | `10`            | Max pooled connections **per process**. Two processes run, so the real ceiling is roughly double.                                                                                                                                                                                                             |
-| `NODE_ENV`                   | `development`   | `development` enables pretty logs; `production` emits JSON.                                                                                                                                                                                                                                                   |
+| `NODE_ENV`                   | `development`   | `development` enables pretty logs; `production` emits JSON. `production` activates strict invariants (see `DATABASE_URL`, `HOST`, `ANTHROPIC_BASE_URL`).                                                                                                                                                     |
 | `LOG_LEVEL`                  | `info`          | pino level: `fatal`…`trace`, or `silent`. `debug` also logs every SQL statement.                                                                                                                                                                                                                              |
-| `HOST`                       | `127.0.0.1`     | API bind address. Use `0.0.0.0` in a container or on a PaaS.                                                                                                                                                                                                                                                  |
+| `HOST`                       | `127.0.0.1`     | API bind address. Use `0.0.0.0` in a container or on a PaaS. In `production` must not be `127.0.0.1`/`localhost`/`::1`/`::ffff:127.0.0.1` — set `0.0.0.0` (or other non-loopback) or startup is refused.                                                                                                          |
 | `PORT`                       | `3000`          | API port.                                                                                                                                                                                                                                                                                                     |
+| `TRUST_PROXY`                | `false`         | Whether `request.ip` (and the per-IP rate limiter) trusts `X-Forwarded-For`. `false` (default, safe for local/dev) ignores forwarding headers; `true` trusts the proxy (use only when behind a trusted PaaS/reverse proxy that is the sole ingress); a comma-separated list of proxy IPs/CIDRs or `loopback`/`linklocal`/`uniquelocal` trusts only those. Do not set `true` unless you are actually behind a trusted proxy. |
 | `WORKER_SHUTDOWN_TIMEOUT_MS` | `10000`         | How long graceful worker shutdown waits for an in-flight job before returning and, if it still owns the lease, releasing that job back to `pending`. This does **not** cancel the underlying external request.                                                                                                |
-| `ANTHROPIC_API_KEY`          | _(unset)_       | **Optional secret.** Direct-Anthropic credential, sent as `x-api-key`. Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients.                                                                                                                 |
-| `ANTHROPIC_AUTH_TOKEN`       | _(unset)_       | **Optional secret.** Bearer token for an Anthropic-_compatible_ gateway, sent as `Authorization: Bearer …`. **Mutually exclusive** with `ANTHROPIC_API_KEY` — set exactly one; configuring both is refused at startup.                                                                                        |
-| `ANTHROPIC_BASE_URL`         | _(unset)_       | Optional. Points the provider at an Anthropic-compatible gateway instead of `https://api.anthropic.com`. Give the **origin only** (optionally with a base path); do **not** include `/v1` — the SDK appends `/v1/messages` itself, so a trailing `/v1` would produce `/v1/v1/messages` (rejected at startup). |
+| `CREDENTIAL_ENCRYPTION_KEY`  | _(unset)_       | **Optional secret.** 256-bit master key for encrypting external-service credentials at rest (AES-256-GCM). Accepts 64 hex characters or a base64/base64url value decoding to exactly 32 bytes. **Backward-compatible single-key deployment:** when set, `connections:create` writes v1 envelopes and the key is also auto-imported as a single `legacy-v1` decrypt-only ring entry. Without this var (or a `legacy-v1` entry in `CREDENTIAL_ENCRYPTION_KEYS`), `connections:create` fails clearly at first encrypt with typed `legacy_v1_writer_missing`. Never logged, persisted, or returned to clients. |
+| `ANTHROPIC_API_KEY`          | _(unset)_       | **Optional secret.** Direct-Anthropic credential, sent as `x-api-key`. Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients. **Mutually exclusive** with `ANTHROPIC_AUTH_TOKEN`. If `ANTHROPIC_BASE_URL` is set, at least one of the two must be set.      |
+| `ANTHROPIC_AUTH_TOKEN`       | _(unset)_       | **Optional secret.** Bearer token for an Anthropic-_compatible_ gateway, sent as `Authorization: Bearer …`. **Mutually exclusive** with `ANTHROPIC_API_KEY` — set exactly one; configuring both is refused at startup. If `ANTHROPIC_BASE_URL` is set, at least one must be set.                                              |
+| `ANTHROPIC_BASE_URL`         | _(unset)_       | Optional. Points the provider at an Anthropic-compatible gateway instead of `https://api.anthropic.com`. Give the **origin only** (optionally with a base path); do **not** include `/v1` — the SDK appends `/v1/messages` itself, so a trailing `/v1` would produce `/v1/v1/messages` (rejected at startup). **Requires** a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) when set; in `production` must be `https://` (http allowed only for local dev). |
 | `ANTHROPIC_MODEL`            | `claude-opus-5` | The model the provider defaults to when a request names none. A deployment decision; any request may override it. Against a gateway, this must be a model id **that gateway accepts** — the default is not guaranteed to be valid there.                                                                      |
+| `CREDENTIAL_ENCRYPTION_KEYS` | _(unset)_       | **Optional secret.** Multi-key keyring for credential encryption — comma-separated `<kid>:<base64key>` pairs. The **first** entry is the v2 active encrypt key; every subsequent entry is decrypt-only. Kid format: `^[a-zA-Z0-9._-]{1,64}$`; key bytes: 32 (same shape rule as `CREDENTIAL_ENCRYPTION_KEY`). The literal kid `legacy-v1` is reserved (always decrypt-only; can never be the first entry). When both this var and `CREDENTIAL_ENCRYPTION_KEY` are set, the keyring is the single source of truth and the legacy var is ignored; a v1 writer exists only when the keyring carries a `legacy-v1` entry (a v1 write capability always has a matching v1 read capability). Required for `pnpm connections rotate` — the CLI fails fast with typed `active_key_missing` when no active entry is configured. Never logged. |
+
+Two PostgreSQL **session guards** are always active, without any extra env var: `statement_timeout = 30s` (raised to `300s` only for the migration runner, `60s` in integration tests) caps any single query, and `idle_in_transaction_session_timeout = 30s` — per PostgreSQL docs, an idle-in-transaction session is terminated with `25P03` — limits how long a `BEGIN`…`COMMIT` may sit idle, reducing the window where a stuck `await` could hold row locks or bloat `pg_stat_activity`. Legitimate transactions are the short `beginStep`/`settleStep` and `claim`/`requeueExpired` bookkeeping the engine already runs outside handlers (the handler itself executes with no DB transaction held, per the two-transaction model), so `30s` is generous for normal work but tight enough to reclaim a leaked transaction. The values are centralized in [`src/db/client.ts`](src/db/client.ts) as `DEFAULT_*_TIMEOUT_MS` and applied in two layers: retained as `pg` startup parameters for direct/vanilla PostgreSQL where they are honored, and additionally via explicit session initialization (`SET`) on each new physical connection (`onConnect` hook, awaited before the connection is usable — `options=-c` is not used because Neon pooled endpoints reject it as unsupported). The integration test verifies the effective `SHOW` values against the configured `TEST_DATABASE_URL` (idle `30s`, `statement_timeout` `>0`, preserved inside `BEGIN`/`COMMIT` and after reacquire) without sleeping 30s to trigger the `25P03` abort.
 
 `.env` is loaded by Node's built-in `--env-file-if-exists`, so no `dotenv`
 dependency is involved. Validation of `DATABASE_URL` is structural only — scheme,
@@ -838,6 +1044,28 @@ itself sits behind a framework-free `Authenticator` seam that yields
 `request.auth.tenantId`, so it can be swapped for sessions, OAuth or RBAC later
 without touching route code.
 
+Tenant isolation is verified by three complementary layers:
+
+- **Per-domain integration suites** (`connections.test.ts`, `jobs.test.ts`,
+  `api-keys.test.ts`, `workflows.test.ts`, `webhooks.test.ts`, `execution.test.ts`,
+  `run-inspection.test.ts`) assert the per-repository view: each one proves its
+  own tenant-scoped reads/writes are blind to other tenants.
+- **A consolidated cross-tenant security suite** in
+  `src/test/integration/tenant-isolation.test.ts` exercises every tenant-facing
+  surface end-to-end against a real PostgreSQL across eight categories (A–H):
+  API keys, workflows, runs, events/jobs, connections, webhook HMAC, execution,
+  and a negative data-shape sweep that checks A's responses for any of B's
+  distinguishing markers.
+- **A static architecture test** in
+  `src/test/unit/tenant-isolation-architecture.test.ts` reads every file in
+  `src/repositories/` and enforces that every class operating on a tenant-scoped
+  table either extends `TenantScopedRepository`, takes a `TenantScope`
+  directly, or uses one of a small number of named alternative mechanisms
+  (`PostgresJobQueue`'s optional `tenantId` option, `WorkflowExecutor`'s
+  per-`ClaimedJob` tenant id, or the legacy auth-only `DrizzleApiKeyStore`). It
+  fails the build when a future repository or service bypasses the scope, and
+  its named allow-list makes the rationale for each exception explicit.
+
 ## Testing
 
 ```bash
@@ -984,8 +1212,8 @@ cannot drift from local development.
   workflow that needs no database to generate or verify
 - Database connectivity verified at startup before the API opens its port
 - **Fastify API** with clean shutdown on `SIGTERM`/`SIGINT`:
-  - `GET /healthz` — liveness + database readiness (`select 1`), leaking no
-    connection detail
+  - `GET /healthz` — process liveness, no DB dependency; `GET /readyz` —
+    database readiness (`select 1`); neither leaks connection detail
   - **Tenant API-key authentication** — cryptographically random keys, SHA-256
     hash + short prefix stored (never the plaintext), constant-time verification,
     revocation, and a framework-free `Authenticator` seam yielding

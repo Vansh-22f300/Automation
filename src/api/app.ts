@@ -28,25 +28,36 @@ import { registerConnectionRoutes } from "@/api/routes/connections.js";
 import type { ConnectionServiceFactory } from "@/api/routes/connections.js";
 import { registerHealthRoute } from "@/api/routes/health.js";
 import type { DatabaseHealthCheck } from "@/api/routes/health.js";
+import { registerReadyzRoute } from "@/api/routes/readyz.js";
 import { registerRunInspectionRoutes } from "@/api/routes/runs.js";
 import type { RunInspectionServiceFactory } from "@/api/routes/runs.js";
 import { registerWorkflowRoutes } from "@/api/routes/workflows.js";
 import type { WorkflowServiceFactory } from "@/api/routes/workflows.js";
 import { registerWebhookRoutes } from "@/api/routes/webhooks.js";
 import type { WebhookIngestorFactory } from "@/api/routes/webhooks.js";
+import type { WebhookSignatureResolverFactory } from "@/api/routes/webhooks.js";
 import type { ApiServer } from "@/api/types.js";
 import type { Authenticator } from "@/auth/context.js";
+import { RateLimitedError } from "@/api/errors.js";
 import { newId } from "@/domain/ids.js";
 
 export interface AppDependencies {
   /** Resolves credentials to a tenant. */
   readonly authenticator: Authenticator;
-  /** Probes database reachability for `/healthz`. */
+  /** Probes database reachability for `/readyz`. */
   readonly checkDatabase: DatabaseHealthCheck;
   /** Builds a tenant-scoped API-key service for an authenticated request. */
   readonly apiKeyServiceFor: ApiKeyServiceFactory;
   /** Builds a tenant-scoped webhook ingestor for an authenticated request. */
   readonly webhookIngestorFor: WebhookIngestorFactory;
+  /**
+   * Builds a tenant-scoped webhook signature resolver — looks up the active
+   * workflow version's `signature` config (if any) for a `(tenant, source)`
+   * pair and resolves the signing secret from the configured connection.
+   * Returns null when no signature is required for the source, so the legacy
+   * behavior is preserved for sources without a configured signature.
+   */
+  readonly webhookSignatureResolverFor: WebhookSignatureResolverFactory;
   /** Builds a tenant-scoped workflow repository for an authenticated request. */
   readonly workflowServiceFor: WorkflowServiceFactory;
   /** Builds a tenant-scoped connection repository for an authenticated request. */
@@ -55,6 +66,37 @@ export interface AppDependencies {
   readonly runInspectionFor: RunInspectionServiceFactory;
   /** Structured logger; Fastify attaches a per-request child of it. */
   readonly logger: Logger;
+  /**
+   * How Fastify derives `request.ip` (and thus the rate-limit key) from
+   * `X-Forwarded-For` headers.
+   *
+   * - `false` (default) — never trust forwarding headers; `request.ip` is
+   *   always the socket's remote address. Safe for local development and for
+   *   any deployment that is directly reachable. A forged
+   *   `X-Forwarded-For` cannot change the bucket.
+   * - `true` — trust `X-Forwarded-For` (Fastify `trustProxy: true`). Enable
+   *   only when the API is behind a trusted reverse proxy / PaaS that is the
+   *   sole ingress and that appends the real client IP. In that deployment the
+   *   limiter correctly keys by the forwarded client IP rather than the proxy's
+   *   IP, which would otherwise collapse all clients into one bucket.
+   * - `string` / `string[]` — a comma-separated list or array of trusted
+   *   proxy addresses, CIDRs or the names `loopback`/`linklocal`/`uniquelocal`
+   *   (as understood by `@fastify/proxy-addr`). More precise than `true`
+   *   because only the named proxies are trusted.
+   *
+   * Keeping this explicit prevents an untrusted caller from spoofing the
+   * rate-limit identity with an arbitrary `X-Forwarded-For` value.
+   */
+  readonly trustProxy?: boolean | string | string[];
+  /**
+   * Override the in-memory rate-limit window for testing. When omitted the
+   * production defaults (`100` requests per `1 minute`) are used.
+   * This is test-only plumbing — no production caller should pass it.
+   */
+  readonly rateLimit?: {
+    readonly max?: number;
+    readonly timeWindow?: string | number;
+  };
 }
 
 /**
@@ -85,28 +127,39 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     loggerInstance: deps.logger,
     // 1 MiB. Payloads are small; a low ceiling is a cheap DoS guard.
     bodyLimit: 1_048_576,
-    // Behind a trusted proxy this must be enabled so the client IP (and thus the
-    // rate-limit key) is the real one and not the proxy's. Off by default so a
-    // spoofed X-Forwarded-For cannot defeat the limiter when we are not proxied.
-    trustProxy: false,
+    // `trustProxy` controls how `request.ip` (and thus the rate-limit key
+    // derived from it) is resolved. The default is `false` — the socket's
+    // remote address — so local development and direct-internet deployments
+    // never honour a client-supplied `X-Forwarded-For`. When the deployment
+    // is behind a trusted reverse proxy / PaaS, the operator explicitly sets
+    // `TRUST_PROXY=true` (or a list of proxy CIDRs/names) via the environment;
+    // `server.ts` translates that validated env value into this option. That
+    // makes the limiter key by the real forwarded client IP instead of the
+    // proxy's IP, without allowing an untrusted caller to spoof the bucket
+    // with an arbitrary header. Never hard-code `true` here — it would be a
+    // global blind trust irrespective of deployment.
+    trustProxy: deps.trustProxy ?? false,
     // A unique id per request, surfaced in logs and every error body so a report
     // can be traced. v7 keeps them time-ordered and globally unique across
     // instances (Fastify's default counter is only unique per process).
     genReqId: () => newId(),
   });
 
-  // In-memory fixed-window limiter. Keyed by client IP by default.
+  // In-memory fixed-window limiter. Keyed by client IP via `request.ip` by
+  // default — which already respects `trustProxy` above — so no custom
+  // `keyGenerator` that reads `x-forwarded-for` directly is needed (that
+  // would bypass the trust check and allow spoofing). The limits are the
+  // conservative per-instance defaults; production-grade distributed quotas
+  // remain a later item.
   await app.register(rateLimit, {
-    max: RATE_LIMIT_MAX,
-    timeWindow: RATE_LIMIT_WINDOW,
-    // Route the 429 through our envelope rather than the plugin's default shape.
-    errorResponseBuilder: (request, context) => ({
-      error: {
-        code: "rate_limited",
-        message: `Rate limit exceeded, retry in ${Math.ceil(context.ttl / 1000)}s`,
-        requestId: request.id,
-      },
-    }),
+    max: deps.rateLimit?.max ?? RATE_LIMIT_MAX,
+    timeWindow: deps.rateLimit?.timeWindow ?? RATE_LIMIT_WINDOW,
+    // Throw a typed ApiError so the central error handler renders the standard
+    // envelope with the correct 429 status. Using an ApiError (instead of a
+    // plain object without statusCode) ensures the response is 429, not 500,
+    // and that the requestId correlates into the logs.
+    errorResponseBuilder: (_request, context) =>
+      new RateLimitedError(`Rate limit exceeded, retry in ${Math.ceil(context.ttl / 1000)}s`),
   });
 
   registerErrorHandling(app);
@@ -145,9 +198,12 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     },
   );
 
-  // Public, unauthenticated route. Registered at the top level so no auth hook
-  // applies to it; it exempts itself from the rate limiter internally.
-  registerHealthRoute(app, deps.checkDatabase);
+  // Public, unauthenticated routes. Registered at the top level so no auth hook
+  // applies to them; each exempts itself from the rate limiter internally.
+  // `/healthz` proves the process is alive (no dependency check); `/readyz`
+  // proves the process can serve traffic by probing the database.
+  registerHealthRoute(app);
+  registerReadyzRoute(app, deps.checkDatabase);
 
   // Everything below requires a valid API key. Encapsulated so the auth hook does
   // not touch the public route above. The plugin callback's instance is typed
@@ -159,7 +215,11 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     registerApiKeyRoutes(protectedScope, deps.apiKeyServiceFor);
     registerWorkflowRoutes(protectedScope, deps.workflowServiceFor);
     registerConnectionRoutes(protectedScope, deps.connectionServiceFor);
-    registerWebhookRoutes(protectedScope, deps.webhookIngestorFor);
+    registerWebhookRoutes(
+      protectedScope,
+      deps.webhookIngestorFor,
+      deps.webhookSignatureResolverFor,
+    );
     registerRunInspectionRoutes(protectedScope, deps.runInspectionFor);
   });
 

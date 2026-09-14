@@ -207,6 +207,9 @@ async function makeApp(): Promise<ApiServer> {
     webhookIngestorFor: () => {
       throw new Error("not used");
     },
+    webhookSignatureResolverFor: () => {
+      throw new Error("not used");
+    },
     runInspectionFor: readerFor,
   });
 }

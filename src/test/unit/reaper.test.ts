@@ -22,6 +22,7 @@ import { describe, expect, it } from 'vitest';
 import { MAX_CRASH_ATTEMPTS } from '@/domain/queue.js';
 import type { EnqueueInput, JobError, Queue, ReapResult } from '@/domain/queue.js';
 import type { Logger } from '@/observability/logger.js';
+import { WorkerHeartbeat } from '@/worker/heartbeat.js';
 import { Reaper } from '@/worker/reaper.js';
 
 /** A pino logger writing NDJSON into a buffer, parsed back one record per line. */
@@ -149,5 +150,124 @@ describe('Reaper.sweep', () => {
     // Pinned deliberately: the value is an operational contract (how much work a
     // poison job may cost before it is abandoned), not an implementation detail.
     expect(MAX_CRASH_ATTEMPTS).toBe(5);
+  });
+});
+
+describe('Reaper → heartbeat wiring', () => {
+  // The reaper shares a WorkerHeartbeat with the worker so a single snapshot
+  // shows the worker process's total recovery throughput, not just the
+  // claim-loop half. These tests prove the call site in reaper.sweep()
+  // actually invokes heartbeat.recordReaped with the right argument and that
+  // it does NOT call it on the throw / zero paths.
+
+  it('calls recordReaped(requeued + deadLettered.length) on a non-empty sweep', async () => {
+    const logger = pino({ level: 'silent' });
+    const heartbeat = new WorkerHeartbeat();
+    const reaper = new Reaper({
+      queue: new SweepOnlyQueue({
+        requeued: 2,
+        deadLettered: [
+          {
+            id: 'job-poison',
+            tenantId: 'tenant-a',
+            runId: 'run-7',
+            stepKey: 'call-llm',
+            attempt: MAX_CRASH_ATTEMPTS,
+          },
+        ],
+      }),
+      logger,
+      intervalMs: 60_000,
+      heartbeat,
+    });
+
+    expect(heartbeat.snapshot().counts.reaped).toBe(0);
+
+    const result = await reaper.sweep();
+
+    expect(result.requeued).toBe(2);
+    expect(result.deadLettered).toHaveLength(1);
+    // The wiring: recordReaped was called with requeued (2) + deadLettered.length (1) = 3.
+    expect(heartbeat.snapshot().counts.reaped).toBe(3);
+  });
+
+  it('does NOT increment reaped on a zero/zero sweep (the heartbeat is a no-op at zero)', async () => {
+    const logger = pino({ level: 'silent' });
+    const heartbeat = new WorkerHeartbeat();
+    const reaper = new Reaper({
+      queue: new SweepOnlyQueue({ requeued: 0, deadLettered: [] }),
+      logger,
+      intervalMs: 60_000,
+      heartbeat,
+    });
+
+    expect(heartbeat.snapshot().counts.reaped).toBe(0);
+    await reaper.sweep();
+    // The reaper calls recordReaped(0) and the heartbeat ignores it. The
+    // operator-visible counter stays at zero — there was no work to record.
+    expect(heartbeat.snapshot().counts.reaped).toBe(0);
+  });
+
+  it('still increments reaped when deadLettered is non-empty even if requeued is zero', async () => {
+    const logger = pino({ level: 'silent' });
+    const heartbeat = new WorkerHeartbeat();
+    const reaper = new Reaper({
+      queue: new SweepOnlyQueue({
+        requeued: 0,
+        deadLettered: [
+          {
+            id: 'job-poison',
+            tenantId: 'tenant-a',
+            runId: 'run-7',
+            stepKey: 'call-llm',
+            attempt: MAX_CRASH_ATTEMPTS,
+          },
+        ],
+      }),
+      logger,
+      intervalMs: 60_000,
+      heartbeat,
+    });
+
+    await reaper.sweep();
+    // 0 + 1 = 1: a dead-lettered job is real work the reaper had to do,
+    // even when nothing was put back into the pending pool.
+    expect(heartbeat.snapshot().counts.reaped).toBe(1);
+  });
+
+  it('does NOT increment reaped when the sweep itself throws (catch path skips the call)', async () => {
+    const logger = pino({ level: 'silent' });
+    const heartbeat = new WorkerHeartbeat();
+    const reaper = new Reaper({
+      queue: new SweepOnlyQueue(new Error('connection terminated')),
+      logger,
+      intervalMs: 60_000,
+      heartbeat,
+    });
+
+    const result = await reaper.sweep();
+    // The catch path returns the zero result and crucially does NOT call
+    // recordReaped — a sweep that failed didn't recover any work.
+    expect(result).toEqual({ requeued: 0, deadLettered: [] });
+    expect(heartbeat.snapshot().counts.reaped).toBe(0);
+  });
+
+  it('accumulates reaped across multiple sweeps (each sweep is independent of the last)', async () => {
+    const logger = pino({ level: 'silent' });
+    const heartbeat = new WorkerHeartbeat();
+    // Every sweep recovers exactly one job, so three sweeps → three reaped.
+    const reaper = new Reaper({
+      queue: new SweepOnlyQueue({ requeued: 1, deadLettered: [] }),
+      logger,
+      intervalMs: 60_000,
+      heartbeat,
+    });
+
+    await reaper.sweep();
+    expect(heartbeat.snapshot().counts.reaped).toBe(1);
+    await reaper.sweep();
+    expect(heartbeat.snapshot().counts.reaped).toBe(2);
+    await reaper.sweep();
+    expect(heartbeat.snapshot().counts.reaped).toBe(3);
   });
 });

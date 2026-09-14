@@ -16,18 +16,37 @@
  *   - a 256-bit key supplied only through environment configuration — never stored
  *     in the database, never logged, never returned by the API.
  *
- * The persisted representation is a small **versioned envelope** (`v`, `alg`, `iv`,
- * `ct`, `tag`), so a future key-rotation/versioning scheme can add `v: 2` and a key
- * id without a data migration. Step 9A does not implement rotation; it only makes it
- * possible. The plaintext that gets encrypted is the caller's credential object as
- * JSON — it deliberately does NOT embed the tenant id or provider (those live in
- * the row, unencrypted, and putting them in the secret would only weaken the
- * separation between "what identifies the row" and "the secret itself").
+ * The persisted representation is a **versioned envelope**. Two versions coexist:
+ *
+ *   - **v1** (`{v, alg, iv, ct, tag}`): the original shape. No `kid`, no AAD.
+ *     Still the default write shape so an existing single-key deployment keeps
+ *     producing byte-identical envelopes after upgrade.
+ *   - **v2** (`{v, alg, kid, iv, ct, tag}`): adds `kid` (so the keyring can resolve
+ *     the key) and an AAD binding of `${tenantId}:${connectionId}` that ties the
+ *     ciphertext to its row cryptographically. v2 is written **only** by the
+ *     `connections:rotate` operator action — `connections:create` continues to emit
+ *     v1 envelopes until an operator opts in to v2 writes (deliberate, deferred).
+ *
+ * Two parallel capabilities back the cipher:
+ *
+ *   - **legacyV1Writer** — the bytes that produce v1 envelopes. Always the
+ *     keyring's `legacy-v1` entry (the same entry v1 reads resolve), fed either
+ *     by an explicit keyring entry or by auto-import of the legacy env var
+ *     (`CREDENTIAL_ENCRYPTION_KEY`) when no keyring is configured. Null means
+ *     `encrypt()` throws `legacy_v1_writer_missing`.
+ *   - **ring** — the keyring carrying zero-or-more keys, the first of which is the
+ *     **v2 active key**. Null active means `encryptWithActive()` throws
+ *     `active_key_missing`. Encryption via the ring goes through the cipher (so AAD
+ *     is applied) — the keyring itself has no encrypt method.
+ *
+ * The cipher never logs plaintext, key material, the auth tag, or the cause object
+ * of any thrown error. The never-log list is enforced by the existing tests.
  */
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 import type { Env } from '@/config/env.js';
+import { LEGACY_V1_KID, KeyRing } from '@/security/keyring.js';
 import { PermanentError } from '@/domain/errors.js';
 
 /** The AEAD algorithm. A constant so the envelope is self-describing and checkable. */
@@ -38,18 +57,19 @@ const IV_BYTES = 12;
 const TAG_BYTES = 16;
 /** AES-256 needs exactly 32 bytes of key. */
 const KEY_BYTES = 32;
-/** The only envelope version this module writes and reads today. */
-const ENVELOPE_VERSION = 1;
+/** Envelope version constants. */
+const ENVELOPE_VERSION_V1 = 1;
+const ENVELOPE_VERSION_V2 = 2;
 
 /**
- * The stored shape of an encrypted credential. Persisted as `jsonb`. Every field
- * except `v`/`alg` is base64. `v` exists so a later version can be distinguished
- * and migrated; `alg` makes the blob self-describing rather than relying on a
- * convention no future reader can see.
+ * The v1 envelope (unchanged shape). Still written by `encrypt()` and read by
+ * `decrypt()` for every pre-v2 row. No AAD; the legacy key in the ring resolves
+ * the bytes; tampered or wrong-keyed ciphertext fails GCM verification with no
+ * plaintext returned.
  */
-export interface EncryptedEnvelope {
-  readonly v: number;
-  readonly alg: string;
+export interface EncryptedEnvelopeV1 {
+  readonly v: 1;
+  readonly alg: 'aes-256-gcm';
   /** base64 initialisation vector (nonce). */
   readonly iv: string;
   /** base64 ciphertext. */
@@ -57,6 +77,30 @@ export interface EncryptedEnvelope {
   /** base64 GCM authentication tag. */
   readonly tag: string;
 }
+
+/**
+ * The v2 envelope. Adds `kid` (the keyring entry that produced it) and the AAD
+ * binding of `${tenantId}:${connectionId}` (see {@link decrypt}). v2 envelopes are
+ * written only by `encryptWithActive()` — `encrypt()` continues to emit v1.
+ */
+export interface EncryptedEnvelopeV2 {
+  readonly v: 2;
+  readonly alg: 'aes-256-gcm';
+  /** Non-secret kid label, `^[a-zA-Z0-9._-]{1,64}$`. */
+  readonly kid: string;
+  /** base64 initialisation vector (nonce). */
+  readonly iv: string;
+  /** base64 ciphertext. */
+  readonly ct: string;
+  /** base64 GCM authentication tag. */
+  readonly tag: string;
+}
+
+/**
+ * The stored shape of an encrypted credential: a discriminated union on `v`.
+ * Persisted as `jsonb`. Every field except `v`/`alg`/`kid` is base64.
+ */
+export type EncryptedEnvelope = EncryptedEnvelopeV1 | EncryptedEnvelopeV2;
 
 /** A credential object is any JSON-serialisable record. Its contents are opaque here. */
 export type CredentialPayload = Record<string, unknown>;
@@ -66,7 +110,7 @@ export class CredentialKeyMissingError extends PermanentError {
   constructor() {
     super(
       'credential_key_missing',
-      'a credential encryption operation was attempted but CREDENTIAL_ENCRYPTION_KEY is not configured',
+      'a credential encryption operation was attempted but no key is configured',
     );
   }
 }
@@ -79,12 +123,34 @@ export class CredentialKeyInvalidError extends PermanentError {
 }
 
 /**
- * Raised when decryption fails: a tampered blob, a truncated tag, the wrong key, or
- * an unrecognised envelope. Never carries the ciphertext or key in its message.
+ * Raised when decryption fails: a tampered blob, a truncated tag, the wrong key, an
+ * unrecognised envelope, a missing `legacy-v1` ring entry, or an unknown kid.
+ * Never carries the ciphertext or key in its message.
  */
 export class CredentialDecryptionError extends PermanentError {
   constructor(message: string, cause?: unknown) {
     super('credential_decryption_failed', message, cause !== undefined ? { cause } : undefined);
+  }
+}
+
+/** Raised when `encrypt()` is called with no v1 writer configured. */
+export class CredentialLegacyV1WriterMissingError extends PermanentError {
+  constructor() {
+    super(
+      'credential_legacy_v1_writer_missing',
+      'a v1 credential write was attempted but no v1 writer is configured ' +
+        '(set CREDENTIAL_ENCRYPTION_KEY or include a "legacy-v1" entry in CREDENTIAL_ENCRYPTION_KEYS)',
+    );
+  }
+}
+
+/** Raised when `encryptWithActive()` is called with no v2 active key configured. */
+export class CredentialActiveKeyMissingError extends PermanentError {
+  constructor() {
+    super(
+      'credential_active_key_missing',
+      'a v2 credential write was attempted but CREDENTIAL_ENCRYPTION_KEYS has no active entry',
+    );
   }
 }
 
@@ -123,27 +189,63 @@ export function generateCredentialKey(): string {
 /**
  * Authenticated encryption of credential objects.
  *
- * Holds an optional key: metadata-only operations (listing connections) need no key,
- * so a repository can be constructed without one and only the encrypt/decrypt paths
- * demand it — failing clearly via {@link CredentialKeyMissingError} when it is
- * absent. The key never leaves this object and is never logged.
+ * Holds two parallel capabilities: a {@link KeyRing} (decrypt authority, with the
+ * first entry as the v2 active key) and a `legacyV1Writer` Buffer (the bytes that
+ * produce v1 envelopes — either the legacy env var or the keyring's `legacy-v1`
+ * entry). The cipher exposes three operations:
+ *
+ *   - `encrypt(payload)` — writes **v1** envelopes using `legacyV1Writer`. Throws
+ *     `CredentialLegacyV1WriterMissingError` when the writer is null. This is the
+ *     default write path; `connections:create` calls it.
+ *   - `encryptWithActive(payload, aad)` — writes **v2** envelopes using the
+ *     keyring's active kid and the supplied AAD. Throws
+ *     `CredentialActiveKeyMissingError` when the ring has no active entry. Used
+ *     only by `connections:rotate`.
+ *   - `decrypt(envelope, aad?, tenantId?, connectionId?)` — dispatches on
+ *     `envelope.v`: v1 uses `ring.resolve("legacy-v1")` and skips `setAAD`; v2 uses
+ *     `ring.resolve(envelope.kid)` and calls `setAAD` with the tenant/connection
+ *     binding. Every failure mode collapses to `CredentialDecryptionError` with a
+ *     generic message — no key bytes, ciphertext or cause object leaks to callers.
+ *
+ * `hasKey` reports whether **any** write capability is configured (legacy writer OR
+ * v2 active key), preserving the smoke-test guards that check before attempting to
+ * decrypt.
  */
 export class CredentialCipher {
-  constructor(private readonly key: Buffer | null) {}
+  constructor(
+    private readonly legacyV1Writer: Buffer | null,
+    private readonly ring_: KeyRing,
+  ) {}
 
-  /** Whether a key is present — lets callers surface a clear setup error early. */
+  /**
+   * Whether the cipher has at least one write capability. True when either the v1
+   * writer is set or the ring carries an active key. Preserves the smoke-test
+   * "no key ⇒ cannot decrypt ⇒ cannot run the live path" semantics.
+   */
   get hasKey(): boolean {
-    return this.key !== null;
+    return this.legacyV1Writer !== null || this.ring_.hasActive;
   }
 
-  private requireKey(): Buffer {
-    if (this.key === null) throw new CredentialKeyMissingError();
-    return this.key;
+  /**
+   * The keyring this cipher is bound to. Exposed so the rotation CLI can read
+   * the active kid for the iteration predicate. The cipher still owns all
+   * encrypt/decrypt operations through it.
+   */
+  get ring(): KeyRing {
+    return this.ring_;
   }
 
-  /** Encrypt a credential object into a versioned, authenticated envelope. */
-  encrypt(payload: CredentialPayload): EncryptedEnvelope {
-    const key = this.requireKey();
+  /**
+   * Encrypt a credential object into a **v1** envelope (byte-identical to the
+   * pre-v2 envelope). Backs `connections:create` and preserves the rolling-deploy
+   * compatibility release: an existing single-key deployment continues to write
+   * the same envelope shape after upgrade.
+   */
+  encrypt(payload: CredentialPayload): EncryptedEnvelopeV1 {
+    if (this.legacyV1Writer === null) {
+      throw new CredentialLegacyV1WriterMissingError();
+    }
+    const key = this.legacyV1Writer;
     const iv = randomBytes(IV_BYTES);
     const cipher = createCipheriv(ALGORITHM, key, iv);
     const plaintext = Buffer.from(JSON.stringify(payload), 'utf8');
@@ -151,8 +253,40 @@ export class CredentialCipher {
     const tag = cipher.getAuthTag();
 
     return {
-      v: ENVELOPE_VERSION,
+      v: ENVELOPE_VERSION_V1,
       alg: ALGORITHM,
+      iv: iv.toString('base64'),
+      ct: ciphertext.toString('base64'),
+      tag: tag.toString('base64'),
+    };
+  }
+
+  /**
+   * Encrypt a credential object into a **v2** envelope using the keyring's active
+   * kid and the supplied AAD. Used only by `connections:rotate`; an operator-initiated
+   * action that re-encrypts every ciphertext under the current active key.
+   *
+   * The `aad` binds the ciphertext to `${tenantId}:${connectionId}` so a row-swap
+   * fails GCM verification on the next read. The AAD is a 73-byte UTF-8 buffer for
+   * two UUIDv7 strings plus the colon — the caller passes exactly that.
+   */
+  encryptWithActive(payload: CredentialPayload, aad: Buffer): EncryptedEnvelopeV2 {
+    const activeKid = this.ring_.activeKid;
+    if (activeKid === null) {
+      throw new CredentialActiveKeyMissingError();
+    }
+    const key = this.ring_.resolve(activeKid);
+    const iv = randomBytes(IV_BYTES);
+    const cipher = createCipheriv(ALGORITHM, key, iv);
+    cipher.setAAD(aad);
+    const plaintext = Buffer.from(JSON.stringify(payload), 'utf8');
+    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    const tag = cipher.getAuthTag();
+
+    return {
+      v: ENVELOPE_VERSION_V2,
+      alg: ALGORITHM,
+      kid: activeKid,
       iv: iv.toString('base64'),
       ct: ciphertext.toString('base64'),
       tag: tag.toString('base64'),
@@ -164,13 +298,39 @@ export class CredentialCipher {
    * part of `final()`, so a tampered blob or the wrong key throws rather than
    * yielding forged plaintext. All failure modes collapse to
    * {@link CredentialDecryptionError} with a generic message.
+   *
+   * For v2 envelopes the caller passes `tenantId` and `connectionId` so the cipher
+   * can reconstruct the `${tenantId}:${connectionId}` AAD. For v1 envelopes these
+   * arguments are ignored — v1 predates AAD and uses the legacy key directly.
    */
-  decrypt(envelope: EncryptedEnvelope): CredentialPayload {
-    const key = this.requireKey();
+  decrypt(
+    envelope: EncryptedEnvelope,
+    options: { readonly aad?: Buffer; readonly tenantId?: string; readonly connectionId?: string } = {},
+  ): CredentialPayload {
+    if (envelope.v === ENVELOPE_VERSION_V1) {
+      return this.decryptV1(envelope);
+    }
+    if (envelope.v === ENVELOPE_VERSION_V2) {
+      return this.decryptV2(envelope, options);
+    }
+    throw new CredentialDecryptionError(
+      `unsupported credential envelope (version ${(envelope as { v: unknown }).v as string})`,
+    );
+  }
 
-    if (envelope.v !== ENVELOPE_VERSION || envelope.alg !== ALGORITHM) {
+  private decryptV1(envelope: EncryptedEnvelopeV1): CredentialPayload {
+    let key: Buffer;
+    try {
+      key = this.ring_.resolve(LEGACY_V1_KID);
+    } catch {
       throw new CredentialDecryptionError(
-        `unsupported credential envelope (version ${envelope.v}, algorithm ${envelope.alg})`,
+        'failed to decrypt credential (legacy_v1_key_missing)',
+      );
+    }
+
+    if (envelope.alg !== ALGORITHM) {
+      throw new CredentialDecryptionError(
+        `unsupported credential envelope (algorithm ${envelope.alg})`,
       );
     }
 
@@ -184,23 +344,114 @@ export class CredentialCipher {
     try {
       const decipher = createDecipheriv(ALGORITHM, key, iv);
       decipher.setAuthTag(tag);
+      // No setAAD for v1 — v1 envelopes predate AAD.
       const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
       return JSON.parse(plaintext.toString('utf8')) as CredentialPayload;
     } catch (error) {
-      // Authentication failure, wrong key, or corrupt data — never distinguish, and
-      // never leak the cause's contents to callers.
       throw new CredentialDecryptionError('failed to decrypt credential (bad key or tampered data)', error);
     }
+  }
+
+  private decryptV2(
+    envelope: EncryptedEnvelopeV2,
+    options: { readonly aad?: Buffer; readonly tenantId?: string; readonly connectionId?: string },
+  ): CredentialPayload {
+    if (envelope.alg !== ALGORITHM) {
+      throw new CredentialDecryptionError(
+        `unsupported credential envelope (algorithm ${envelope.alg})`,
+      );
+    }
+    if (typeof envelope.kid !== 'string' || envelope.kid.length === 0) {
+      throw new CredentialDecryptionError('credential envelope is missing a kid');
+    }
+
+    let key: Buffer;
+    try {
+      key = this.ring_.resolve(envelope.kid);
+    } catch {
+      throw new CredentialDecryptionError(
+        `failed to decrypt credential (unknown_kid "${envelope.kid}")`,
+      );
+    }
+
+    const iv = Buffer.from(envelope.iv, 'base64');
+    const tag = Buffer.from(envelope.tag, 'base64');
+    const ciphertext = Buffer.from(envelope.ct, 'base64');
+    if (iv.length !== IV_BYTES || tag.length !== TAG_BYTES) {
+      throw new CredentialDecryptionError('credential envelope has a malformed iv or tag');
+    }
+
+    // AAD reconstruction. The caller passes either a pre-built buffer or the
+    // (tenantId, connectionId) pair; either way the GCM tag verification covers
+    // exactly the same bytes that were passed at encrypt time, otherwise the tag
+    // fails and the ciphertext is refused.
+    const aad = options.aad ?? this.deriveAad(options.tenantId, options.connectionId);
+
+    try {
+      const decipher = createDecipheriv(ALGORITHM, key, iv);
+      decipher.setAuthTag(tag);
+      if (aad !== undefined) decipher.setAAD(aad);
+      const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+      return JSON.parse(plaintext.toString('utf8')) as CredentialPayload;
+    } catch (error) {
+      throw new CredentialDecryptionError('failed to decrypt credential (bad key or tampered data)', error);
+    }
+  }
+
+  /**
+   * Reconstruct the `${tenantId}:${connectionId}` AAD from the two id strings.
+   * Both UUIDv7 strings are 36 chars; the total AAD is 73 bytes. Returning
+   * `undefined` when either input is missing is intentional — a v2 read without a
+   * caller-supplied AAD (or id pair) cannot validate the tag against the row that
+   * produced it, so we leave it out and rely on the GCM tag failing when the
+   * AAD-free path is taken on a row that was written WITH AAD.
+   */
+  private deriveAad(tenantId?: string, connectionId?: string): Buffer | undefined {
+    if (tenantId === undefined || connectionId === undefined) return undefined;
+    return Buffer.from(`${tenantId}:${connectionId}`, 'utf8');
   }
 }
 
 /**
- * Build a cipher from validated environment config. When `CREDENTIAL_ENCRYPTION_KEY`
- * is unset the cipher has no key and any encrypt/decrypt call fails clearly — which
- * is why the application still boots without it (nothing constructs a credential
- * until a connection operation actually needs one).
+ * Build a cipher from validated environment config.
+ *
+ * - The {@link KeyRing} is built from `CREDENTIAL_ENCRYPTION_KEYS` when present.
+ *   When absent but `CREDENTIAL_ENCRYPTION_KEY` is set, the legacy key is auto-
+ *   imported as a single decrypt-only `legacy-v1` entry. When both are absent, the
+ *   ring is empty (use-time failures surface typed errors).
+ * - `legacyV1Writer` is always the ring's `legacy-v1` entry — the same entry
+ *   `decrypt` resolves for v1 envelopes — so a v1 write capability always has
+ *   a matching v1 read capability. It is null unless the ring carries
+ *   `legacy-v1` (via an explicit keyring entry, or the auto-import when only
+ *   the legacy env var is set), and `encrypt()` fails at first use otherwise.
+ *
+ * See the env × behaviour matrix in §7 of the architectural plan for the exact
+ * contract this factory implements.
  */
 export function createCredentialCipher(env: Env): CredentialCipher {
-  const raw = env.CREDENTIAL_ENCRYPTION_KEY;
-  return new CredentialCipher(raw !== undefined ? parseCredentialKey(raw) : null);
+  const legacyRaw = env.CREDENTIAL_ENCRYPTION_KEY;
+  const newRaw = env.CREDENTIAL_ENCRYPTION_KEYS;
+  const legacyKey = legacyRaw !== undefined ? parseCredentialKey(legacyRaw) : null;
+
+  // Build the ring: explicit new var > auto-import of legacy > empty.
+  let ring: KeyRing;
+  if (newRaw !== undefined) {
+    ring = KeyRing.parse(newRaw);
+  } else if (legacyKey !== null) {
+    ring = KeyRing.fromLegacyKey(legacyKey);
+  } else {
+    ring = KeyRing.empty();
+  }
+
+  // The v1 writer is the ring's `legacy-v1` entry — the exact entry the v1
+  // reader resolves — so a v1 write capability always has a matching v1 read
+  // capability. When CREDENTIAL_ENCRYPTION_KEYS is absent, the legacy env var
+  // reaches this entry through the auto-import above; once a keyring is
+  // configured it is the single source of truth and the legacy var is ignored.
+  // A keyring without a `legacy-v1` entry therefore has NO v1 writer: `encrypt`
+  // fails with `credential_legacy_v1_writer_missing` instead of writing v1
+  // envelopes that nothing could ever read back.
+  const legacyV1Writer = ring.legacyV1Key;
+
+  return new CredentialCipher(legacyV1Writer, ring);
 }

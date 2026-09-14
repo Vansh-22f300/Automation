@@ -32,6 +32,7 @@ import type { ClaimedJob, Queue } from '@/domain/queue.js';
 import { DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS } from '@/domain/timing.js';
 import { StepExecutionNotImplementedError, StepFailedError, StepRetryError } from '@/worker/dispatcher.js';
 import type { StepDispatcher } from '@/worker/dispatcher.js';
+import type { WorkerHeartbeat } from '@/worker/heartbeat.js';
 
 /** Confirms a run exists for a tenant. The worker's "is this job valid?" check. */
 export type RunExistenceCheck = (tenantId: string, runId: string) => Promise<boolean>;
@@ -58,6 +59,14 @@ export interface WorkerOptions {
   readonly runExists: RunExistenceCheck;
   /** How long graceful shutdown waits for in-flight work before giving up. */
   readonly shutdownTimeoutMs?: number;
+  /**
+   * Optional in-memory heartbeat tracker. When supplied the worker stamps
+   * lifecycle transitions and per-tick heartbeats into it; settlement
+   * outcomes increment the cumulative counters. Omitting it is safe —
+   * existing tests and any future caller that does not want observability
+   * can pass nothing. Production wiring in `main.ts` always supplies one.
+   */
+  readonly heartbeat?: WorkerHeartbeat;
 }
 
 export class Worker {
@@ -68,6 +77,7 @@ export class Worker {
   private readonly pollIntervalMs: number;
   private readonly runExists: RunExistenceCheck;
   private readonly shutdownTimeoutMs: number;
+  private readonly heartbeat: WorkerHeartbeat | undefined;
 
   private running = false;
   private timer: NodeJS.Timeout | undefined;
@@ -85,6 +95,7 @@ export class Worker {
     this.pollIntervalMs = options.pollIntervalMs;
     this.runExists = options.runExists;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS;
+    this.heartbeat = options.heartbeat;
   }
 
   /** Begin polling. Returns immediately; the loop runs on timers. */
@@ -94,6 +105,7 @@ export class Worker {
     // A restarted worker must be stoppable again; the memoized shutdown from the
     // previous lifecycle has already resolved and would otherwise be handed back.
     this.stopPromise = undefined;
+    this.heartbeat?.start();
     this.logger.info({ poll_interval_ms: this.pollIntervalMs }, 'worker_started');
     this.scheduleNext(0);
   }
@@ -129,6 +141,7 @@ export class Worker {
       this.timer = undefined;
     }
 
+    this.heartbeat?.markStopping();
     this.logger.info({ timeout_ms: this.shutdownTimeoutMs }, 'worker_shutdown_requested');
 
     const claimed = this.currentJob;
@@ -160,6 +173,7 @@ export class Worker {
       if (stranded !== undefined) await this.releaseLease(stranded);
     }
 
+    this.heartbeat?.markStopped();
     this.logger.info('worker_shutdown');
   }
 
@@ -241,6 +255,11 @@ export class Worker {
 
   private async tick(): Promise<void> {
     if (!this.running) return;
+    // Stamp the heartbeat once per tick — even if the tick itself throws,
+    // the operator still needs to see the loop is alive. `tick()` is called
+    // once per poll iteration so the cadence matches `pollIntervalMs` when
+    // idle and the job-processing rate when busy.
+    this.heartbeat?.tick();
     try {
       const handled = await this.pollOnce();
       // Drain quickly while there is work; back off to the poll interval when idle.
@@ -261,6 +280,9 @@ export class Worker {
     if (!this.running) return false;
     const job = await this.queue.claim(this.workerId);
     if (job === null) return false;
+    // Bump the claimed counter only after a real claim, so a stuck pool that
+    // keeps returning null does not inflate the counter or the in-flight slot.
+    this.heartbeat?.recordClaimed();
     await this.handle(job);
     return true;
   }
@@ -282,6 +304,7 @@ export class Worker {
         code: 'run_not_found',
         message: 'job references a workflow run that does not exist',
       });
+      this.heartbeat?.recordFailed();
       return;
     }
 
@@ -290,6 +313,7 @@ export class Worker {
       // The engine advanced the run by exactly one step (or recognised a stale
       // redelivery and did nothing). Either way this job's work is done.
       await this.queue.complete(job.id, job.lockedBy);
+      this.heartbeat?.recordCompleted();
       log.info('job_completed');
     } catch (error) {
       if (error instanceof StepFailedError) {
@@ -299,6 +323,7 @@ export class Worker {
         // the same reason. No retry: either the failure was unretryable or its
         // business budget is exhausted (the engine made that call).
         await this.settleFailed(log, job, error.reason);
+        this.heartbeat?.recordFailed();
         return;
       }
       if (error instanceof StepRetryError) {
@@ -306,6 +331,9 @@ export class Worker {
         // `running` and recorded this attempt; move the queue job back to
         // `pending` with the computed future `run_at` so it is re-executed after
         // the backoff. Durable: the deferral lives on the row, not in memory.
+        // A retry is not a terminal count — the job is back on the queue and
+        // will be claimed again, so the in-flight slot stays at 1 and the
+        // counters stay where they were at claim time.
         await this.settleRetry(log, job, error.reason, error.runAt);
         return;
       }
@@ -316,6 +344,7 @@ export class Worker {
           code: error.code,
           message: error.message,
         });
+        this.heartbeat?.recordFailed();
         return;
       }
       if (error instanceof InvalidJobTransitionError) {
@@ -325,7 +354,10 @@ export class Worker {
         // must not settle a job it no longer holds — and the step's own effects were
         // already committed by the engine in their own transaction. Nothing to
         // repair; name it precisely instead of filing it as an unexpected error.
+        // Count as a release: we held the lease and it left our possession,
+        // even if it was the queue / reaper that took it.
         log.warn({ err: error }, 'job_settlement_not_owned');
+        this.heartbeat?.recordReleased();
         return;
       }
       // Genuinely unexpected (e.g. a dropped connection mid-execution). Do not
@@ -333,6 +365,10 @@ export class Worker {
       // the reaper returns it to `pending` for a fresh attempt. Nothing is
       // corrupted and nothing is swallowed.
       log.error({ err: error }, 'job_processing_error');
+      // The lease will lapse and the reaper will take the row; count it as a
+      // release so the in-flight slot clears. Distinct from `failed` — this
+      // job was never terminally failed, only abandoned.
+      this.heartbeat?.recordReleased();
     } finally {
       if (this.currentJob?.id === job.id && this.currentJob.lockedBy === job.lockedBy) {
         this.currentJob = undefined;

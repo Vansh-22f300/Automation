@@ -40,6 +40,7 @@ import {
   UnimplementedStepDispatcher,
 } from "@/worker/dispatcher.js";
 import type { StepDispatcher } from "@/worker/dispatcher.js";
+import { WorkerHeartbeat } from "@/worker/heartbeat.js";
 import { Worker } from "@/worker/worker.js";
 
 const silentLogger = pino({ level: "silent" });
@@ -513,6 +514,177 @@ describe("Worker.stop", () => {
     expect(records().some((record) => record.msg === "worker_shutdown")).toBe(
       true,
     );
+  });
+});
+
+describe("Worker → heartbeat wiring", () => {
+  // The WorkerHeartbeat unit tests cover the state machine and counters in
+  // isolation. These tests instead prove the *call sites* in worker.ts actually
+  // invoke the right heartbeat method on each settlement path — successful
+  // claim/complete, terminal failure, lost-lease settlement refusal, and
+  // unexpected processing errors — and that the lifecycle hooks fire in order.
+  // Real WorkerHeartbeat instances are attached; the assertions read the
+  // snapshot, not mocks.
+  function buildWithHeartbeat(
+    queue: Queue,
+    overrides: Partial<{
+      dispatcher: StepDispatcher;
+      runExists: (tenantId: string, runId: string) => Promise<boolean>;
+      workerId: string;
+      shutdownTimeoutMs: number;
+    }> = {},
+  ): { worker: Worker; heartbeat: WorkerHeartbeat } {
+    const heartbeat = new WorkerHeartbeat();
+    const worker = new Worker({
+      queue,
+      dispatcher: overrides.dispatcher ?? new UnimplementedStepDispatcher(),
+      logger: silentLogger,
+      workerId: overrides.workerId ?? "worker-test",
+      pollIntervalMs: 5,
+      runExists: overrides.runExists ?? (() => Promise.resolve(true)),
+      ...(overrides.shutdownTimeoutMs !== undefined
+        ? { shutdownTimeoutMs: overrides.shutdownTimeoutMs }
+        : {}),
+      heartbeat,
+    });
+    return { worker, heartbeat };
+  }
+
+  it("A. successful claim invokes recordClaimed (claimed++; distinct from completed)", async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    const { worker, heartbeat } = buildWithHeartbeat(queue, {
+      dispatcher: { dispatch: () => Promise.resolve() },
+    });
+    worker.start();
+
+    // Before any work: nothing has been claimed yet.
+    expect(heartbeat.snapshot().counts.claimed).toBe(0);
+
+    await worker.pollOnce();
+
+    // recordClaimed fires inside pollOnce the moment a job is returned from
+    // queue.claim(...). This assertion is distinct from test B's
+    // `counts.completed`: a worker that never recorded the claim would still
+    // record the completion if recordCompleted were still wired, so each call
+    // site needs its own wiring assertion.
+    expect(heartbeat.snapshot().counts.claimed).toBe(1);
+    expect(heartbeat.snapshot().counts.completed).toBe(1);
+    expect(heartbeat.snapshot().inFlight).toBe(0);
+    await worker.stop();
+  });
+
+  it("B. successful completion sets recordCompleted (completed++, inFlight=0)", async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    const { worker, heartbeat } = buildWithHeartbeat(queue, {
+      dispatcher: { dispatch: () => Promise.resolve() },
+    });
+    worker.start();
+
+    await worker.pollOnce();
+
+    // The happy path through Worker.handle() calls recordCompleted, which is
+    // the *only* settlement that bumps this counter.
+    expect(queue.completed).toEqual(["job-1"]);
+    expect(heartbeat.snapshot().counts.completed).toBe(1);
+    expect(heartbeat.snapshot().counts.failed).toBe(0);
+    expect(heartbeat.snapshot().counts.released).toBe(0);
+    expect(heartbeat.snapshot().inFlight).toBe(0);
+    await worker.stop();
+  });
+
+  it("C. terminal failure (StepFailedError) sets recordFailed (failed++, inFlight=0)", async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    const reason = { code: "step_execution_error", message: "handler blew up" };
+    const { worker, heartbeat } = buildWithHeartbeat(queue, {
+      dispatcher: {
+        dispatch: () => Promise.reject(new StepFailedError(reason)),
+      },
+    });
+    worker.start();
+
+    await worker.pollOnce();
+
+    // Worker.handle() routes a StepFailedError through queue.fail(...) and
+    // bumps recordFailed — never recordCompleted, never recordReleased.
+    expect(queue.failed).toHaveLength(1);
+    expect(heartbeat.snapshot().counts.failed).toBe(1);
+    expect(heartbeat.snapshot().counts.completed).toBe(0);
+    expect(heartbeat.snapshot().counts.released).toBe(0);
+    expect(heartbeat.snapshot().inFlight).toBe(0);
+    await worker.stop();
+  });
+
+  it("D. lost-lease settlement refusal (InvalidJobTransitionError) sets recordReleased", async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    // Another worker re-claimed the row mid-step: the ownership-guarded
+    // `complete` rejects with InvalidJobTransitionError. Worker.handle catches
+    // this in the explicit settlement-refusal branch (it is NOT a processing
+    // error) and records `released`.
+    queue.complete = (jobId) =>
+      Promise.reject(new InvalidJobTransitionError(jobId, "completed"));
+    const { worker, heartbeat } = buildWithHeartbeat(queue, {
+      dispatcher: { dispatch: () => Promise.resolve() },
+    });
+    worker.start();
+
+    await worker.pollOnce();
+
+    expect(heartbeat.snapshot().counts.released).toBe(1);
+    expect(heartbeat.snapshot().counts.completed).toBe(0);
+    expect(heartbeat.snapshot().counts.failed).toBe(0);
+    expect(heartbeat.snapshot().inFlight).toBe(0);
+    await worker.stop();
+  });
+
+  it("E. unexpected processing error sets recordReleased (lease left to lapse, reaper recovers)", async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    const { worker, heartbeat } = buildWithHeartbeat(queue, {
+      dispatcher: { dispatch: () => Promise.reject(new Error("boom")) },
+    });
+    worker.start();
+
+    await worker.pollOnce();
+
+    // Neither completed nor failed: the lease will lapse and the reaper
+    // reclaims the job. The handler still records `released` so the in-flight
+    // slot clears and the snapshot reflects the work this worker actually did.
+    expect(queue.completed).toEqual([]);
+    expect(queue.failed).toEqual([]);
+    expect(heartbeat.snapshot().counts.released).toBe(1);
+    expect(heartbeat.snapshot().counts.completed).toBe(0);
+    expect(heartbeat.snapshot().counts.failed).toBe(0);
+    expect(heartbeat.snapshot().inFlight).toBe(0);
+    await worker.stop();
+  });
+
+  it("F. lifecycle wiring: start→starting, tick→running, stop→stopped", async () => {
+    const queue = new FakeQueue([claimedJob()]);
+    const { worker, heartbeat } = buildWithHeartbeat(queue, {
+      dispatcher: { dispatch: () => Promise.resolve() },
+    });
+
+    // Fresh heartbeat before start(): never_started.
+    expect(heartbeat.snapshot().state).toBe("never_started");
+
+    worker.start();
+    // start() invokes heartbeat.start(), promoting state to 'starting'.
+    // The scheduled tick at delay 0 has not fired yet under fake timers.
+    expect(heartbeat.snapshot().state).toBe("starting");
+
+    // Drain the scheduled tick. tick() calls heartbeat.tick() at entry — this
+    // is what promotes 'starting' to 'running' — then awaits the full
+    // pollOnce cycle. After it resolves: claimed++, completed++, inFlight=0.
+    await vi.runOnlyPendingTimersAsync();
+    expect(heartbeat.snapshot().state).toBe("running");
+    expect(heartbeat.snapshot().counts.claimed).toBe(1);
+    expect(heartbeat.snapshot().counts.completed).toBe(1);
+    expect(heartbeat.snapshot().inFlight).toBe(0);
+
+    // stop() invokes markStopping, drains (nothing in flight), then markStopped.
+    // The end state is 'stopped' — distinctly different from 'running'.
+    await worker.stop();
+    expect(heartbeat.snapshot().state).toBe("stopped");
+    expect(heartbeat.snapshot().state).not.toBe("running");
   });
 });
 
