@@ -1,2 +1,11 @@
+# pnpm settings for the frontend package. Same allowBuilds rationale as the
+# root pnpm-workspace.yaml: esbuild's postinstall links the platform binary
+# that vite needs. (This file previously held an unedited template
+# placeholder; it now carries the real, valid configuration.)
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: true
+
+# See the root workspace file and "Dependency management and security" in the
+# root README.md: direct dependencies are exact-pinned and the lockfile is
+# installed frozen. Keep any future `pnpm add` here exact as well.
+saveExact: true

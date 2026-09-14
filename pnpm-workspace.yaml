@@ -2,7 +2,7 @@
 #
 # As of pnpm 10/11 these live here rather than in package.json. This file does
 # NOT declare a workspace monorepo — the repository is a single package. It
-# exists only to hold the setting below.
+# exists only to hold the settings below.
 #
 # esbuild's postinstall script links its platform-specific binary. It is a
 # transitive dependency of tsx and vitest, and both fail without it. Allowlisting
@@ -10,3 +10,29 @@
 # depending on a local `pnpm approve-builds` decision that is not committed.
 allowBuilds:
   esbuild: true
+
+# Dependency policy: every direct dependency is pinned to an exact version in
+# package.json (see "Dependency management and security" in README.md), and the
+# committed lockfiles are installed frozen. saveExact makes any future
+# `pnpm add` record an exact version too, so a new dependency cannot quietly
+# reintroduce a floating range.
+saveExact: true
+
+# Security-audit exceptions, read by `pnpm audit` and the CI audit job.
+# Every entry is development-only — absent from the production tree, which
+# `pnpm audit --prod` proves clean — and documents its reason here. Production
+# findings are never suppressed. Remove an entry when its fix ships and re-
+# review the list whenever either package is touched.
+auditConfig:
+  ignoreGhsas:
+    # esbuild <=0.24.2 dev-server request forgery (moderate). Reaches this
+    # repository only through drizzle-kit's @esbuild-kit loader — a dev CLI
+    # that never exposes a browser-facing dev server here. The fix arrives
+    # with a future drizzle-kit release; re-review on any drizzle-kit bump.
+    - GHSA-67mh-4wv8-2f99
+    # vitest <4.1.11 path traversal via @vitest/mocker redirect mocks
+    # (moderate). The patched range is a vitest major (>=4.1.11) — an upgrade
+    # deliberately deferred as a separate decision, not part of hardening.
+    # Exploitation requires a malicious test file already inside the repo.
+    # Re-review when vitest is upgraded.
+    - GHSA-82fw-gwwq-j7x9
