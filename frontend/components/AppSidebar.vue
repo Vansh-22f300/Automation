@@ -7,6 +7,9 @@ import {
   Workflow,
 } from "@lucide/vue";
 
+withDefaults(defineProps<{ open?: boolean }>(), { open: false });
+defineEmits<{ close: [] }>();
+
 const navigation = [
   { label: "Dashboard", to: "/", icon: LayoutDashboard },
   { label: "Workflows", to: "/workflows", icon: Workflow },
@@ -16,9 +19,9 @@ const navigation = [
 </script>
 
 <template>
-  <aside class="sidebar">
-    <NuxtLink class="brand" to="/" aria-label="AI Workforce dashboard">
-      <span class="brand-mark"><Activity :size="19" /></span>
+  <aside id="app-sidebar" class="sidebar" :class="{ 'is-open': open }" aria-label="Primary">
+    <NuxtLink class="brand" to="/workflows" aria-label="AI Workforce workspace" @click="$emit('close')">
+      <span class="brand-mark"><Activity :size="19" aria-hidden="true" /></span>
       <span class="brand-copy">
         <strong>AI Workforce</strong>
         <span>Operations workspace</span>
@@ -31,13 +34,14 @@ const navigation = [
         :key="item.to"
         :to="item.to"
         class="nav-link"
+        @click="$emit('close')"
       >
         <component :is="item.icon" :size="18" aria-hidden="true" />
         <span>{{ item.label }}</span>
       </NuxtLink>
     </nav>
     <div class="sidebar-footer">
-      <span class="environment-dot" />
+      <span class="environment-dot" aria-hidden="true" />
       <div>
         <strong>Local development</strong>
         <p>Fastify API via Nuxt proxy</p>
