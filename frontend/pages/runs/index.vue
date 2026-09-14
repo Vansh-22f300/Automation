@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ListFilter, PlaySquare } from "@lucide/vue";
+import { Activity, ListFilter, PlaySquare, Sparkles } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 import { formatDate } from "~/lib/format";
 
@@ -27,6 +27,8 @@ const { data: workflows } = useResource(() => api.listWorkflows(100));
 const items = computed(() => data.value?.items ?? []);
 const hasPrevious = computed(() => previousCursors.value.length > 0);
 const hasNext = computed(() => (data.value?.page.nextCursor ?? null) !== null);
+const succeeded = computed(() => items.value.filter(r => r.status === 'succeeded').length);
+const active = computed(() => items.value.filter(r => ['running','queued','waiting'].includes(r.status)).length);
 
 watch([status, workflowId, cursor], ([s, w, c]) => {
   router.replace({ query: { ...route.query, status: s || undefined, workflowId: w || undefined, cursor: c || undefined } });
@@ -69,20 +71,47 @@ function clearFilters() {
       description="Durable execution history — every trigger, step and job, tenant-isolated and inspectable."
     />
 
-    <section class="panel table-shell">
+    <section class="metric-grid" style="margin-bottom:20px">
+      <article class="metric-card card-sheen" style="min-height:88px;padding:16px 20px;display:flex;align-items:center;gap:14px">
+        <span style="display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:var(--brand-weak-bg);color:var(--brand-weak-text);border:1px solid var(--brand-weak-border)"><Activity :size="16" aria-hidden="true" /></span>
+        <div>
+          <p style="margin:0;color:var(--text-muted);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;font-weight:600">Visible</p>
+          <strong style="font-size:18px;margin:2px 0 0">{{ items.length }} runs</strong>
+          <span>tenant-scoped · live</span>
+        </div>
+      </article>
+      <article class="metric-card card-sheen" style="min-height:88px;padding:16px 20px;display:flex;align-items:center;gap:14px">
+        <span style="display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:var(--success-bg);color:var(--success-text);border:1px solid rgba(23,114,69,0.18)"><PlaySquare :size="16" aria-hidden="true" /></span>
+        <div>
+          <p style="margin:0;color:var(--text-muted);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;font-weight:600">Succeeded</p>
+          <strong style="font-size:18px;margin:2px 0 0;color:var(--success-text)">{{ succeeded }}</strong>
+          <span>completed clean</span>
+        </div>
+      </article>
+      <article class="metric-card card-sheen" style="min-height:88px;padding:16px 20px;display:flex;align-items:center;gap:14px">
+        <span style="display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:var(--info-bg);color:var(--info-text);border:1px solid rgba(23,92,211,0.18)"><Sparkles :size="16" aria-hidden="true" /></span>
+        <div>
+          <p style="margin:0;color:var(--text-muted);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;font-weight:600">Active</p>
+          <strong style="font-size:18px;margin:2px 0 0;color:var(--info-text)">{{ active }}</strong>
+          <span>queued / running</span>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel panel--elevated table-shell">
       <div class="panel-heading">
         <div>
           <p class="eyebrow">Collection</p>
           <h2>Run history</h2>
-          <p class="inline-note" style="margin-top:4px">{{ items.length === 0 ? 'No results' : items.length + ' runs' }} · filters apply to tenant only</p>
+          <p class="inline-note" style="margin-top:4px">Filters apply to tenant only · cursor pagination</p>
         </div>
-        <span class="pill" aria-hidden="true"><PlaySquare :size="12" style="margin-right:6px"/>{{ items.length }} visible</span>
+        <span class="pill" aria-hidden="true" style="border-radius:999px"><PlaySquare :size="12" style="margin-right:6px"/>{{ items.length }} visible</span>
       </div>
 
-      <form class="table-toolbar" @submit.prevent="applyFilters" aria-label="Run filters">
+      <form class="table-toolbar" @submit.prevent="applyFilters" aria-label="Run filters" style="padding:12px;border:1px solid var(--border-subtle);border-radius:12px;background:var(--surface-raised)">
         <div class="filters">
-          <label class="hidden-sm" for="run-status">Status</label>
-          <select id="run-status" v-model="status" class="filter-select" aria-label="Filter by status">
+          <label class="hidden-sm" for="run-status" style="font-size:12px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted)">Status</label>
+          <select id="run-status" v-model="status" class="filter-select" aria-label="Filter by status" style="border-radius:999px;min-width:140px">
             <option value="">All statuses</option>
             <option value="queued">Queued</option>
             <option value="running">Running</option>
@@ -92,18 +121,18 @@ function clearFilters() {
             <option value="cancelled">Cancelled</option>
           </select>
 
-          <label class="hidden-sm" for="workflow-filter">Workflow</label>
-          <select id="workflow-filter" v-model="workflowId" class="filter-select" aria-label="Filter by workflow">
+          <label class="hidden-sm" for="workflow-filter" style="font-size:12px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted)">Workflow</label>
+          <select id="workflow-filter" v-model="workflowId" class="filter-select" aria-label="Filter by workflow" style="border-radius:999px;min-width:160px">
             <option value="">All workflows</option>
             <option v-for="workflow in workflows?.items ?? []" :key="workflow.id" :value="workflow.id">{{ workflow.name }}</option>
           </select>
         </div>
         <div class="page-toolbar">
-          <button class="button button-secondary" type="submit">
+          <button class="button button-primary" type="submit" style="border-radius:999px;height:36px">
             <ListFilter :size="14" aria-hidden="true" />
-            Apply filters
+            Apply
           </button>
-          <button v-if="status || workflowId" class="button button-secondary" type="button" @click="clearFilters">Clear</button>
+          <button v-if="status || workflowId" class="button button-secondary" type="button" @click="clearFilters" style="border-radius:999px">Clear</button>
         </div>
       </form>
 
@@ -132,49 +161,54 @@ function clearFilters() {
             <tbody>
               <tr v-for="run in items" :key="run.id">
                 <td>
-                  <NuxtLink class="table-link" :to="`/runs/${encodeURIComponent(run.id)}`"><strong style="font-family:var(--font-mono);font-size:12px">{{ run.id.slice(0,8) }}…{{ run.id.slice(-4) }}</strong></NuxtLink>
-                  <p class="mono-text" style="font-size:11px" :title="run.id">{{ run.id }}</p>
+                  <NuxtLink class="table-link" :to="`/runs/${encodeURIComponent(run.id)}`"><span style="display:inline-flex;align-items:center;gap:8px"><span class="status-dot" :class="run.status==='succeeded' ? 'status-dot--success' : run.status==='failed' ? 'status-dot--failed' : ['running','queued','waiting'].includes(run.status) ? 'status-dot--running' : ''" aria-hidden="true" /><strong style="font-family:var(--font-mono);font-size:12px">{{ run.id.slice(0,8) }}…{{ run.id.slice(-4) }}</strong></span></NuxtLink>
+                  <p class="mono-text" style="font-size:11px;margin:2px 0 0" :title="run.id">{{ run.id }}</p>
                 </td>
                 <td>
                   <strong>{{ run.workflowName }}</strong>
-                  <p class="mono-text">{{ run.workflowId.slice(0,8) }}…</p>
+                  <p class="mono-text" style="margin:2px 0 0">{{ run.workflowId.slice(0,8) }}…</p>
                 </td>
                 <td><StatusBadge :status="run.status" /></td>
-                <td><span class="pill" style="font-family:var(--font-mono);font-size:12px">{{ run.currentStepKey ?? "Complete" }}</span></td>
-                <td>{{ formatDate(run.startedAt ?? run.createdAt) }}</td>
-                <td>{{ formatDate(run.finishedAt) }}</td>
+                <td><span class="pill" style="font-family:var(--font-mono);font-size:11px;border-radius:999px">{{ run.currentStepKey ?? "Complete" }}</span></td>
+                <td style="white-space:nowrap">{{ formatDate(run.startedAt ?? run.createdAt) }}</td>
+                <td style="white-space:nowrap">{{ formatDate(run.finishedAt) }}</td>
               </tr>
             </tbody>
           </table>
         </div>
 
         <div class="card-list" role="list">
-          <div v-for="run in items" :key="run.id" class="data-card" role="listitem">
+          <div v-for="run in items" :key="run.id" class="app-card" role="listitem">
             <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
-              <NuxtLink class="table-link" :to="`/runs/${encodeURIComponent(run.id)}`"><strong style="font-family:var(--font-mono);font-size:12px">{{ run.id.slice(0,8) }}…</strong></NuxtLink>
+              <NuxtLink class="table-link" :to="`/runs/${encodeURIComponent(run.id)}`"><span style="display:inline-flex;gap:8px;align-items:center"><span class="status-dot" :class="run.status==='succeeded' ? 'status-dot--success' : run.status==='failed' ? 'status-dot--failed' : 'status-dot--running'" aria-hidden="true" /><strong style="font-family:var(--font-mono);font-size:12px">{{ run.id.slice(0,8) }}…</strong></span></NuxtLink>
               <StatusBadge :status="run.status" />
             </div>
-            <p style="margin:6px 0 0;font-size:13px;font-weight:500">{{ run.workflowName }}</p>
-            <p class="mono-text" style="font-size:11px">{{ run.currentStepKey ?? 'Complete' }} · {{ formatDate(run.startedAt ?? run.createdAt) }}</p>
+            <p style="margin:8px 0 0;font-size:13px;font-weight:600">{{ run.workflowName }}</p>
+            <p class="mono-text" style="font-size:11px;margin:2px 0 0">{{ run.currentStepKey ?? 'Complete' }} · {{ formatDate(run.startedAt ?? run.createdAt) }}</p>
+            <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+              <span class="pill" style="border-radius:999px">{{ run.status }}</span>
+              <span class="pill" style="border-radius:999px;font-family:var(--font-mono);font-size:11px">{{ run.currentStepKey ?? 'Complete' }}</span>
+            </div>
           </div>
         </div>
       </template>
 
-      <div v-if="items.length > 0" class="pagination-row">
+      <div v-if="items.length > 0" class="pagination-row" style="margin-top:12px;padding-top:14px;border-top:1px solid var(--border-subtle)">
         <p class="inline-note">Cursor pagination · tenant-scoped</p>
         <div class="page-toolbar">
-          <button class="button button-secondary" type="button" :disabled="!hasPrevious" @click="loadPrevious">Previous</button>
-          <button class="button button-secondary" type="button" :disabled="!hasNext" @click="loadNext">Next</button>
+          <button class="button button-secondary" type="button" :disabled="!hasPrevious" @click="loadPrevious" style="border-radius:999px">Previous</button>
+          <button class="button button-secondary" type="button" :disabled="!hasNext" @click="loadNext" style="border-radius:999px">Next</button>
         </div>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel panel--elevated">
       <div class="panel-heading">
         <div>
           <p class="eyebrow">Run lookup</p>
           <h2>Open a specific run</h2>
         </div>
+        <span class="pill" style="border-radius:999px;background:var(--surface-sunken)">inspect</span>
       </div>
       <p class="panel-copy">Enter a run ID to view its execution — steps, jobs, LLM usage and tool activity.</p>
       <RunLookup />
@@ -184,4 +218,5 @@ function clearFilters() {
 
 <style scoped>
 .visually-hidden { position:absolute; left:-9999px; }
+tbody tr:hover { background: var(--surface-raised); }
 </style>
