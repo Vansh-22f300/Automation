@@ -4,7 +4,7 @@ AI-powered operations automation. Business applications are connected, a process
 is described, and the platform executes it — receiving triggers, reasoning with
 an LLM, calling external tools, and keeping a durable audit trail of every step.
 
-> **Status: backend production hardening is paused after Step 13 Items 1–3; Frontend Milestone 1 is available in `frontend/`.**
+> **Status: backend production hardening is paused after Step 13 Items 1–3; Frontend Premium SaaS Phase D — cinematic workspace (dark void console, same system as landing: aurora/bento/product surfaces, Linear×Vercel×Raycast, no fake claims) is available in `frontend/`.**
 > The project has a PostgreSQL schema, migrations and a connection pool, a Fastify
 > API with a health endpoint and tenant API-key authentication, a tenant-scoped
 > service for authoring workflows and their immutable versioned definitions, a
@@ -135,27 +135,44 @@ It verifies the database is reachable **before** opening the port, then binds to
 
 ## Local frontend
 
-The visible application lives in [`frontend/`](frontend/), a separate Nuxt 3
-single-page app. It consumes Fastify through a small typed client; it does not
-duplicate API routes or contain backend business logic.
+The visible application lives in [`frontend/`](frontend/), a Nuxt 3 + Vue 3 SPA with a token-based CSS design system (Geist / Geist Mono) elevated in Phase C to a **cinematic premium** language — no React/Tailwind/Framer, pure Vue/CSS. It consumes Fastify through a small typed client; it does not duplicate API routes or contain backend business logic.
+
+**Two experiences, one design system:**
+
+- **`/` — public product landing** (layout `landing.vue`, **no API dependency**): dark cinematic canvas (`#050508` void, layered elevated surfaces), subtle aurora (mint/lilac/bloom) + grid + noise behind content, sticky dark-glass nav with scroll progress, oversized hero (tight tracking, gradient accent) + layered product hero visualization (workflow surface + running run timeline with floating lease/encrypted metadata), capability strip, editorial problem→solution bento, **bento capabilities** (large pinned-version surface + supporting cards) instead of uniform 3-card rows, **product showcase** built from real workflow/run/connection concepts (large run-detail surface + workflow catalog + connections), 4-step timeline, reliability bento, philosophy, FAQ and final CTA. Renders correctly with no `NUXT_PUBLIC_API_KEY` and no backend running — pure static marketing, capability-based proof only (no fake logos, testimonials, pricing or metrics; illustrative content is explicitly labeled).
+- **Authenticated workspace** (`/workflows`, `/runs`, `/runs/:runId`, `/connections` — layout `default.vue`): **same cinematic system as landing** — void `#050508` canvas with subtle aurora, glass/dark elevated surfaces, `workspace-bento` (large catalog/feed + side metrics), premium page headers (eyebrow + large title + ambient glow), **workflows as hybrid workflow-card grid** (name/status/version/trigger + illustrative webhook→steps→run + hover), **runs as command-center feed** (`run-feed-item` with status-dot pulse, workflow/current-step/duration, dark filter bar, URL-synced), **run detail as execution inspector** (bento hero + duration/LLM metrics, central timeline with luminous dots + vertical gradient line, jobs/tools/trigger as dark card-sheen surfaces, redacted `details`), **connections as dark registry** (`connection-card` with provider initials + metadata + secure indicators). Sidebar void/panel with gradient active, mobile drawer/topbar preserved, `prefers-reduced-motion` respected, color-independent status (dot + text), 320-1440+ no overflow.
+
+Design language: *Linear × Vercel × Raycast × premium developer tools* — dark cinematic throughout (landing is marketing expression, workspace is product console), restrained glass/gradient-border/bento/product surfaces, `prefers-reduced-motion` respected, keyboard-visible focus, color-independent status (dot + text), 320-1440+ no overflow.
 
 Start the API first, then in another terminal:
 
 ```bash
 cd frontend
-pnpm dev
+pnpm dev        # http://localhost:3001 (Vite proxies /backend -> 127.0.0.1:3000)
+pnpm typecheck  # nuxt typecheck (strict)
+pnpm build      # nuxt build
 ```
 
-Open `http://localhost:3001`. Create `frontend/.env` from
-[`frontend/.env.example`](frontend/.env.example) and set `NUXT_PUBLIC_API_KEY`
-to a local tenant API key. This is development-only browser configuration; never
-commit a real key. The Nuxt Vite server proxies `/backend/*` to
-`NUXT_BACKEND_URL` (default `http://127.0.0.1:3000`) so browser requests remain
-same-origin and Fastify needs no CORS policy.
+Create `frontend/.env` from [`frontend/.env.example`](frontend/.env.example):
 
-The current API exposes authenticated tenant-scoped collection reads for
-workflows, runs, and connections, plus detailed run inspection by id. The Nuxt
-dashboard consumes these endpoints directly through the typed frontend API client.
+```
+NUXT_PUBLIC_API_KEY=<tenant bearer key>   # required for /workflows,/runs,/connections; landing needs none
+NUXT_PUBLIC_API_BASE=/backend             # default; override only if not using Vite proxy
+NUXT_BACKEND_URL=http://127.0.0.1:3000    # Vite dev proxy target
+```
+
+`NUXT_PUBLIC_API_KEY` is development-only browser config — never commit a real key. All authenticated pages send `Authorization: Bearer <key>`; `GET /healthz` is public. The Vite proxy keeps requests same-origin so Fastify needs no CORS policy.
+
+**Frontend architecture:**
+
+- `app.vue` → `layouts/default.vue` (app shell + `AppSidebar` drawer) or `layouts/landing.vue` (public, dark + noise + aurora)
+- `pages/index.vue` (landing, static, cinematic hero/bento/showcase), `pages/workflows.vue`, `pages/runs/index.vue`, `pages/runs/[runId].vue`, `pages/connections.vue`
+- `components/AppSidebar.vue`, `PageHeader.vue`, `StatusBadge.vue`, `EmptyState.vue`, `ErrorState.vue`, `LoadingState.vue`, `RunLookup.vue` + landing sections inline
+- `composables/useApiClient.ts` → `lib/api-client.ts` (`getHealth`, `listWorkflows`, `listRuns`, `listConnections`, `getRun` — contracts unchanged), `composables/use-resource.ts` (pending/error/refresh)
+- `assets/css/main.css` — single token source (`--bg`, `--surface`, `--text`, `--brand`, `--sidebar-bg`, `--landing-void/panel/mint/lilac/bloom`, etc.), landing dark/aurora/glass/gradient-border/bento/product-surface, workspace **same void console** (`app-shell`/`app-main` void + aurora, `page-header` ambient, `workspace-bento`/`workflow-card`/`run-feed-item`/`connection-card`, dark `panel`/`metric-card`/`table` with glass, `status-dot` pulse, `timeline-premium`), drawer, table→card/grid fallback, reveal + drift/float/shine (reduced-motion safe)
+- `types/api.ts` — DTOs mirroring backend `RunInspection` (summaries redacted)
+
+The current API exposes authenticated tenant-scoped collection reads for workflows, runs, and connections, plus detailed run inspection by id. The landing does not call them; the authenticated workspace consumes them directly through the typed client.
 
 ### Endpoints
 
