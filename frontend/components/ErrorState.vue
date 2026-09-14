@@ -13,13 +13,13 @@ function friendly(message: string): string {
 </script>
 
 <template>
-  <div class="state-panel state-error" role="alert" aria-live="polite">
-    <span style="display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:var(--danger-bg);border:1px solid #f3c6c1;color:var(--danger-text)"><AlertCircle :size="18" aria-hidden="true" /></span>
+  <div class="state-panel state-error" role="alert" aria-live="polite" style="color:var(--landing-dim)">
+    <span style="display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.22);color:#ff8a8a"><AlertCircle :size="18" aria-hidden="true" /></span>
     <div>
-      <h2>Couldn’t load this view</h2>
-      <p>{{ friendly(message) }}</p>
+      <h2 style="color:#ff9a9a">Couldn’t load this view</h2>
+      <p style="color:var(--landing-dim)">{{ friendly(message) }}</p>
     </div>
-    <button class="button button-secondary" type="button" @click="$emit('retry')">
+    <button class="button button-secondary" type="button" style="border-radius:999px" @click="$emit('retry')">
       <RefreshCw :size="16" aria-hidden="true" />
       Try again
     </button>
