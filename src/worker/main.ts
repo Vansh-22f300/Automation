@@ -129,7 +129,7 @@ try {
 // decrypt runs — so the worker still boots when no connection is configured; a
 // tool call for a tenant with no key then fails cleanly at execution.
 const toolRegistry = createSlackToolRegistry({ logger });
-const cipher = createCredentialCipher(env);
+const cipher = createCredentialCipher(env, { logger });
 const resolverFactory = (tenantId: string): ConnectionResolver =>
   new ConnectionRepository(new TenantScope(database.db, tenantId), cipher);
 

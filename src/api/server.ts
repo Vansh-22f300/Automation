@@ -32,7 +32,11 @@ const env = loadEnv();
 const logger = createLogger(env, { service: "api" });
 
 const database = createDatabase(env, logger, { service: "api" });
-const cipher = createCredentialCipher(env);
+// Pass the logger so the factory can emit the cleanup warning when both
+// `CREDENTIAL_ENCRYPTION_KEY` and a keyring containing `legacy-v1` are
+// configured — the legacy var is dead in that configuration and the
+// operator can remove it from the environment.
+const cipher = createCredentialCipher(env, { logger });
 
 // The producer side of the queue. Enqueuing the first job is unscoped here (the
 // tenant is carried on each job and enforced by the composite FK); ingestion

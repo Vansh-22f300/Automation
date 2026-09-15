@@ -24,7 +24,6 @@ import { describe, expect, it } from 'vitest';
 import {
   CredentialCipher,
   CredentialKeyInvalidError,
-  CredentialLegacyV1WriterMissingError,
   createCredentialCipher,
   generateCredentialKey,
   parseCredentialKey,
@@ -217,22 +216,57 @@ describe('createCredentialCipher — env × behaviour matrix', () => {
     expect(reference.decrypt(v1)).toEqual({ a: 1 });
   });
 
-  it('new present (no legacy-v1) / legacy present → legacy var ignored; no v1 writer; v2 active present', () => {
-    const c = make(K1.toString('base64'), `${kidA}:${kidA_b64}`);
-    expect(c.hasKey).toBe(true);
-    // Once a keyring is configured it is the single source of truth: without a
-    // `legacy-v1` entry there is no v1 writer. The legacy var must NOT back the
-    // writer here — a v1 write capability always has a matching v1 read
-    // capability, and the ring could never read those envelopes back.
-    expect(() => c.encrypt({ a: 1 })).toThrow(CredentialLegacyV1WriterMissingError);
-    // v2 write + read works.
-    const env = c.encryptWithActive({ a: 1 }, Buffer.from('a:b'));
-    expect(c.decrypt(env, { tenantId: 't', connectionId: 'c', aad: Buffer.from('a:b') })).toEqual({ a: 1 });
+  it('new present (with legacy-v1) / legacy present → cleanup warning emitted when a logger is provided', () => {
+    const events: Array<{ event: string; msg: string }> = [];
+    const stubLogger = {
+      info(payload: Record<string, unknown>, msg: string) {
+        events.push({ event: String(payload['event']), msg });
+      },
+    };
+    createCredentialCipher(envWith(K1.toString('base64'), `${kidA}:${kidA_b64},${LEGACY_V1_KID}:${kidB_b64}`), {
+      logger: stubLogger as never,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.event).toBe('credential_keyring_legacy_var_ignored');
+    expect(events[0]?.msg).toBe('credential_keyring_legacy_var_ignored');
   });
 
-  it('legacy absent / new absent → ring empty, writer null, hasKey = false', () => {
-    const c = make();
-    expect(c.hasKey).toBe(false);
+  it('new present (with legacy-v1) / legacy present → no warning emitted without a logger', () => {
+    // No logger → the warning is silently dropped. The cipher is still
+    // constructed correctly.
+    const c = createCredentialCipher(
+      envWith(K1.toString('base64'), `${kidA}:${kidA_b64},${LEGACY_V1_KID}:${kidB_b64}`),
+    );
+    expect(c.hasKey).toBe(true);
+  });
+
+  it('new present (no legacy-v1) / legacy present → BOOT FAIL (orphan legacy var)', () => {
+    // Invariant P: a v1 write capability requires a v1 read capability.
+    // The legacy env var is set but the keyring has no `legacy-v1` entry;
+    // the orphan configuration is rejected at boot with a clear message.
+    expect(() => make(K1.toString('base64'), `${kidA}:${kidA_b64}`)).toThrow(
+      CredentialKeyInvalidError,
+    );
+  });
+
+  it('new present (no legacy-v1) / legacy present → boot-fail message names both env vars', () => {
+    let caught: unknown;
+    try {
+      make(K1.toString('base64'), `${kidA}:${kidA_b64}`);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CredentialKeyInvalidError);
+    const message = (caught as Error).message;
+    expect(message).toContain('CREDENTIAL_ENCRYPTION_KEY');
+    expect(message).toContain('CREDENTIAL_ENCRYPTION_KEYS');
+    expect(message).toContain('legacy-v1');
+  });
+
+  it('legacy absent / new absent → BOOT FAIL (no keys at all)', () => {
+    // A deployment that sets neither env var has no encryption capability
+    // and must be refused at boot, not at first use.
+    expect(() => make()).toThrow(CredentialKeyInvalidError);
   });
 
   it('new present malformed → boot-time failure (parsed at KeyRing.parse)', () => {

@@ -46,6 +46,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 import type { Env } from '@/config/env.js';
+import type { Logger } from '@/observability/logger.js';
 import { LEGACY_V1_KID, KeyRing } from '@/security/keyring.js';
 import { PermanentError } from '@/domain/errors.js';
 
@@ -415,23 +416,56 @@ export class CredentialCipher {
 /**
  * Build a cipher from validated environment config.
  *
- * - The {@link KeyRing} is built from `CREDENTIAL_ENCRYPTION_KEYS` when present.
- *   When absent but `CREDENTIAL_ENCRYPTION_KEY` is set, the legacy key is auto-
- *   imported as a single decrypt-only `legacy-v1` entry. When both are absent, the
- *   ring is empty (use-time failures surface typed errors).
- * - `legacyV1Writer` is always the ring's `legacy-v1` entry — the same entry
- *   `decrypt` resolves for v1 envelopes — so a v1 write capability always has
- *   a matching v1 read capability. It is null unless the ring carries
- *   `legacy-v1` (via an explicit keyring entry, or the auto-import when only
- *   the legacy env var is set), and `encrypt()` fails at first use otherwise.
+ * The factory implements the env × behaviour matrix in §7 of the architectural
+ * plan. Three boot-time invariants are enforced here, not at env parse time,
+ * so the factory is the single authoritative source of truth for the
+ * configuration contract:
  *
- * See the env × behaviour matrix in §7 of the architectural plan for the exact
- * contract this factory implements.
+ * - **Invariant P — v1 write capability requires v1 read capability.** A
+ *   configuration that lets `connections:create` write v1 envelopes under
+ *   bytes the configured keyring cannot decrypt is incoherent and is
+ *   refused at boot with a typed `CredentialKeyInvalidError`. The legacy
+ *   env var is honoured as a v1 writer source only when the keyring is
+ *   empty (auto-import populates the ring with the same bytes) or when
+ *   the keyring itself carries a `legacy-v1` entry. The forbidden
+ *   configuration — `CREDENTIAL_ENCRYPTION_KEY` set together with a
+ *   `CREDENTIAL_ENCRYPTION_KEYS` value that lacks a `legacy-v1` entry —
+ *   fails here with a clear message.
+ *
+ * - **No keys at all fails at boot.** A deployment that sets neither
+ *   env var has no encryption capability and is refused here so the
+ *   process cannot start in an obviously broken state.
+ *
+ * - **Cleanup warning when the legacy var is dead.** When the keyring
+ *   contains a `legacy-v1` entry AND `CREDENTIAL_ENCRYPTION_KEY` is
+ *   also set, the legacy var is unused (the keyring's entry backs both
+ *   v1 read and v1 write with the same bytes). The factory emits a
+ *   one-time INFO-level warning so operators can remove the dead env
+ *   var. The warning is emitted only when a logger is supplied via
+ *   `options.logger`; tests inject a stub logger to assert on it.
+ *
+ * The factory accepts an optional `{ logger }` so production callers can
+ * receive the cleanup warning. Callers without a logger (unit tests,
+ * smoke CLIs) silently skip the warning — the cipher is still constructed
+ * correctly.
  */
-export function createCredentialCipher(env: Env): CredentialCipher {
+export function createCredentialCipher(
+  env: Env,
+  options?: { readonly logger?: Logger },
+): CredentialCipher {
   const legacyRaw = env.CREDENTIAL_ENCRYPTION_KEY;
   const newRaw = env.CREDENTIAL_ENCRYPTION_KEYS;
   const legacyKey = legacyRaw !== undefined ? parseCredentialKey(legacyRaw) : null;
+
+  // Boot fail — neither env var set. A deployment with no encryption keys
+  // has no capability at all and would fail at first use with confusing
+  // typed errors. Refuse at boot instead.
+  if (legacyKey === null && newRaw === undefined) {
+    throw new CredentialKeyInvalidError(
+      'at least one of CREDENTIAL_ENCRYPTION_KEY or CREDENTIAL_ENCRYPTION_KEYS must be set — ' +
+        'the cipher cannot encrypt or decrypt credentials without a key',
+    );
+  }
 
   // Build the ring: explicit new var > auto-import of legacy > empty.
   let ring: KeyRing;
@@ -443,14 +477,49 @@ export function createCredentialCipher(env: Env): CredentialCipher {
     ring = KeyRing.empty();
   }
 
+  // Boot fail — orphan legacy env var. The legacy var is set but the
+  // configured keyring has no `legacy-v1` entry, so any v1 envelope the
+  // legacy var could (under the previous design) have written cannot be
+  // read back. Refuse the configuration with a clear message naming
+  // both env vars and pointing at the resolution.
+  if (legacyKey !== null && newRaw !== undefined && !ring.hasLegacyV1) {
+    throw new CredentialKeyInvalidError(
+      'CREDENTIAL_ENCRYPTION_KEY is set but CREDENTIAL_ENCRYPTION_KEYS does not contain a ' +
+        '"legacy-v1" entry. Either remove CREDENTIAL_ENCRYPTION_KEY from the environment, or ' +
+        'add a "legacy-v1:<base64-key>" entry to CREDENTIAL_ENCRYPTION_KEYS. ' +
+        'The legacy env var cannot act as a writer-only fallback: a v1 write capability ' +
+        'must always have a matching v1 read capability (invariant P).',
+    );
+  }
+
+  // Cleanup warning — legacy var is dead. The keyring is the source of
+  // truth for both v1 read and v1 write (its `legacy-v1` entry backs both
+  // with the same bytes). The legacy env var is unused and the operator
+  // can remove it from their config. Only emitted when a logger is
+  // supplied; without a logger the warning is silently dropped (no side
+  // effects, no thrown error).
+  if (
+    legacyKey !== null &&
+    ring.hasLegacyV1 &&
+    options?.logger !== undefined
+  ) {
+    options.logger.info(
+      {
+        event: 'credential_keyring_legacy_var_ignored',
+        message:
+          'CREDENTIAL_ENCRYPTION_KEY is set but ignored: CREDENTIAL_ENCRYPTION_KEYS contains a ' +
+          '"legacy-v1" entry which is the authoritative source for v1 read and v1 write. ' +
+          'Remove CREDENTIAL_ENCRYPTION_KEY from the environment.',
+      },
+      'credential_keyring_legacy_var_ignored',
+    );
+  }
+
   // The v1 writer is the ring's `legacy-v1` entry — the exact entry the v1
   // reader resolves — so a v1 write capability always has a matching v1 read
   // capability. When CREDENTIAL_ENCRYPTION_KEYS is absent, the legacy env var
   // reaches this entry through the auto-import above; once a keyring is
   // configured it is the single source of truth and the legacy var is ignored.
-  // A keyring without a `legacy-v1` entry therefore has NO v1 writer: `encrypt`
-  // fails with `credential_legacy_v1_writer_missing` instead of writing v1
-  // envelopes that nothing could ever read back.
   const legacyV1Writer = ring.legacyV1Key;
 
   return new CredentialCipher(legacyV1Writer, ring);

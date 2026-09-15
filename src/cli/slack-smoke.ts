@@ -24,7 +24,11 @@ import { ToolExecutor } from '@/domain/tool-executor.js';
 import { createLogger } from '@/observability/logger.js';
 import { ConnectionRepository } from '@/repositories/connection-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
-import { createCredentialCipher } from '@/security/credential-cipher.js';
+import {
+  CredentialCipher,
+  CredentialKeyInvalidError,
+  createCredentialCipher,
+} from '@/security/credential-cipher.js';
 
 const MESSAGE = 'AI Workforce Slack connector test';
 
@@ -43,7 +47,19 @@ if (tenantId === undefined || connectionId === undefined) {
 
 const env = loadEnv();
 const logger = createLogger(env, { service: 'slack-smoke' });
-const cipher = createCredentialCipher(env);
+// The factory boot-fails on `absent / absent` per invariant P — wrap to
+// preserve the dev-friendly "no key ⇒ skip the live path" UX rather than
+// surfacing a configuration error when the smoke is run without keys.
+let cipher: CredentialCipher;
+try {
+  cipher = createCredentialCipher(env, { logger });
+} catch (error) {
+  if (error instanceof CredentialKeyInvalidError) {
+    reportNotExecuted(error.message);
+    process.exit(0);
+  }
+  throw error;
+}
 
 if (!cipher.hasKey) {
   // No key ⇒ cannot decrypt ⇒ cannot run the live path. Not a failure.

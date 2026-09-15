@@ -62,7 +62,7 @@ if (command === undefined || tenantId === undefined) usage();
 const env = loadEnv();
 const logger = createLogger(env, { service: 'cli' });
 const database = createDatabase(env, logger, { service: 'cli' });
-const cipher = createCredentialCipher(env);
+const cipher = createCredentialCipher(env, { logger });
 
 try {
   await database.verifyConnection();

@@ -35,7 +35,11 @@ import { createClaudeProvider } from '@/llm/claude-provider.js';
 import { createLogger } from '@/observability/logger.js';
 import { ConnectionRepository } from '@/repositories/connection-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
-import { createCredentialCipher } from '@/security/credential-cipher.js';
+import {
+  CredentialCipher,
+  CredentialKeyInvalidError,
+  createCredentialCipher,
+} from '@/security/credential-cipher.js';
 
 function reportNotExecuted(reason: string): void {
   process.stdout.write(`live smoke: NOT executed (${reason})\n`);
@@ -68,7 +72,19 @@ if (env.ANTHROPIC_API_KEY === undefined && env.ANTHROPIC_AUTH_TOKEN === undefine
 }
 
 const logger = createLogger(env, { service: 'llm-tool-smoke' });
-const cipher = createCredentialCipher(env);
+// The factory boot-fails on `absent / absent` per invariant P — wrap to
+// preserve the dev-friendly "no key ⇒ skip the live path" UX rather than
+// surfacing a configuration error when the smoke is run without keys.
+let cipher: CredentialCipher;
+try {
+  cipher = createCredentialCipher(env, { logger });
+} catch (error) {
+  if (error instanceof CredentialKeyInvalidError) {
+    reportNotExecuted(error.message);
+    process.exit(0);
+  }
+  throw error;
+}
 
 // No key ⇒ cannot decrypt the stored bot token ⇒ cannot run the live path.
 if (!cipher.hasKey) {
