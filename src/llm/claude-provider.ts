@@ -186,13 +186,20 @@ export class ClaudeProvider implements LlmProvider {
     const started = performance.now();
     try {
       this.assertHasMessages(request.messages);
-      const response = await this.client.messages.parse(
+      // Use `messages.create` and parse locally rather than `messages.parse`. The
+      // parse helper trusts the gateway to honour `output_config`; a gateway that
+      // ignores it returns prose and the helper throws deep in the SDK. We still
+      // SEND `output_config` (real Anthropic and compliant gateways constrain the
+      // output to it), but we also append an explicit JSON-only instruction and
+      // parse/validate the text ourselves — so the contract holds on gateways that
+      // ignore `output_config` too.
+      const response = await this.client.messages.create(
         {
           model,
           max_tokens: request.maxOutputTokens,
           messages: this.toSdkMessages(request.messages),
           output_config: { format: zodOutputFormat(request.schema) },
-          ...(request.system !== undefined ? { system: request.system } : {}),
+          system: buildStructuredSystem(request.system, request.schema),
           ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
         },
         this.requestOptions(request),
@@ -201,20 +208,12 @@ export class ClaudeProvider implements LlmProvider {
       const latencyMs = elapsed(started);
       this.assertNotRefusal(response.stop_reason, model);
 
-      // Defensive re-validation. `parse()` already validates, but we never let
-      // unvalidated data escape this boundary into workflow context — a mismatch
-      // (or a null parse) is a permanent failure, not a silent malformed result.
-      const parsed = request.schema.safeParse(response.parsed_output);
-      if (!parsed.success) {
-        throw new PermanentError(
-          'llm_structured_parse_failed',
-          'Claude structured output did not match the requested schema',
-          { details: { provider: PROVIDER_NAME, model } },
-        );
-      }
+      // Parse the model's text ourselves and validate against the schema — no
+      // unvalidated data escapes this boundary into workflow context.
+      const data = this.parseStructuredText(extractText(response.content), request.schema, model);
 
       const completion: LlmStructuredCompletion<T> = {
-        data: parsed.data,
+        data,
         model: response.model,
         usage: toUsage(response.usage),
         latencyMs,
@@ -231,9 +230,9 @@ export class ClaudeProvider implements LlmProvider {
    * One stateless tool-conversation turn. Offers the model the given tools plus
    * the final-output schema and returns either the tools it requested or its
    * final structured data. The bounded loop lives in the caller; this performs a
-   * single round-trip and never executes a tool or loops. `messages.parse`
-   * accepts `tools` and `output_config` together, so one call covers both the
-   * "requested a tool" and "produced final output" outcomes.
+   * single round-trip and never executes a tool or loops. One `messages.create`
+   * call covers both outcomes — a `tool_use` turn or a final answer — and the
+   * final answer is parsed locally (see `parseStructuredText`).
    */
   async converse(request: LlmToolTurnRequest): Promise<LlmToolTurn> {
     const model = request.model ?? this.model;
@@ -245,7 +244,15 @@ export class ClaudeProvider implements LlmProvider {
         });
       }
 
-      const response = await this.client.messages.parse(
+      // Drive the tool turn through `messages.create`, NOT `messages.parse`. The
+      // parse helper eagerly runs the output-schema parser over every `text` block
+      // in the response; on a `tool_use` turn the model's accompanying text is not
+      // the final JSON, so the helper throws a base `AnthropicError` *inside* the
+      // SDK — before the `stop_reason === 'tool_use'` branch below can extract the
+      // tool call. The request body (including `output_config`, tools and
+      // tool_choice) is unchanged; we simply parse the final answer ourselves in
+      // the non-tool branch.
+      const response = await this.client.messages.create(
         {
           model,
           max_tokens: request.maxOutputTokens,
@@ -254,7 +261,11 @@ export class ClaudeProvider implements LlmProvider {
           ...(request.tools.length > 0
             ? { tools: toSdkTools(request.tools), tool_choice: { type: 'auto' as const } }
             : {}),
-          ...(request.system !== undefined ? { system: request.system } : {}),
+          // Same JSON-only instruction as the no-tools structured path, so the
+          // FINAL answer (after any tool rounds) is schema-shaped JSON even on a
+          // gateway that ignores `output_config`. It is phrased for the final turn,
+          // so it does not suppress tool_use on earlier rounds.
+          system: buildStructuredSystem(request.system, request.schema),
         },
         {
           maxRetries: 0,
@@ -285,18 +296,13 @@ export class ClaudeProvider implements LlmProvider {
         return { kind: 'tool_use', toolCalls, model: response.model, usage, latencyMs, provider: PROVIDER_NAME };
       }
 
-      // Otherwise the model produced its final answer. Defensively re-validate —
-      // unvalidated data must never escape this boundary into workflow context.
-      const parsed = request.schema.safeParse(response.parsed_output);
-      if (!parsed.success) {
-        throw new PermanentError(
-          'llm_structured_parse_failed',
-          'Claude structured output did not match the requested schema',
-          { details: { provider: PROVIDER_NAME, model } },
-        );
-      }
+      // Otherwise the model produced its final answer. Parse it ourselves through
+      // the same local structured path `completeStructured` uses — extract text,
+      // JSON.parse, validate — so behaviour is identical on both paths and holds on
+      // gateways that ignore `output_config`.
+      const data = this.parseStructuredText(extractText(response.content), request.schema, model);
       this.logSuccess(model, usage, latencyMs);
-      return { kind: 'final', data: parsed.data, model: response.model, usage, latencyMs, provider: PROVIDER_NAME };
+      return { kind: 'final', data, model: response.model, usage, latencyMs, provider: PROVIDER_NAME };
     } catch (error) {
       throw this.handle(error, model, started);
     }
@@ -319,6 +325,35 @@ export class ClaudeProvider implements LlmProvider {
     }
   }
 
+  /**
+   * The single local structured-output contract, shared by `completeStructured`
+   * and `converse`'s final answer. Strict by design — trim, `JSON.parse`, Zod
+   * `safeParse` — with no prose-to-JSON guessing, substring scraping, or markdown
+   * unwrapping. Invalid JSON and a schema mismatch both surface as the existing
+   * permanent `llm_structured_parse_failed` (distinguished only by message).
+   */
+  private parseStructuredText<T>(text: string, schema: z.ZodType<T>, model: string): T {
+    let json: unknown;
+    try {
+      json = JSON.parse(text.trim());
+    } catch (cause) {
+      throw new PermanentError(
+        'llm_structured_parse_failed',
+        'Claude structured output was not valid JSON',
+        { details: { provider: PROVIDER_NAME, model }, cause },
+      );
+    }
+    const parsed = schema.safeParse(json);
+    if (!parsed.success) {
+      throw new PermanentError(
+        'llm_structured_parse_failed',
+        'Claude structured output did not match the requested schema',
+        { details: { provider: PROVIDER_NAME, model } },
+      );
+    }
+    return parsed.data;
+  }
+
   private toSdkMessages(messages: readonly LlmMessage[]): Anthropic.MessageParam[] {
     return messages.map((m) => ({ role: m.role, content: m.content }));
   }
@@ -337,8 +372,18 @@ export class ClaudeProvider implements LlmProvider {
   /** Normalize, log, and rethrow any failure as an `AppError`. */
   private handle(error: unknown, model: string, started: number): AppError {
     const appError = isAppError(error) ? error : this.toAppError(error, model);
+    // `err_message` is our own normalized message, never the raw SDK error — so it
+    // carries a useful reason (no longer just "unexpected failure") without leaking
+    // credentials, auth headers, request bodies or connector secrets, which live
+    // only on the untyped `cause` we deliberately do not log.
     this.logger.warn(
-      { provider: PROVIDER_NAME, model, latency_ms: elapsed(started), err_code: appError.code },
+      {
+        provider: PROVIDER_NAME,
+        model,
+        latency_ms: elapsed(started),
+        err_code: appError.code,
+        err_message: appError.message,
+      },
       'llm request failed',
     );
     return appError;
@@ -435,6 +480,20 @@ export class ClaudeProvider implements LlmProvider {
       );
     }
 
+    // A *base* AnthropicError that is not an APIError reaches here — most often the
+    // SDK's structured-output parse helper rejecting a response (e.g. from
+    // `completeStructured`). Its message is a structural diagnostic ("Failed to
+    // parse structured output …") carrying no credential/auth/request-body content,
+    // so surface it rather than collapsing to the opaque llm_unknown. A parse
+    // failure is deterministic, hence Permanent.
+    if (error instanceof Anthropic.AnthropicError) {
+      return new PermanentError(
+        'llm_response_parse_error',
+        `Claude response could not be parsed: ${error.message}`,
+        { cause: error, details },
+      );
+    }
+
     return new PermanentError('llm_unknown', 'unexpected failure calling Claude', {
       cause: error,
       details,
@@ -477,6 +536,29 @@ function extractText(content: Anthropic.ContentBlock[]): string {
     .filter((block): block is Anthropic.TextBlock => block.type === 'text')
     .map((block) => block.text)
     .join('');
+}
+
+/**
+ * Compose the SYSTEM instruction for a structured request: the caller's own
+ * system (preserved verbatim) followed by an explicit JSON-only directive that
+ * carries the requested schema. This is what makes the structured contract hold
+ * on gateways that ignore `output_config` — the model is told, in-band, to return
+ * exactly one raw JSON object of this shape and nothing else.
+ *
+ * The schema is serialized with the SDK's existing output-format machinery
+ * (`zodOutputFormat` → the same JSON Schema we also send as `output_config`), so
+ * no bespoke serializer is invented here. The directive is phrased for the FINAL
+ * answer, so on a tool turn it does not discourage the model from calling tools
+ * on earlier rounds.
+ */
+function buildStructuredSystem(system: string | undefined, schema: z.ZodType): string {
+  const jsonSchema = JSON.stringify((zodOutputFormat(schema) as { schema: unknown }).schema);
+  const directive =
+    'When you give your final answer, respond with ONLY a single JSON object that conforms to this JSON Schema:\n' +
+    jsonSchema +
+    '\nReturn only the raw JSON object — no explanatory text before or after it, and do not wrap it in markdown code fences.';
+  const base = system?.trim();
+  return base !== undefined && base !== '' ? `${system}\n\n${directive}` : directive;
 }
 
 /**

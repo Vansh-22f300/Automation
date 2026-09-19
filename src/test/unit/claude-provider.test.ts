@@ -298,33 +298,53 @@ describe('ClaudeProvider.complete — normalization', () => {
   });
 });
 
-describe('ClaudeProvider.completeStructured', () => {
+describe('ClaudeProvider.completeStructured — local JSON parsing via messages.create', () => {
   const schema = z.object({ answer: z.string(), score: z.number() });
 
-  function parsedMessage(parsedOutput: unknown): Anthropic.Message {
-    return { ...fakeMessage(), parsed_output: parsedOutput } as unknown as Anthropic.Message;
+  /** A create() response whose single text block is `obj` serialized as JSON. */
+  function jsonMessage(obj: unknown): Anthropic.Message {
+    return fakeMessage({ content: [{ type: 'text', text: JSON.stringify(obj), citations: null }] });
   }
 
-  it('returns validated, typed data on success', async () => {
+  it('accepts a create() response whose text is valid JSON and returns validated, typed data', async () => {
     const client = testClient();
-    vi.spyOn(client.messages, 'parse').mockResolvedValue(
-      parsedMessage({ answer: 'yes', score: 0.9 }) as never,
-    );
+    const createSpy = vi.spyOn(client.messages, 'create').mockResolvedValue(jsonMessage({ answer: 'yes', score: 0.9 }));
+    const parseSpy = vi.spyOn(client.messages, 'parse');
+
     const result = await makeProvider(client).completeStructured({
       messages: [{ role: 'user', content: 'hi' }],
       maxOutputTokens: 100,
       schema,
     });
+
     expect(result.data).toEqual({ answer: 'yes', score: 0.9 });
     expect(result.provider).toBe('claude');
     expect(result.usage.totalTokens).toBe(19);
+    // The structured path no longer relies on the SDK's parse helper.
+    expect(createSpy).toHaveBeenCalledOnce();
+    expect(parseSpy).not.toHaveBeenCalled();
   });
 
-  it('maps a schema mismatch to a PermanentError', async () => {
+  it('appends a JSON-only directive to the system while preserving the caller system, and still sends output_config', async () => {
     const client = testClient();
-    vi.spyOn(client.messages, 'parse').mockResolvedValue(
-      parsedMessage({ answer: 'yes', score: 'not-a-number' }) as never,
-    );
+    const createSpy = vi.spyOn(client.messages, 'create').mockResolvedValue(jsonMessage({ answer: 'a', score: 1 }));
+
+    await makeProvider(client).completeStructured({
+      system: 'ORIGINAL_SYSTEM_TEXT',
+      messages: [{ role: 'user', content: 'hi' }],
+      maxOutputTokens: 100,
+      schema,
+    });
+
+    const sent = createSpy.mock.calls[0]?.[0] as unknown as { system?: string; output_config?: unknown };
+    expect(sent.system).toContain('ORIGINAL_SYSTEM_TEXT');
+    expect(sent.system).toContain('JSON');
+    expect(sent).toHaveProperty('output_config');
+  });
+
+  it('rejects a schema mismatch (valid JSON, wrong shape) with llm_structured_parse_failed', async () => {
+    const client = testClient();
+    vi.spyOn(client.messages, 'create').mockResolvedValue(jsonMessage({ answer: 'yes', score: 'not-a-number' }));
     try {
       await makeProvider(client).completeStructured({
         messages: [{ role: 'user', content: 'hi' }],
@@ -338,16 +358,175 @@ describe('ClaudeProvider.completeStructured', () => {
     }
   });
 
-  it('maps a null parsed_output to a PermanentError', async () => {
+  it('rejects a prose (non-JSON) response with llm_structured_parse_failed', async () => {
     const client = testClient();
-    vi.spyOn(client.messages, 'parse').mockResolvedValue(parsedMessage(null) as never);
+    vi.spyOn(client.messages, 'create').mockResolvedValue(
+      fakeMessage({ content: [{ type: 'text', text: 'Posted to the channel successfully.', citations: null }] }),
+    );
     await expect(
       makeProvider(client).completeStructured({
         messages: [{ role: 'user', content: 'hi' }],
         maxOutputTokens: 100,
         schema,
       }),
-    ).rejects.toBeInstanceOf(PermanentError);
+    ).rejects.toMatchObject({ code: 'llm_structured_parse_failed' });
+  });
+});
+
+describe('ClaudeProvider.converse — tool turns via messages.create', () => {
+  const schema = z.object({ message: z.string() });
+  const tools = [
+    {
+      name: 'send_slack_message',
+      description: 'Send a message to a Slack channel',
+      inputSchema: z.object({ channel: z.string(), text: z.string() }).strict(),
+    },
+  ];
+  const baseRequest = {
+    messages: [{ role: 'user' as const, content: 'notify the team' }],
+    tools,
+    schema,
+    maxOutputTokens: 200,
+  };
+
+  it('returns tool_use for a thinking + text + tool_use response, without ever parsing the text', async () => {
+    const client = testClient();
+    const createSpy = vi.spyOn(client.messages, 'create').mockResolvedValue(
+      fakeMessage({
+        stop_reason: 'tool_use',
+        content: [
+          { type: 'thinking', thinking: 'the user wants a slack ping', signature: '' },
+          { type: 'text', text: 'Sure — sending that now.', citations: null },
+          {
+            type: 'tool_use',
+            id: 'toolu_1',
+            name: 'send_slack_message',
+            input: { channel: '#ai-workforce-test', text: 'Hello from AI Workforce' },
+          },
+        ],
+      } as never),
+    );
+    // The parse helper is what used to blow up on the text block; it must not run.
+    const parseSpy = vi.spyOn(client.messages, 'parse');
+
+    const result = await makeProvider(client).converse(baseRequest);
+
+    expect(result.kind).toBe('tool_use');
+    if (result.kind !== 'tool_use') expect.unreachable('expected a tool_use turn');
+    expect(result.toolCalls).toEqual([
+      {
+        id: 'toolu_1',
+        name: 'send_slack_message',
+        arguments: { channel: '#ai-workforce-test', text: 'Hello from AI Workforce' },
+      },
+    ]);
+    expect(createSpy).toHaveBeenCalledOnce();
+    expect(parseSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends the tools, tool_choice:auto and output_config in the request', async () => {
+    const client = testClient();
+    const createSpy = vi.spyOn(client.messages, 'create').mockResolvedValue(
+      fakeMessage({
+        stop_reason: 'tool_use',
+        content: [
+          { type: 'tool_use', id: 't1', name: 'send_slack_message', input: { channel: '#c', text: 'x' } },
+        ],
+      } as never),
+    );
+
+    await makeProvider(client).converse(baseRequest);
+
+    const sent = createSpy.mock.calls[0]?.[0] as unknown as Record<string, unknown>;
+    expect(sent).toMatchObject({ tool_choice: { type: 'auto' } });
+    expect(sent).toHaveProperty('output_config');
+    expect((sent.tools as Array<{ name: string }>)[0]?.name).toBe('send_slack_message');
+  });
+
+  it('parses the final structured answer from the response text (create path)', async () => {
+    const client = testClient();
+    vi.spyOn(client.messages, 'create').mockResolvedValue(
+      fakeMessage({
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: JSON.stringify({ message: 'all done' }), citations: null }],
+      }),
+    );
+
+    const result = await makeProvider(client).converse(baseRequest);
+
+    expect(result.kind).toBe('final');
+    if (result.kind !== 'final') expect.unreachable('expected a final turn');
+    expect(result.data).toEqual({ message: 'all done' });
+  });
+
+  it('maps a non-JSON final answer to a permanent llm_structured_parse_failed', async () => {
+    const client = testClient();
+    vi.spyOn(client.messages, 'create').mockResolvedValue(
+      fakeMessage({
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'not valid json', citations: null }],
+      }),
+    );
+
+    try {
+      await makeProvider(client).converse(baseRequest);
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      expect(error).toBeInstanceOf(PermanentError);
+      expect((error as PermanentError).code).toBe('llm_structured_parse_failed');
+    }
+  });
+
+  it('rejects a tool_use stop_reason with no tool_use block as malformed', async () => {
+    const client = testClient();
+    vi.spyOn(client.messages, 'create').mockResolvedValue(
+      fakeMessage({ stop_reason: 'tool_use', content: [{ type: 'text', text: 'hmm', citations: null }] }),
+    );
+
+    try {
+      await makeProvider(client).converse(baseRequest);
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      expect((error as PermanentError).code).toBe('llm_tool_call_malformed');
+    }
+  });
+
+  it('runs a tool_use round then a JSON final round to success', async () => {
+    const client = testClient();
+    vi.spyOn(client.messages, 'create')
+      .mockResolvedValueOnce(
+        fakeMessage({
+          stop_reason: 'tool_use',
+          content: [
+            { type: 'tool_use', id: 't1', name: 'send_slack_message', input: { channel: '#c', text: 'x' } },
+          ],
+        } as never),
+      )
+      .mockResolvedValueOnce(
+        fakeMessage({
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: JSON.stringify({ message: 'done' }), citations: null }],
+        }),
+      );
+    const provider = makeProvider(client);
+
+    const turn1 = await provider.converse(baseRequest);
+    expect(turn1.kind).toBe('tool_use');
+    if (turn1.kind !== 'tool_use') expect.unreachable('expected a tool_use turn');
+
+    // The caller feeds the tool result back and asks again — the final answer is
+    // parsed locally from the response text.
+    const turn2 = await provider.converse({
+      ...baseRequest,
+      messages: [
+        { role: 'user', content: 'notify the team' },
+        { role: 'assistant', toolCalls: turn1.toolCalls },
+        { role: 'tool', results: [{ id: 't1', output: { ok: true } }] },
+      ],
+    });
+    expect(turn2.kind).toBe('final');
+    if (turn2.kind !== 'final') expect.unreachable('expected a final turn');
+    expect(turn2.data).toEqual({ message: 'done' });
   });
 });
 
@@ -445,6 +624,16 @@ describe('ClaudeProvider — error mapping', () => {
     const mapped = await completeRejecting(new Error('something odd'));
     expect(mapped).toBeInstanceOf(PermanentError);
     expect((mapped as PermanentError).code).toBe('llm_unknown');
+    expect(isRetryable(mapped)).toBe(false);
+  });
+
+  it('maps a base AnthropicError to a permanent llm_response_parse_error, surfacing its message', async () => {
+    const mapped = await completeRejecting(
+      new Anthropic.AnthropicError('Failed to parse structured output as JSON: Unexpected token'),
+    );
+    expect(mapped).toBeInstanceOf(PermanentError);
+    expect((mapped as PermanentError).code).toBe('llm_response_parse_error');
+    expect((mapped as PermanentError).message).toContain('Failed to parse structured output');
     expect(isRetryable(mapped)).toBe(false);
   });
 });
