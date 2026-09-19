@@ -654,12 +654,12 @@ FATAL: configuration error — refusing to start.
 | `PORT`                       | `3000`          | API port.                                                                                                                                                                                                                                                                                                     |
 | `TRUST_PROXY`                | `false`         | Whether `request.ip` (and the per-IP rate limiter) trusts `X-Forwarded-For`. `false` (default, safe for local/dev) ignores forwarding headers; `true` trusts the proxy (use only when behind a trusted PaaS/reverse proxy that is the sole ingress); a comma-separated list of proxy IPs/CIDRs or `loopback`/`linklocal`/`uniquelocal` trusts only those. Do not set `true` unless you are actually behind a trusted proxy. |
 | `WORKER_SHUTDOWN_TIMEOUT_MS` | `10000`         | How long graceful worker shutdown waits for an in-flight job before returning and, if it still owns the lease, releasing that job back to `pending`. This does **not** cancel the underlying external request.                                                                                                |
-| `CREDENTIAL_ENCRYPTION_KEY`  | _(unset)_       | **Optional secret.** 256-bit master key for encrypting external-service credentials at rest (AES-256-GCM). Accepts 64 hex characters or a base64/base64url value decoding to exactly 32 bytes. **Backward-compatible single-key deployment:** when set, `connections:create` writes v1 envelopes and the key is also auto-imported as a single `legacy-v1` decrypt-only ring entry. Without this var (or a `legacy-v1` entry in `CREDENTIAL_ENCRYPTION_KEYS`), `connections:create` fails clearly at first encrypt with typed `legacy_v1_writer_missing`. Never logged, persisted, or returned to clients. |
+| `CREDENTIAL_ENCRYPTION_KEY`  | _(unset)_       | **Secret. Required at boot unless `CREDENTIAL_ENCRYPTION_KEYS` is set** — `createCredentialCipher` refuses to start when neither is present. 256-bit master key for encrypting external-service credentials at rest (AES-256-GCM). Accepts 64 hex characters or a base64/base64url value decoding to exactly 32 bytes. **Backward-compatible single-key deployment:** when set, `connections:create` writes v1 envelopes and the key is also auto-imported as a single `legacy-v1` decrypt-only ring entry. Without this var (or a `legacy-v1` entry in `CREDENTIAL_ENCRYPTION_KEYS`), `connections:create` fails clearly at first encrypt with typed `legacy_v1_writer_missing`. Never logged, persisted, or returned to clients. |
 | `ANTHROPIC_API_KEY`          | _(unset)_       | **Optional secret.** Direct-Anthropic credential, sent as `x-api-key`. Only needed by code paths that call Claude; the app boots without it. Never logged, persisted, or returned to clients. **Mutually exclusive** with `ANTHROPIC_AUTH_TOKEN`. If `ANTHROPIC_BASE_URL` is set, at least one of the two must be set.      |
 | `ANTHROPIC_AUTH_TOKEN`       | _(unset)_       | **Optional secret.** Bearer token for an Anthropic-_compatible_ gateway, sent as `Authorization: Bearer …`. **Mutually exclusive** with `ANTHROPIC_API_KEY` — set exactly one; configuring both is refused at startup. If `ANTHROPIC_BASE_URL` is set, at least one must be set.                                              |
 | `ANTHROPIC_BASE_URL`         | _(unset)_       | Optional. Points the provider at an Anthropic-compatible gateway instead of `https://api.anthropic.com`. Give the **origin only** (optionally with a base path); do **not** include `/v1` — the SDK appends `/v1/messages` itself, so a trailing `/v1` would produce `/v1/v1/messages` (rejected at startup). **Requires** a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) when set; in `production` must be `https://` (http allowed only for local dev). |
 | `ANTHROPIC_MODEL`            | `claude-opus-5` | The model the provider defaults to when a request names none. A deployment decision; any request may override it. Against a gateway, this must be a model id **that gateway accepts** — the default is not guaranteed to be valid there.                                                                      |
-| `CREDENTIAL_ENCRYPTION_KEYS` | _(unset)_       | **Optional secret.** Multi-key keyring for credential encryption — comma-separated `<kid>:<base64key>` pairs. The **first** entry is the v2 active encrypt key; every subsequent entry is decrypt-only. Kid format: `^[a-zA-Z0-9._-]{1,64}$`; key bytes: 32 (same shape rule as `CREDENTIAL_ENCRYPTION_KEY`). The literal kid `legacy-v1` is reserved (always decrypt-only; can never be the first entry). When both this var and `CREDENTIAL_ENCRYPTION_KEY` are set, the keyring is the single source of truth and the legacy var is ignored; a v1 writer exists only when the keyring carries a `legacy-v1` entry (a v1 write capability always has a matching v1 read capability). Required for `pnpm connections rotate` — the CLI fails fast with typed `active_key_missing` when no active entry is configured. Never logged. |
+| `CREDENTIAL_ENCRYPTION_KEYS` | _(unset)_       | **Secret. Satisfies the boot requirement above** (setting this alone is sufficient; setting neither it nor `CREDENTIAL_ENCRYPTION_KEY` refuses startup). Multi-key keyring for credential encryption — comma-separated `<kid>:<base64key>` pairs. The **first** entry is the v2 active encrypt key; every subsequent entry is decrypt-only. Kid format: `^[a-zA-Z0-9._-]{1,64}$`; key bytes: 32 (same shape rule as `CREDENTIAL_ENCRYPTION_KEY`). The literal kid `legacy-v1` is reserved (always decrypt-only; can never be the first entry). When both this var and `CREDENTIAL_ENCRYPTION_KEY` are set, the keyring is the single source of truth and the legacy var is ignored; a v1 writer exists only when the keyring carries a `legacy-v1` entry (a v1 write capability always has a matching v1 read capability). Required for `pnpm connections rotate` — the CLI fails fast with typed `active_key_missing` when no active entry is configured. Never logged. |
 
 Two PostgreSQL **session guards** are always active, without any extra env var: `statement_timeout = 30s` (raised to `300s` only for the migration runner, `60s` in integration tests) caps any single query, and `idle_in_transaction_session_timeout = 30s` — per PostgreSQL docs, an idle-in-transaction session is terminated with `25P03` — limits how long a `BEGIN`…`COMMIT` may sit idle, reducing the window where a stuck `await` could hold row locks or bloat `pg_stat_activity`. Legitimate transactions are the short `beginStep`/`settleStep` and `claim`/`requeueExpired` bookkeeping the engine already runs outside handlers (the handler itself executes with no DB transaction held, per the two-transaction model), so `30s` is generous for normal work but tight enough to reclaim a leaked transaction. The values are centralized in [`src/db/client.ts`](src/db/client.ts) as `DEFAULT_*_TIMEOUT_MS` and applied in two layers: retained as `pg` startup parameters for direct/vanilla PostgreSQL where they are honored, and additionally via explicit session initialization (`SET`) on each new physical connection (`onConnect` hook, awaited before the connection is usable — `options=-c` is not used because Neon pooled endpoints reject it as unsupported). The integration test verifies the effective `SHOW` values against the configured `TEST_DATABASE_URL` (idle `30s`, `statement_timeout` `>0`, preserved inside `BEGIN`/`COMMIT` and after reacquire) without sleeping 30s to trigger the `25P03` abort.
 
@@ -1256,6 +1256,179 @@ faked, so the checkout plus the PostgreSQL container is the whole environment.
 The pnpm version comes from `packageManager` in `package.json` (the workflow
 passes no version of its own) and the Node major matches `engines.node`, so CI
 cannot drift from local development.
+
+## Deployment (Render)
+
+[`render.yaml`](render.yaml) is a Render Blueprint that provisions the whole
+system from the repository: a managed PostgreSQL, the HTTP API as a **web
+service**, and the worker as a **background worker**. Both services build and
+run from the same checkout — the API and the worker are two entry points into
+one codebase, not two artifacts.
+
+| Resource              | Render type       | Entry point            | Serves            |
+| --------------------- | ----------------- | ---------------------- | ----------------- |
+| `ai-workforce-db`     | PostgreSQL        | —                      | storage           |
+| `ai-workforce-api`    | web service       | `dist/api/server.js`   | HTTP + `/readyz`  |
+| `ai-workforce-worker` | background worker | `dist/worker/main.js`  | queue + reaper    |
+
+### Build and start commands
+
+Both services share one build command:
+
+```bash
+corepack enable && pnpm install --frozen-lockfile --prod=false && pnpm build
+```
+
+- `corepack enable` pins pnpm to the `packageManager` field (`pnpm@11.4.0`), so
+  the deploy uses the exact package manager version the repo does.
+- `--frozen-lockfile` installs `pnpm-lock.yaml` verbatim — the same contract CI
+  enforces; a lockfile that has drifted from `package.json` fails the build
+  instead of silently resolving new versions.
+- `--prod=false` is **required**. The services set `NODE_ENV=production` (below),
+  which makes pnpm omit `devDependencies` by default — but the build needs `tsc`
+  and `tsc-alias` (both `devDependencies`) to emit `dist/`. Without this flag the
+  build fails with `tsc: not found`. Only production dependencies are needed at
+  **runtime**; the dev dependencies are used solely during the build step.
+
+Start commands run the compiled JavaScript directly with `node` — no pnpm or
+`tsx` at runtime:
+
+- **API:** `node dist/api/server.js`
+- **Worker:** `node dist/worker/main.js`
+
+The worker start command runs the real worker process (claim → dispatch →
+settle, plus the lease reaper), never the API.
+
+### Database migrations
+
+Migrations are the committed SQL files under [`drizzle/`](drizzle/) plus
+`drizzle/meta/_journal.json`; the runner is
+[`src/db/migrate.ts`](src/db/migrate.ts), compiled to `dist/db/migrate.js`. The
+runner resolves the migrations folder as the **relative path `drizzle/` against
+the current working directory**, and Render runs commands from the repository
+root, so the source `drizzle/` tree is what gets applied — the build does not
+need to copy it into `dist/`. The runner is idempotent (it records applied
+migrations in `drizzle.__drizzle_migrations`) and runs under a 300 s statement
+timeout, so re-running it is safe and a no-op once the schema is current.
+
+The blueprint runs migrations in the **API service's `preDeployCommand`**:
+
+```bash
+node dist/db/migrate.js
+```
+
+`preDeployCommand` runs once per deploy, after the build and **before** the new
+version receives traffic, and only on the API service — so the API and worker
+never race to apply the same migrations. Because `/readyz` gates traffic on a
+live database connection, the new version only goes live after both the
+migrations and the readiness probe succeed.
+
+> **`preDeployCommand` needs a paid instance type.** If you deploy on a plan that
+> does not support it, remove that line and instead run
+> `node dist/db/migrate.js` once from the API service's **Render Shell** after
+> each deploy that adds a migration, before the new code depends on it.
+
+### First-deploy procedure
+
+1. Push `render.yaml` to the deployment branch (`main`).
+2. In the Render dashboard, **New → Blueprint** and select this repository.
+   Render reads `render.yaml` and proposes the database, the two services, and
+   the shared environment group.
+3. Set the one manual secret. In the **`ai-workforce-shared`** environment group,
+   set `CREDENTIAL_ENCRYPTION_KEY` (it is declared `sync: false`, so Render
+   prompts for it and never stores it in the repo). Generate a 32-byte key:
+
+   ```bash
+   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+   ```
+
+   This one value is shared by both services (see below). Keep a copy in a
+   secrets manager — losing it makes every stored connection credential
+   unrecoverable.
+4. Apply the blueprint. Render creates the database, injects its internal
+   connection string into both services as `DATABASE_URL`, builds each service,
+   runs the migration `preDeployCommand` on the API, and starts both.
+5. Confirm the API is live: `GET https://<api-service>.onrender.com/readyz`
+   returns `200 {"status":"ready"}` once it can reach PostgreSQL.
+
+Later deploys are just a push to the branch: build → migrate (API preDeploy) →
+health check → traffic shift.
+
+### Environment variables in production
+
+The blueprint sets everything except one secret. The variables fall into four
+distinct groups; the full reference for each is in
+[Configuration](#configuration).
+
+**1. Required secret — you set it (once).** Declared `sync: false`, so it lives
+only in Render, never in the repo:
+
+| Variable                    | Where                   | Handling                                                                                                                        |
+| --------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `CREDENTIAL_ENCRYPTION_KEY` | `ai-workforce-shared`   | **Required at boot** on both services (the process refuses to start without it). Set once in the shared group; see group 3.      |
+
+**2. Injected by Render — you set nothing.** Render computes these at deploy time:
+
+| Variable       | Source                        | Handling                                                                                             |
+| -------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL` | `fromDatabase` (both services)| Internal connection string of `ai-workforce-db`. Private network, so no `?sslmode` is needed.        |
+| `PORT`         | Render (API web service only) | Injected for the web service; the app reads it via `env.PORT`. Never hard-coded.                     |
+
+**3. Fixed by the blueprint.** Literal values in `render.yaml`. The `HOST`,
+`NODE_ENV`, `LOG_LEVEL`, and `CREDENTIAL_ENCRYPTION_KEY` entries live in the
+**`ai-workforce-shared`** group, so a single definition reaches **both** the API
+and the worker — the mechanism that keeps the credential key identical on the two
+services (a mismatch would make stored credentials unreadable on one side):
+
+| Variable                     | Scope                 | Value                                                                                     |
+| ---------------------------- | --------------------- | ----------------------------------------------------------------------------------------- |
+| `NODE_ENV`                   | shared (both)         | `production` — activates the strict env invariants and JSON logs.                         |
+| `HOST`                       | shared (both)         | `0.0.0.0` — required in production on both services (see invariants below).               |
+| `LOG_LEVEL`                  | shared (both)         | `info`.                                                                                   |
+| `TRUST_PROXY`                | API only              | `true` — the API is behind Render's proxy, so the rate limiter keys on the real client IP.|
+| `DATABASE_POOL_MAX`          | per service (both)    | `10` per process. Two processes run, so size the database connection limit for ~double.   |
+| `WORKER_SHUTDOWN_TIMEOUT_MS` | worker only           | `10000` — graceful-shutdown budget for an in-flight job.                                   |
+
+**4. Optional LLM credentials — not in the blueprint.** `ANTHROPIC_API_KEY` /
+`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` are optional: the API and worker
+boot without them and only fail if a workflow actually invokes a Claude step. If
+you run `llm` steps, add the appropriate credential to **both** services in the
+dashboard (see [LLM provider](#llm-provider) for the direct-vs-gateway rules).
+Keep them out of `render.yaml` — they are secrets.
+
+### Production invariants the blueprint satisfies
+
+The env validator in [`src/config/env.ts`](src/config/env.ts) refuses to start
+in `production` unless several conditions hold. The blueprint is built to meet
+them:
+
+- **`HOST` must be non-loopback.** Set to `0.0.0.0` in the shared group. This
+  applies to the worker too: it binds no socket, but it runs the same
+  `loadEnv()` validation at startup, so a loopback `HOST` would refuse to boot
+  it.
+- **`DATABASE_URL` must not be loopback and its database name must not contain
+  `test`.** Render's internal connection string is a private-network host (not
+  loopback) and the database is named `ai_workforce`, so both hold.
+- **A credential key must be present at boot.** `createCredentialCipher` (called
+  at module load in both `dist/api/server.js` and `dist/worker/main.js`) throws
+  if neither `CREDENTIAL_ENCRYPTION_KEY` nor `CREDENTIAL_ENCRYPTION_KEYS` is set.
+  The shared group supplies `CREDENTIAL_ENCRYPTION_KEY`.
+
+The key **must be the same value on the API and the worker**: the API encrypts
+connection credentials and the worker decrypts them when it runs a step, so a
+mismatch makes every stored credential unreadable on one side. Putting it in the
+shared `ai-workforce-shared` group is what guarantees a single value reaches
+both services.
+
+### Health checks
+
+- **`/readyz`** — the API's `healthCheckPath`. Returns `200` only when the
+  process can reach PostgreSQL (`select 1`), `503` otherwise. This is the
+  correct gate for routing traffic and for the deploy's health check.
+- **`/healthz`** — liveness only, no database. Not used by the blueprint but
+  available for a liveness probe.
+- The worker is a background service with no port and therefore no HTTP health
+  check; Render supervises it by process liveness.
 
 ## Current status
 

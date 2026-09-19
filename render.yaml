@@ -1,0 +1,129 @@
+# Render Blueprint — AI Workforce
+#
+# Two long-lived services plus a managed PostgreSQL, matching how the app is
+# actually built and started (see package.json scripts and src/*/{server,main}.ts):
+#
+#   ai-workforce-api     — the Fastify HTTP API (web service, health-checked on /readyz)
+#   ai-workforce-worker  — the queue worker/reaper process (background worker, no port)
+#   ai-workforce-db      — managed PostgreSQL
+#
+# Deploy with Render Blueprints: commit this file, then in the Render dashboard
+# create a new Blueprint from the repository. First-deploy procedure and the
+# manual value that must be set once (the credential key) are documented in the
+# README "Deployment (Render)" section.
+#
+# Why the specific commands below — each is derived from the repo, not guessed:
+#   * Build runs `pnpm install --frozen-lockfile --prod=false`. `--frozen-lockfile`
+#     preserves the committed pnpm-lock.yaml exactly (same as CI). `--prod=false`
+#     is REQUIRED: NODE_ENV=production (set below, so the app's production env
+#     invariants hold) would otherwise make pnpm skip devDependencies, and the
+#     build needs tsc + tsc-alias (devDependencies) to emit dist/.
+#   * `corepack enable` pins pnpm to the `packageManager` field (pnpm@11.4.0),
+#     preserving the exact package-manager version the repo uses.
+#   * Start commands run the COMPILED entrypoints with plain `node` (no pnpm/tsx
+#     at runtime): dist/api/server.js and dist/worker/main.js. Only production
+#     dependencies (drizzle-orm, pg, fastify, pino, …) are needed at runtime and
+#     they are all in "dependencies".
+#   * Migrations run in the API service's preDeployCommand as
+#     `node dist/db/migrate.js` — once per deploy, from the repo root (so the
+#     relative `drizzle/` migrations folder in src/db/migrate.ts resolves), and
+#     BEFORE the new version receives traffic. The worker does not migrate, so
+#     the two services never race to apply the same migrations.
+#     NOTE: preDeployCommand requires a paid instance type. On a plan without it,
+#     run `node dist/db/migrate.js` once from the API service's Render Shell
+#     before the first deploy (see README).
+
+databases:
+  - name: ai-workforce-db
+    # The application refuses, in production, a DATABASE_URL whose database name
+    # contains "test" (src/config/env.ts). "ai_workforce" is safe.
+    databaseName: ai_workforce
+    region: oregon
+    # Current Render compute-based Postgres slug (smallest paid tier). Adjust to
+    # your account's available plan; `free` also works but sleeps when idle.
+    plan: 0.1c-256mb
+
+services:
+  # ---- API (HTTP) --------------------------------------------------------
+  - type: web
+    name: ai-workforce-api
+    runtime: node
+    region: oregon
+    # Current Render compute-based slug; also the default when `plan` is omitted.
+    # A paid tier is required for preDeployCommand (see the migrations note above).
+    plan: 0.5c-512mb
+    branch: main
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --prod=false && pnpm build
+    # Apply pending migrations once per deploy, before traffic shifts to the new
+    # version. Runs from the repo root, where the `drizzle/` migrations live.
+    preDeployCommand: node dist/db/migrate.js
+    startCommand: node dist/api/server.js
+    # Readiness probe: 200 only when the process can reach PostgreSQL (select 1).
+    # /healthz is liveness-only; /readyz is the correct gate for routing traffic.
+    healthCheckPath: /readyz
+    envVars:
+      - fromGroup: ai-workforce-shared
+      # Behind Render's proxy the real client IP arrives in X-Forwarded-For;
+      # trusting it makes the per-IP rate limiter key by client IP, not the
+      # proxy's IP. Safe here because Render's proxy is the sole ingress.
+      - key: TRUST_PROXY
+        value: "true"
+      # Render injects the INTERNAL connection string (private network, no TLS
+      # required). Its host is non-loopback and the db name is "ai_workforce",
+      # so the production DATABASE_URL invariants are satisfied.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ai-workforce-db
+          property: connectionString
+      - key: DATABASE_POOL_MAX
+        value: "10"
+      # PORT is provided by Render automatically for web services; the app reads
+      # it via env.PORT. Do not hard-code it here.
+
+  # ---- Worker (background) ----------------------------------------------
+  - type: worker
+    name: ai-workforce-worker
+    runtime: node
+    region: oregon
+    # Current Render compute-based slug; also the default when `plan` is omitted.
+    # A paid tier is required for preDeployCommand (see the migrations note above).
+    plan: 0.5c-512mb
+    branch: main
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --prod=false && pnpm build
+    # Runs the ACTUAL worker entrypoint (claim/dispatch/settle + reaper), not the API.
+    startCommand: node dist/worker/main.js
+    envVars:
+      - fromGroup: ai-workforce-shared
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ai-workforce-db
+          property: connectionString
+      - key: DATABASE_POOL_MAX
+        value: "10"
+      - key: WORKER_SHUTDOWN_TIMEOUT_MS
+        value: "10000"
+
+# Shared environment — one source of truth for values that must be identical
+# across both services. The credential key MUST match on API and worker: the
+# worker decrypts connection credentials the API encrypted, so a mismatch makes
+# every stored credential unreadable on one side.
+envVarGroups:
+  - name: ai-workforce-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      # Required in production (the app refuses a loopback HOST at boot). The
+      # worker binds no port, but it runs the same env validation, so it needs
+      # this too.
+      - key: HOST
+        value: 0.0.0.0
+      # AES-256-GCM master key for connection-credential encryption. REQUIRED at
+      # boot for both services. Not generated here on purpose: the cipher needs
+      # exactly 64 hex chars or a base64 value decoding to 32 bytes. Set it once
+      # in the Render dashboard for this group (same value shared by both
+      # services). Generate with:
+      #   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+      - key: CREDENTIAL_ENCRYPTION_KEY
+        sync: false
