@@ -113,10 +113,11 @@ jobs:
       #   * DATABASE_POOL_MAX=5: Neon Free caps connections tightly; the API and
       #     any overlapping worker session share that ceiling.
       #   * LOG_LEVEL=info: structured operational logs without per-SQL debug noise.
-      #   * ANTHROPIC_* is intentionally omitted: llm steps only run if a credential
-      #     is present, and free mode does not exercise them by default. Add
-      #     ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) as a worker-free secret and
-      #     wire it here only when actually testing LLM steps.
+      #   * ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL point the
+      #     worker at the Anthropic-compatible gateway so llm steps can run. The
+      #     token is a worker-free environment secret; BASE_URL and MODEL are
+      #     worker-free environment variables. AUTH_TOKEN and API_KEY are mutually
+      #     exclusive at boot — set only the bearer token here, never both.
       - name: Run a bounded worker session
         env:
           NODE_ENV: production
@@ -125,6 +126,9 @@ jobs:
           DATABASE_POOL_MAX: "5"
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
         run: |
           timeout --signal=SIGTERM --kill-after=30s --preserve-status 240s \
             node dist/worker/main.js
