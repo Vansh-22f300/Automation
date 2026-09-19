@@ -1,0 +1,130 @@
+# Temporary FREE-MODE worker — scheduled, time-bounded queue worker sessions.
+#
+# This is development/demo infrastructure, NOT the production architecture. In
+# production the worker is an always-on Render background service defined in
+# render.yaml. Render's Free tier does not offer background workers or cron jobs,
+# so free mode instead wakes the EXISTING worker here on a schedule, lets it drain
+# the durable Postgres queue for a bounded window, then stops it gracefully.
+#
+# Nothing about the queue changes: the same src/worker/main.ts runs, keeping the
+# durable PostgreSQL queue, leases, retries and dead-letter behaviour. This file
+# only bounds how long a session runs and how often one starts. See
+# docs/deploy-free.md for the full runbook, cost model and how to switch back to
+# the paid always-on worker.
+#
+# Overlap is safe by construction: claims use FOR UPDATE SKIP LOCKED and every
+# settlement is guarded on locked_by, so if one session overruns into the next
+# they cannot double-process a row. cancel-in-progress is therefore false — an
+# overrunning session is allowed to finish draining rather than being killed.
+
+name: worker (free mode)
+
+on:
+  # GitHub's minimum cron granularity is 5 minutes. Scheduled runs are best-effort
+  # and can be delayed or dropped under load, so treat pickup latency as ~5-15 min
+  # between sessions (see docs/deploy-free.md "Expected worker latency").
+  schedule:
+    - cron: "*/5 * * * *"
+  # Manual trigger for testing / on-demand draining.
+  workflow_dispatch:
+
+# One free-mode worker session at a time. cancel-in-progress: false lets an
+# overrunning session finish its graceful drain instead of being killed mid-job
+# (a hard kill would strand that job's lease until it lapses ~15 min later).
+concurrency:
+  group: worker-free
+  cancel-in-progress: false
+
+# Least privilege: the job only reads the checkout. It never writes back to the
+# repo and never needs a token beyond reading source.
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    name: bounded worker session
+    runs-on: ubuntu-latest
+    # Hard ceiling on the whole job. The worker window is ~4 min; the rest is
+    # checkout/install/build. 10 min leaves generous headroom without letting a
+    # wedged run bill indefinitely.
+    timeout-minutes: 10
+
+    # Scope the DATABASE_URL / CREDENTIAL_ENCRYPTION_KEY secrets to this
+    # environment so the CI workflow (ci.yml) and any pull_request run cannot read
+    # them. Configure the secrets under Settings > Environments > worker-free.
+    environment: worker-free
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # pnpm must be set up BEFORE setup-node so setup-node's `cache: pnpm` can
+      # locate the store. No explicit version: pnpm/action-setup reads
+      # packageManager (pnpm@11.4.0) from package.json — same as ci.yml.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # package.json pins engines.node to ">=24.0.0 <25".
+          node-version: "24"
+          cache: pnpm
+
+      # --frozen-lockfile fails rather than silently resolving a different tree
+      # when pnpm-lock.yaml is stale — identical to ci.yml. devDependencies are
+      # required here because the next step builds with tsc + tsc-alias.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Compile to dist/. The bounded run below executes the built entrypoint with
+      # plain node, exactly like production (dist/worker/main.js).
+      - name: Build
+        run: pnpm build
+
+      # Run ONE bounded worker session, then stop gracefully.
+      #
+      # The worker polls forever (it does not exit when the queue drains), so the
+      # session is bounded externally by `timeout`:
+      #   * at 240s (~4 min) timeout sends SIGTERM;
+      #   * src/worker/main.ts handles SIGTERM -> stops claiming, drains the
+      #     in-flight job (WORKER_SHUTDOWN_TIMEOUT_MS), hands its lease back to
+      #     `pending`, closes the pool, and exits 0;
+      #   * --kill-after=30s sends SIGKILL only if that graceful shutdown wedges,
+      #     which is a genuine red signal rather than silent data loss;
+      #   * --preserve-status makes this step report the WORKER's real exit code
+      #     (0 on the clean path), not timeout's own 124, so a healthy drain is a
+      #     green run.
+      #
+      # This step does NOT run database migrations — migrations are applied once,
+      # out of band, on the API/database side (see docs/deploy-free.md). Keeping
+      # migration ownership on one side prevents the API and worker from racing to
+      # apply the same migration.
+      #
+      # Env notes:
+      #   * NODE_ENV=production + HOST=0.0.0.0: the worker binds no port but runs
+      #     the SAME production env validation as the API, which refuses a loopback
+      #     HOST at boot — so HOST must be non-loopback here too.
+      #   * DATABASE_URL and CREDENTIAL_ENCRYPTION_KEY come from the worker-free
+      #     environment secrets; they are never hard-coded and never echoed.
+      #     CREDENTIAL_ENCRYPTION_KEY MUST match the value configured for the API
+      #     on Render — the worker decrypts connection credentials the API
+      #     encrypted, so a mismatch makes every stored credential unreadable.
+      #   * DATABASE_POOL_MAX=5: Neon Free caps connections tightly; the API and
+      #     any overlapping worker session share that ceiling.
+      #   * LOG_LEVEL=info: structured operational logs without per-SQL debug noise.
+      #   * ANTHROPIC_* is intentionally omitted: llm steps only run if a credential
+      #     is present, and free mode does not exercise them by default. Add
+      #     ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) as a worker-free secret and
+      #     wire it here only when actually testing LLM steps.
+      - name: Run a bounded worker session
+        env:
+          NODE_ENV: production
+          HOST: 0.0.0.0
+          LOG_LEVEL: info
+          DATABASE_POOL_MAX: "5"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+        run: |
+          timeout --signal=SIGTERM --kill-after=30s --preserve-status 240s \
+            node dist/worker/main.js
