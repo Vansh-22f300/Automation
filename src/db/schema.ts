@@ -489,6 +489,21 @@ export const workflowRuns = pgTable(
     }).onDelete('cascade'),
     /** Tenant-scoped listing, newest first. */
     index('workflow_runs_tenant_id_created_at_idx').on(t.tenantId, t.createdAt.desc()),
+
+    /**
+     * Backs the retention prune predicate (`tenant_id = $1 AND status IN
+     * (terminal) AND finished_at < cutoff`) — a partial index restricted to
+     * terminal statuses so the index stays small and the predicate is an exact
+     * match (no filter scan over non-terminal runs). See `pnpm runs:prune` and
+     * `src/repositories/run-prune-repository.ts`. The leading tenant column
+     * matches the dominant query predicate; the `finished_at DESC` ordering
+     * matches the keyset cursor `(finished_at DESC, id DESC)` so the listing
+     * scan needs no separate sort step.
+     */
+    index('workflow_runs_tenant_id_finished_at_terminal_idx')
+      .on(t.tenantId, t.finishedAt.desc())
+      .where(sql`${t.status} IN ('succeeded', 'failed', 'cancelled')`),
+
     /**
      * Backs the composite foreign key that `jobs` uses to attach a queued unit
      * of work to a run *in the same tenant*. Redundant for uniqueness (`id` is

@@ -71,6 +71,13 @@
       "when": 1788102537833,
       "tag": "0009_kind_bullseye",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1789486450443,
+      "tag": "0010_retention_partial_finished_at_index",
+      "breakpoints": true
     }
   ]
 }

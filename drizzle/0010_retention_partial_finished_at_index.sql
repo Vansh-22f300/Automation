@@ -1,0 +1,1 @@
+CREATE INDEX "workflow_runs_tenant_id_finished_at_terminal_idx" ON "workflow_runs" USING btree ("tenant_id","finished_at" DESC NULLS LAST) WHERE "workflow_runs"."status" IN ('succeeded', 'failed', 'cancelled');

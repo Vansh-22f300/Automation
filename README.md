@@ -87,6 +87,7 @@ pnpm db:migrate
 | `pnpm workflow:create <tenantId> "<name>" [source]`                         | Author a test workflow (linear `noop` definition, `webhook` trigger) and its active version 1. Prints the ids.                                                                                                                                                                                                                                                                                                                                                                               |
 | `pnpm webhooks:inspect <tenantId>`                                          | List a tenant's recent events, workflow runs, jobs, step runs and `llm_usage` (read-only dev aid to verify ingestion, queueing and execution).                                                                                                                                                                                                                                                                                                                                               |
 | `pnpm runs:inspect <tenantId> <runId> [--detail]`                           | Assemble one safe, tenant-scoped view of a single run — run/workflow/version, event, ordered step runs, jobs, per-round `llm_usage`, reconstructed tool activity and usage totals. Summaries (byte size + secret-scrubbed preview) by default; `--detail` attaches the raw values, still secret-scrubbed. Shares the **exact** assembler and redaction layer as `GET /v1/runs/:runId`.                                                                                                       |
+| `pnpm runs:prune <tenantId> --older-than <Nd\|Nh> [--dry-run] [--batch-size <N>]` | **Operator-only retention.** Delete this tenant's **terminal** runs (`succeeded`/`failed`/`cancelled`) whose `finished_at` is older than the cutoff, paging by keyset `(finished_at DESC, id DESC)`; each run is one short autocommit `DELETE` that **cascades** to its `jobs`, `workflow_step_runs`, and `llm_usage`. `--older-than` is **required** (`Nd`/`Nh`; rejects 0, negative, malformed, > 5 y); the recommended operational policy is `90d`. `--dry-run` enumerates would-prune rows with a **plain SELECT and zero writes** (no `FOR UPDATE`). `--batch-size` defaults 100, max 1000. Every query is tenant-scoped; each `DELETE` re-checks tenant + id + terminal status + `finished_at < cutoff` (compare-and-set), so re-running is idempotent and concurrent prunes never double-delete. Never touches `workflows`, `workflow_versions`, `events`, `connections`, `tenants`, `users`, or `api_keys`. Exit codes: `0` clean, `1` partial, `2` total failure / misconfiguration. Logs identifiers, statuses, counts, mode, cutoff and duration only — never payloads or secrets. |
 | `pnpm connections create <tenantId> <provider> "<name>" '<credentialJson>'` | **Dev-only.** Create an external-service connection, encrypting the credential at rest (requires `CREDENTIAL_ENCRYPTION_KEY` or a `legacy-v1` entry in `CREDENTIAL_ENCRYPTION_KEYS`). Never prints the decrypted secret or the key. To keep a token out of shell history, omit the trailing JSON and pass it via the `CONNECTION_CREDENTIAL_JSON` env var instead.                                                                                                                                                                                  |
 | `pnpm connections list <tenantId>`                                          | List a tenant's connections — metadata only (id, provider/name, status, last-used), never the secret.                                                                                                                                                                                                                                                                                                                                                                                        |
 | `pnpm connections disable <tenantId> <connectionId>`                        | Disable a connection so it can no longer be resolved for a tool run.                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -566,6 +567,66 @@ worker runs in a separate process, the API has no way to read its state,
 and coupling API readiness to worker activity would make a healthy API
 report "not ready" because the worker is down — which is a separate
 operational signal that belongs at a separate observability point.
+
+### Operations: run retention (`pnpm runs:prune`)
+
+Runs accumulate: every execution leaves a `workflow_runs` row and its
+`jobs`, `workflow_step_runs`, and `llm_usage` children. Retention is the
+operator's tool for bounding that growth without touching anything else.
+
+```bash
+# See what a 90-day policy would remove — reads only, writes nothing.
+pnpm runs:prune <tenantId> --older-than 90d --dry-run
+
+# Actually delete this tenant's terminal runs finished more than 90 days ago.
+pnpm runs:prune <tenantId> --older-than 90d --batch-size 100
+```
+
+The command is deliberately narrow and safe by construction:
+
+- **Only terminal, aged runs.** A run is eligible only when its `status` is
+  `succeeded`/`failed`/`cancelled` **and** `finished_at IS NOT NULL` **and**
+  `finished_at < cutoff`. `queued`, `running` and `waiting` runs are never
+  touched, so an in-flight execution can never be pruned. The cutoff always
+  uses `finished_at`, never `created_at`.
+- **`--older-than` is required.** There is no executable default — an operator
+  must state the age (`Nd` days or `Nh` hours). `90d` is the **recommended
+  operational policy**, not a built-in one. Zero, negative, malformed, and
+  durations over five years are refused.
+- **Cascade, not manual deletes.** Each eligible run is removed by a single
+  `DELETE` on `workflow_runs`; its `jobs`, `workflow_step_runs`, and
+  `llm_usage` rows go with it through the foreign-key cascades already in the
+  schema. Protected tables — `tenants`, `users`, `api_keys`, `connections`,
+  `workflows`, `workflow_versions`, `events` — are never deleted or mutated.
+  **Events are outside retention**: they are not pruned with the runs born
+  from them.
+- **Keyset pagination, short transactions.** Enumeration is a plain,
+  `FOR UPDATE`-free SELECT ordered by `(finished_at DESC, id DESC)`, bounded by
+  `--batch-size` (default 100, max 1000) so memory stays flat over any backlog.
+  Each row's delete is its own short autocommit statement; no transaction is
+  held open across pages.
+- **Idempotent and concurrency-safe.** The `DELETE` re-checks tenant + id +
+  terminal status + `finished_at < cutoff` as a compare-and-set, so a second
+  run is a clean no-op and two operators pruning at once never double-delete
+  (one wins, the other counts the row as skipped).
+- **Tenant-scoped.** The tenant id is the first positional argument; every
+  statement carries the tenant predicate. There is no cross-tenant or global
+  prune path.
+- **`--dry-run` writes nothing.** It enumerates the same eligible rows via the
+  same plain SELECT, prints a `would-prune` line per row and a summary, and
+  performs no `UPDATE`, `DELETE`, or `FOR UPDATE`.
+
+Exit codes: `0` clean (including "nothing to prune" and dry-run), `1` a
+partial real run (some rows pruned, some failed), `2` a total failure or a
+boot-time misconfiguration. Logs carry only identifiers, statuses, timestamps,
+counts, mode, cutoff and duration — never run context, payloads, step
+input/output, or credentials.
+
+The prune predicate is backed by a partial index (migration `0010`,
+`workflow_runs_tenant_id_finished_at_terminal_idx` on `(tenant_id,
+finished_at DESC)` `WHERE status IN ('succeeded','failed','cancelled')`) so the
+listing scan matches the eligibility filter and the keyset order exactly,
+without scanning non-terminal runs.
 
 ## Configuration
 
@@ -1198,7 +1259,7 @@ cannot drift from local development.
 
 ## Current status
 
-### Implemented (Steps 1–12)
+### Implemented (Steps 1–12; Step 13 hardening in progress)
 
 - pnpm + ESM + strict TypeScript project setup, Node 24 pinned
 - Fail-fast, Zod-validated environment configuration
@@ -1410,6 +1471,26 @@ rand·raw/2`; defaults 1s base, ×2, 5min cap, budget 5), pure and injectable
   or retry after a tool (e.g. a Slack post) has already acted can repeat that action;
   `SlackConnector` adds no idempotency key in this step. New logs: `step_retry_scheduled`,
   `step_retry_exhausted`, `job_retry_scheduled`. Migration `0009` adds `jobs.retry_count`.
+- **Run retention (Step 13 — retention)** — an operator-only `pnpm runs:prune
+  <tenantId> --older-than <Nd|Nh> [--dry-run] [--batch-size <N>]` CLI backed by a
+  tenant-scoped [`RunPruneRepository`](src/repositories/run-prune-repository.ts).
+  It deletes only **terminal** runs (`succeeded`/`failed`/`cancelled`) with
+  `finished_at IS NOT NULL AND finished_at < cutoff`, paging by keyset
+  `(finished_at DESC, id DESC)`; each run is one short autocommit `DELETE` whose
+  existing FK cascade removes its `jobs`, `workflow_step_runs`, and `llm_usage`.
+  `--older-than` is **required** (no executable default; `90d` documented as the
+  recommended policy), and rejects 0/negative/malformed/`> 5y`. Each delete is a
+  compare-and-set on tenant + id + terminal status + cutoff, so re-running is
+  idempotent and concurrent prunes never double-delete. `--dry-run` enumerates via
+  a plain `FOR UPDATE`-free SELECT and performs **zero writes**. Protected tables
+  (`tenants`, `users`, `api_keys`, `connections`, `workflows`,
+  `workflow_versions`, `events`) are never touched; events stay outside retention.
+  Logs carry only identifiers/statuses/counts/mode/cutoff/duration. Migration
+  `0010` adds the partial index
+  `workflow_runs_tenant_id_finished_at_terminal_idx` on `(tenant_id, finished_at
+  DESC)` `WHERE status IN ('succeeded','failed','cancelled')` so the listing scan
+  matches the prune predicate and keyset order exactly. No new env vars, no new
+  dependencies, no API route, no worker change.
 - Bootstrap CLIs for creating a tenant and its first key
 - Build pipeline producing runnable output in `dist/`
 

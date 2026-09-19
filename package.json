@@ -27,6 +27,7 @@
     "workflow:create": "tsx --env-file-if-exists=.env src/cli/create-workflow.ts",
     "webhooks:inspect": "tsx --env-file-if-exists=.env src/cli/inspect-webhooks.ts",
     "runs:inspect": "tsx --env-file-if-exists=.env src/cli/inspect-run.ts",
+    "runs:prune": "tsx --env-file-if-exists=.env src/cli/runs-prune.ts",
     "llm:smoke": "tsx --env-file-if-exists=.env src/cli/llm-smoke.ts",
     "llm:tool-smoke": "tsx --env-file-if-exists=.env src/cli/llm-tool-smoke.ts",
     "connections": "tsx --env-file-if-exists=.env src/cli/connections.ts",
