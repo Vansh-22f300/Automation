@@ -13,7 +13,7 @@
  * Only `noop` exists today, and its handler is intentionally trivial.
  */
 
-import { PermanentError } from '@/domain/errors.js';
+import { PermanentError, RetryableError } from '@/domain/errors.js';
 import type { ConnectionRef, ConnectionResolver } from '@/domain/connection.js';
 import type { ExecutionContext } from '@/domain/execution-context.js';
 import type {
@@ -306,14 +306,38 @@ export class LlmStepHandler implements StepHandler {
         return { output: turn.data, usage };
       }
 
-      // The model requested tools. Record the request turn, then execute each call
-      // sequentially and feed back ONLY safe, normalized results.
-      messages.push({ role: 'assistant', toolCalls: turn.toolCalls });
-      const results: LlmToolResult[] = [];
+      // The model requested tools. Execute every call in the round FIRST, collecting
+      // each outcome, before deciding the round's fate. A failed external side effect
+      // is a real step failure — it must never be fed back to the model as a
+      // recoverable tool result and then hidden by a subsequent "final" answer.
+      const outcomes: ToolCallOutcome[] = [];
       for (const call of turn.toolCalls) {
-        results.push(await this.runToolCall({ call, refByName, toolExecutor, tenantId, execution, round }));
+        outcomes.push(await this.runToolCall({ call, refByName, toolExecutor, tenantId, execution, round }));
       }
-      messages.push({ role: 'tool', results });
+
+      const failures = outcomes.filter((o) => o.failure !== undefined);
+      if (failures.length > 0) {
+        // Round-level classification. If ANY failure is retryable the whole step is
+        // retryable (the engine may re-run it — successful side effects in this round
+        // are at-least-once and are not compensated); otherwise it is permanent.
+        const retryable = failures.some((o) => o.failure!.retryable);
+        const codes = failures.map((o) => o.failure!.code);
+        logger?.warn(
+          { provider: this.provider.name, model, round, err_codes: codes, retryable },
+          'llm_step_failed',
+        );
+        const message = `llm tool call(s) failed in round ${round}: ${codes.join(', ')}`;
+        const details = { round, codes };
+        if (retryable) {
+          throw new RetryableError('llm_tool_call_failed', message, { details });
+        }
+        throw new PermanentError('llm_tool_call_failed', message, { details });
+      }
+
+      // Every call in the round succeeded — record the request turn and feed back ONLY
+      // the safe, normalized results so the model can produce its final answer.
+      messages.push({ role: 'assistant', toolCalls: turn.toolCalls });
+      messages.push({ role: 'tool', results: outcomes.map((o) => o.result) });
     }
 
     // The loop bound was reached without a final answer — refuse deterministically.
@@ -326,11 +350,18 @@ export class LlmStepHandler implements StepHandler {
   }
 
   /**
-   * Execute one model-requested tool call and normalize it into a model-safe
-   * {@link LlmToolResult}. A tool the model was not offered is refused as `unknown_tool`
-   * without ever reaching the executor. Success carries the connector's non-secret
-   * output; failure carries only the classified `{code, message}` — never a credential,
-   * connection metadata, tenant id, or internal error object.
+   * Execute one model-requested tool call. Returns the model-safe
+   * {@link LlmToolResult} the model would see on success, together with the failure
+   * *classification* when the call failed — the round decides what to do with it.
+   *
+   * The `result` is always model-safe: success carries the connector's non-secret
+   * output; a failure's placeholder `result` carries only the classified
+   * `{code, message}` (never a credential, connection metadata, tenant id, or
+   * internal error object) so it is safe to log or feed back. But `failure`, when
+   * present, additionally carries the `retryable` classification the model-facing
+   * type deliberately omits — that flag drives the round's throw and never reaches
+   * the model. A tool the model was not offered is refused as `unknown_tool` (a
+   * deterministic wiring error, not retryable) without ever reaching the executor.
    */
   private async runToolCall(params: {
     call: LlmToolCall;
@@ -339,16 +370,21 @@ export class LlmStepHandler implements StepHandler {
     tenantId: string;
     execution: StepExecution;
     round: number;
-  }): Promise<LlmToolResult> {
+  }): Promise<ToolCallOutcome> {
     const { call, refByName, toolExecutor, tenantId, execution, round } = params;
     const logger = execution.logger;
     logger?.info({ tool: call.name, round, call_id: call.id }, 'llm_tool_call_requested');
 
     const connectionRef = refByName.get(call.name);
     if (connectionRef === undefined) {
-      // The model asked for a tool that was not offered to this step. Refuse safely.
+      // The model asked for a tool that was not offered to this step. A deterministic
+      // wiring error — never retryable — surfaced as a round failure, not fed back.
       logger?.warn({ tool: call.name, round, call_id: call.id, err_code: 'unknown_tool' }, 'llm_tool_call_failed');
-      return { id: call.id, error: { code: 'unknown_tool', message: `tool "${call.name}" is not available to this step` } };
+      const message = `tool "${call.name}" is not available to this step`;
+      return {
+        result: { id: call.id, error: { code: 'unknown_tool', message } },
+        failure: { code: 'unknown_tool', retryable: false },
+      };
     }
 
     logger?.info({ tool: call.name, round, call_id: call.id }, 'llm_tool_call_started');
@@ -368,12 +404,31 @@ export class LlmStepHandler implements StepHandler {
 
     if (result.success) {
       logger?.info({ tool: call.name, round, call_id: call.id }, 'llm_tool_call_succeeded');
-      return { id: call.id, output: result.output };
+      return { result: { id: call.id, output: result.output } };
     }
+    // Preserve the executor's classification (`retryable`) for the round-level
+    // decision. The model-facing `result` still carries only the safe `{code, message}`.
     const code = result.error?.code ?? 'tool_error';
+    const retryable = result.error?.retryable ?? false;
     logger?.warn({ tool: call.name, round, call_id: call.id, err_code: code }, 'llm_tool_call_failed');
-    return { id: call.id, error: { code, message: result.error?.message ?? 'tool execution failed' } };
+    return {
+      result: { id: call.id, error: { code, message: result.error?.message ?? 'tool execution failed' } },
+      failure: { code, retryable },
+    };
   }
+}
+
+/**
+ * The internal outcome of one tool call inside the bounded loop. `result` is the
+ * model-safe {@link LlmToolResult} (the only thing that could ever be fed back);
+ * `failure`, present iff the call failed, additionally carries the `retryable`
+ * classification the model-facing type omits, so the round can throw a
+ * `RetryableError` or `PermanentError` accordingly. This type never leaves the
+ * handler and is never shown to the model.
+ */
+interface ToolCallOutcome {
+  readonly result: LlmToolResult;
+  readonly failure?: { readonly code: string; readonly retryable: boolean };
 }
 
 /**

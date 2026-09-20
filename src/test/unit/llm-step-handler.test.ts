@@ -22,8 +22,13 @@ import {
   SLACK_PROVIDER,
   createSlackToolRegistry,
 } from '@/connectors/slack/index.js';
+import type {
+  SlackHttpResponse,
+  SlackPostMessageInput,
+  SlackTransport,
+} from '@/connectors/slack/index.js';
 import type { AuthorizedConnection, ConnectionRef, ConnectionResolver } from '@/domain/connection.js';
-import { PermanentError } from '@/domain/errors.js';
+import { PermanentError, RetryableError } from '@/domain/errors.js';
 import { ExecutionContext } from '@/domain/execution-context.js';
 import { LlmStepHandler } from '@/domain/step-handler.js';
 import type { WorkflowStep } from '@/domain/workflow-definition.js';
@@ -210,11 +215,42 @@ const toolStep = (overrides: Record<string, unknown> = {}): WorkflowStep =>
   llmStep({ tools: [{ name: SEND_SLACK_MESSAGE_TOOL, connection_id: CONNECTION_ID }], ...overrides });
 
 /** A model tool-call requesting the Slack send with model-supplied arguments. */
-const slackCall = (args: { channel: string; text: string }) => ({
-  id: 'call-1',
+const slackCall = (args: { channel: string; text: string }, id = 'call-1') => ({
+  id,
   name: SEND_SLACK_MESSAGE_TOOL,
   arguments: args,
 });
+
+/** A Slack transport that returns a scripted response per call, in order — so a
+ * single round can mix success and failure (and a permanent with a retryable). */
+class SequencedSlackTransport implements SlackTransport {
+  calls = 0;
+  private readonly responses: readonly SlackHttpResponse[];
+  constructor(responses: readonly SlackHttpResponse[]) {
+    this.responses = responses;
+  }
+  postMessage(_input: SlackPostMessageInput, _botToken: string): Promise<SlackHttpResponse> {
+    const response = this.responses[this.calls] ?? this.responses[this.responses.length - 1]!;
+    this.calls += 1;
+    return Promise.resolve(response);
+  }
+}
+
+/** A Slack `ok:true` success. */
+const OK_RESPONSE: SlackHttpResponse = {
+  status: 200,
+  body: { ok: true, channel: 'C123TEST', ts: '1700000000.000100' },
+};
+/** A deterministic Slack failure (bad channel) → PermanentError, not retryable. */
+const PERMANENT_RESPONSE: SlackHttpResponse = {
+  status: 200,
+  body: { ok: false, error: 'channel_not_found' },
+};
+/** A transient Slack failure (rate limited) → RetryableError. */
+const RETRYABLE_RESPONSE: SlackHttpResponse = {
+  status: 200,
+  body: { ok: false, error: 'ratelimited' },
+};
 
 describe('LlmStepHandler (tools)', () => {
   it('runs the bounded loop: model requests the tool, platform executes it, model finalizes', async () => {
@@ -328,11 +364,13 @@ describe('LlmStepHandler (tools)', () => {
     expect(provider.converseCalls).toBe(0);
   });
 
-  it('refuses a tool the model was not offered, feeding back a safe unknown_tool error', async () => {
+  it('refuses a tool the model was not offered — a deterministic (non-retryable) failure, never fed back', async () => {
     const provider = new FakeLlmProvider({
       structuredData: { category: 'spam' },
       converseTurns: [
         { kind: 'tool_use', toolCalls: [{ id: 'c1', name: 'delete_everything', arguments: {} }] },
+        // A final answer the model would give next — it must never be reached, so a
+        // failed side effect can never be masked by a subsequent "final".
         { kind: 'final' },
       ],
     });
@@ -342,18 +380,25 @@ describe('LlmStepHandler (tools)', () => {
       resolverFactory: () => new FakeConnectionResolver(),
     });
 
-    const result = await handler.execute({
-      step: toolStep(),
-      context: new ExecutionContext(baseContext()),
-      input: { input: 'x' },
-      tenantId: 'tenant-1',
-    });
+    const error = await handler
+      .execute({
+        step: toolStep(),
+        context: new ExecutionContext(baseContext()),
+        input: { input: 'x' },
+        tenantId: 'tenant-1',
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
 
-    // The un-offered tool never reached the executor/transport.
+    // An un-offered tool is a wiring error: deterministic, so PermanentError.
+    expect(error).toBeInstanceOf(PermanentError);
+    expect(error).toMatchObject({ code: 'llm_tool_call_failed', retryable: false });
+    // It never reached the executor/transport, and the loop stopped — no second round.
     expect(transport.calls).toBe(0);
-    expect(result.output).toEqual({ category: 'spam' });
-    const feedback = provider.converseRequests[1]!.messages.find((m) => m.role === 'tool');
-    expect(JSON.stringify(feedback)).toContain('unknown_tool');
+    expect(provider.converseCalls).toBe(1);
+    expect(provider.converseRequests.some((r) => r.messages.some((m) => m.role === 'tool'))).toBe(false);
   });
 
   it('fails with llm_tool_rounds_exceeded when the model never finalizes', async () => {
@@ -380,35 +425,189 @@ describe('LlmStepHandler (tools)', () => {
     expect(provider.converseCalls).toBe(2);
   });
 
-  it('normalizes a tool failure into a safe {code,message} fed back to the model', async () => {
+});
+
+// ---------------------------------------------------------------------------
+// Tool-failure semantics (Issue 1): a failed external side effect is a real step
+// failure — it is classified and thrown, never fed back to the model and then
+// hidden by a subsequent successful "final" response.
+// ---------------------------------------------------------------------------
+
+/** A second scripted tool call (distinct id) for multi-call rounds. */
+const slackCall2 = (args: { channel: string; text: string }) => slackCall(args, 'call-2');
+
+/** Build a tool handler whose transport returns the given per-call responses. */
+const toolHandler = (provider: FakeLlmProvider, transport: SlackTransport, resolver = new FakeConnectionResolver()) =>
+  new LlmStepHandler(provider, {
+    toolRegistry: createSlackToolRegistry({ transport }),
+    resolverFactory: () => resolver,
+  });
+
+/** Run a tool step and capture the rejection (or undefined if it resolved). */
+const runAndCatch = (handler: LlmStepHandler, step = toolStep()) =>
+  handler
+    .execute({
+      step,
+      context: new ExecutionContext(baseContext()),
+      input: { input: 'notify the channel' },
+      tenantId: 'tenant-1',
+      runId: 'run-1',
+      stepRunId: 'sr-1',
+    })
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+describe('LlmStepHandler (tool-failure semantics)', () => {
+  it('a single permanent tool failure fails the step with PermanentError, never fed back', async () => {
     const provider = new FakeLlmProvider({
       structuredData: { category: 'spam' },
       converseTurns: [
         { kind: 'tool_use', toolCalls: [slackCall({ channel: 'C_BAD', text: 'x' })] },
+        { kind: 'final' }, // would mask the failure if ever reached
+      ],
+    });
+    const transport = new SequencedSlackTransport([PERMANENT_RESPONSE]);
+    const error = await runAndCatch(toolHandler(provider, transport));
+
+    expect(error).toBeInstanceOf(PermanentError);
+    expect(error).toMatchObject({ code: 'llm_tool_call_failed', retryable: false });
+    // The side effect ran once; the loop then stopped — the "final" turn was never reached.
+    expect(transport.calls).toBe(1);
+    expect(provider.converseCalls).toBe(1);
+    // No failed tool result was fed back, and no secret leaked into any request.
+    expect(provider.converseRequests.some((r) => r.messages.some((m) => m.role === 'tool'))).toBe(false);
+    expect(JSON.stringify(provider.converseRequests)).not.toContain('xoxb');
+  });
+
+  it('a single retryable tool failure fails the step with RetryableError', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        { kind: 'tool_use', toolCalls: [slackCall({ channel: 'C123TEST', text: 'x' })] },
         { kind: 'final' },
       ],
     });
-    // Slack replies ok:false with a deterministic error.
-    const transport = new FakeSlackTransport({
-      response: { status: 200, body: { ok: false, error: 'channel_not_found' } },
+    const transport = new SequencedSlackTransport([RETRYABLE_RESPONSE]);
+    const error = await runAndCatch(toolHandler(provider, transport));
+
+    expect(error).toBeInstanceOf(RetryableError);
+    expect(error).toMatchObject({ code: 'llm_tool_call_failed', retryable: true });
+    expect(transport.calls).toBe(1);
+    expect(provider.converseCalls).toBe(1);
+  });
+
+  it('a round with a success AND a permanent failure fails permanently (whole round is collected first)', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        {
+          kind: 'tool_use',
+          toolCalls: [slackCall({ channel: 'C_OK', text: 'a' }), slackCall2({ channel: 'C_BAD', text: 'b' })],
+        },
+        { kind: 'final' },
+      ],
     });
-    const handler = new LlmStepHandler(provider, {
-      toolRegistry: createSlackToolRegistry({ transport }),
-      resolverFactory: () => new FakeConnectionResolver(),
+    // First call succeeds, second is a deterministic failure.
+    const transport = new SequencedSlackTransport([OK_RESPONSE, PERMANENT_RESPONSE]);
+    const error = await runAndCatch(toolHandler(provider, transport));
+
+    expect(error).toBeInstanceOf(PermanentError);
+    expect(error).toMatchObject({ code: 'llm_tool_call_failed', retryable: false });
+    // The ENTIRE round ran before the throw — both calls executed (at-least-once).
+    expect(transport.calls).toBe(2);
+    expect(provider.converseCalls).toBe(1);
+  });
+
+  it('a round with a success AND a retryable failure fails retryably', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        {
+          kind: 'tool_use',
+          toolCalls: [slackCall({ channel: 'C_OK', text: 'a' }), slackCall2({ channel: 'C_RL', text: 'b' })],
+        },
+        { kind: 'final' },
+      ],
     });
+    const transport = new SequencedSlackTransport([OK_RESPONSE, RETRYABLE_RESPONSE]);
+    const error = await runAndCatch(toolHandler(provider, transport));
+
+    expect(error).toBeInstanceOf(RetryableError);
+    expect(error).toMatchObject({ code: 'llm_tool_call_failed', retryable: true });
+    expect(transport.calls).toBe(2);
+  });
+
+  it('a round mixing a permanent AND a retryable failure is retryable (any retryable wins)', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        {
+          kind: 'tool_use',
+          toolCalls: [slackCall({ channel: 'C_BAD', text: 'a' }), slackCall2({ channel: 'C_RL', text: 'b' })],
+        },
+        { kind: 'final' },
+      ],
+    });
+    // Permanent first, retryable second — the retryable classification must win.
+    const transport = new SequencedSlackTransport([PERMANENT_RESPONSE, RETRYABLE_RESPONSE]);
+    const error = await runAndCatch(toolHandler(provider, transport));
+
+    expect(error).toBeInstanceOf(RetryableError);
+    expect(error).toMatchObject({ code: 'llm_tool_call_failed', retryable: true });
+    expect(transport.calls).toBe(2);
+  });
+
+  it('an all-success round is unchanged: results are fed back and the model finalizes', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        {
+          kind: 'tool_use',
+          toolCalls: [slackCall({ channel: 'C_OK', text: 'a' }), slackCall2({ channel: 'C_OK', text: 'b' })],
+        },
+        { kind: 'final' },
+      ],
+    });
+    const transport = new SequencedSlackTransport([OK_RESPONSE, OK_RESPONSE]);
+    const handler = toolHandler(provider, transport);
 
     const result = await handler.execute({
       step: toolStep(),
       context: new ExecutionContext(baseContext()),
-      input: { input: 'x' },
+      input: { input: 'notify the channel' },
       tenantId: 'tenant-1',
     });
 
-    // The step still completes (the model recovered); the error was surfaced safely.
+    // Both calls ran, the results were fed back, and the model produced its final answer.
     expect(result.output).toEqual({ category: 'spam' });
+    expect(transport.calls).toBe(2);
+    expect(provider.converseCalls).toBe(2);
     const feedback = provider.converseRequests[1]!.messages.find((m) => m.role === 'tool');
-    const fed = JSON.stringify(feedback);
-    expect(fed).toContain('channel_not_found');
-    expect(fed).not.toContain('xoxb');
+    expect(feedback).toBeDefined();
+    expect(JSON.stringify(feedback)).not.toContain('xoxb');
+  });
+
+  it('never sends a failed tool result back to Claude when a round has any failure', async () => {
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        {
+          kind: 'tool_use',
+          toolCalls: [slackCall({ channel: 'C_OK', text: 'a' }), slackCall2({ channel: 'C_BAD', text: 'b' })],
+        },
+        { kind: 'final' }, // must never be reached
+      ],
+    });
+    const transport = new SequencedSlackTransport([OK_RESPONSE, PERMANENT_RESPONSE]);
+    const error = await runAndCatch(toolHandler(provider, transport));
+
+    expect(error).toBeInstanceOf(PermanentError);
+    // The provider was called exactly once (the tool_use round). No follow-up round
+    // was issued, so neither the succeeded NOR the failed tool result was fed back —
+    // the model never got a chance to emit a masking "final" answer.
+    expect(provider.converseCalls).toBe(1);
+    expect(provider.converseRequests.some((r) => r.messages.some((m) => m.role === 'tool'))).toBe(false);
   });
 });
