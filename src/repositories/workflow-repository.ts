@@ -190,9 +190,13 @@ export class WorkflowRepository
     const activate = input.activate ?? true;
 
     return this.db.transaction(async (tx) => {
+      // The status label tracks whether the workflow has a runnable (active)
+      // version: `active` when version 1 is activated now, otherwise `draft`.
+      // Execution still routes on `workflowVersions.isActive`; status is the
+      // user-facing projection of it, never a second source of truth.
       const [workflow] = await tx
         .insert(workflows)
-        .values({ tenantId: this.tenantId, name: input.name })
+        .values({ tenantId: this.tenantId, name: input.name, status: activate ? 'active' : 'draft' })
         .returning();
 
       // The insert always returns exactly one row.
@@ -277,6 +281,15 @@ export class WorkflowRepository
               eq(workflowVersions.isActive, true),
             ),
           );
+
+        // The workflow now has a runnable version → its status label is `active`.
+        // (activate=false leaves the parent status untouched.)
+        await tx
+          .update(workflows)
+          .set({ status: "active" })
+          .where(
+            and(eq(workflows.id, workflowId), eq(workflows.tenantId, this.tenantId)),
+          );
       }
 
       const [version] = await tx
@@ -354,6 +367,68 @@ export class WorkflowRepository
             eq(workflowVersions.tenantId, this.tenantId),
           ),
         );
+
+      // A workflow with an active version is `active` — this also re-enables a
+      // previously `disabled` workflow, the intended way to bring one back.
+      await tx
+        .update(workflows)
+        .set({ status: "active" })
+        .where(
+          and(eq(workflows.id, workflowId), eq(workflows.tenantId, this.tenantId)),
+        );
+    });
+  }
+
+  /**
+   * Disable a workflow: mark it `disabled` AND deactivate every currently active
+   * version, in one transaction. Because webhook routing selects the target purely
+   * by `is_active`, removing the active version is what actually stops new runs —
+   * the status label alone would not. Version rows are otherwise untouched (only
+   * `is_active` flips) and nothing is deleted, so the history stays intact and the
+   * workflow can be brought back with `activateVersion`.
+   *
+   * Idempotent: disabling an already-disabled workflow deactivates nothing further
+   * and still succeeds. Both the workflow must be this tenant's, or `NotFoundError`
+   * is thrown — the same tenant-safe answer as `activateVersion`/`createVersion`.
+   */
+  async disable(workflowId: string): Promise<Workflow> {
+    return this.db.transaction(async (tx) => {
+      // Lock the workflow row and prove tenant ownership in one step, mirroring
+      // the other mutating methods so disable serialises against version changes.
+      const locked = await tx
+        .select({ id: workflows.id })
+        .from(workflows)
+        .where(
+          and(eq(workflows.id, workflowId), eq(workflows.tenantId, this.tenantId)),
+        )
+        .for("update");
+
+      if (locked.length === 0) {
+        throw new NotFoundError("Workflow not found");
+      }
+
+      // Deactivate any active version(s) — after this there is no active version,
+      // so a webhook for this workflow's source can match nothing and creates no run.
+      await tx
+        .update(workflowVersions)
+        .set({ isActive: false })
+        .where(
+          and(
+            eq(workflowVersions.workflowId, workflowId),
+            eq(workflowVersions.tenantId, this.tenantId),
+            eq(workflowVersions.isActive, true),
+          ),
+        );
+
+      const [updated] = await tx
+        .update(workflows)
+        .set({ status: "disabled" })
+        .where(
+          and(eq(workflows.id, workflowId), eq(workflows.tenantId, this.tenantId)),
+        )
+        .returning();
+
+      return updated!;
     });
   }
 
