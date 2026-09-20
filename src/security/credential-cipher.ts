@@ -492,14 +492,27 @@ export function createCredentialCipher(
     );
   }
 
-  // Cleanup warning — legacy var is dead. The keyring is the source of
-  // truth for both v1 read and v1 write (its `legacy-v1` entry backs both
-  // with the same bytes). The legacy env var is unused and the operator
-  // can remove it from their config. Only emitted when a logger is
-  // supplied; without a logger the warning is silently dropped (no side
-  // effects, no thrown error).
+  // Cleanup warning — legacy var is dead. Emitted only when the plural
+  // CREDENTIAL_ENCRYPTION_KEYS is actually present (`newRaw !== undefined`)
+  // AND it carries a `legacy-v1` entry AND the singular legacy var is also
+  // set. In that configuration the keyring is the source of truth for both
+  // v1 read and v1 write (its `legacy-v1` entry backs both with the same
+  // bytes), so the singular env var is unused and the operator can remove it.
+  //
+  // The `newRaw !== undefined` guard is essential: without it this also fires
+  // in the singular-only auto-import case (where `KeyRing.fromLegacyKey`
+  // synthesises a `legacy-v1` entry so `ring.hasLegacyV1` is true), producing
+  // a false positive whose advice — "remove CREDENTIAL_ENCRYPTION_KEY" — would
+  // empty the ring and fail boot. The three configurations are therefore:
+  //   singular only              → no warning (the var is the sole key source)
+  //   singular + plural(legacy-v1) → warning  (the var is redundant)
+  //   plural only                → no legacy-var warning (nothing to remove)
+  //
+  // Only emitted when a logger is supplied; without a logger the warning is
+  // silently dropped (no side effects, no thrown error).
   if (
     legacyKey !== null &&
+    newRaw !== undefined &&
     ring.hasLegacyV1 &&
     options?.logger !== undefined
   ) {

@@ -231,6 +231,24 @@ describe('createCredentialCipher — env × behaviour matrix', () => {
     expect(events[0]?.msg).toBe('credential_keyring_legacy_var_ignored');
   });
 
+  it('legacy present / new absent → NO cleanup warning even when a logger is provided', () => {
+    // The singular-only auto-import case. `KeyRing.fromLegacyKey` synthesises a
+    // `legacy-v1` entry, so `ring.hasLegacyV1` is true — but the plural
+    // CREDENTIAL_ENCRYPTION_KEYS is absent, the singular var is the sole key
+    // source, and telling the operator to remove it would empty the ring and
+    // fail boot. The warning must NOT fire here, logger or not.
+    const events: Array<{ event: string; msg: string }> = [];
+    const stubLogger = {
+      info(payload: Record<string, unknown>, msg: string) {
+        events.push({ event: String(payload['event']), msg });
+      },
+    };
+    createCredentialCipher(envWith(K1.toString('base64')), {
+      logger: stubLogger as never,
+    });
+    expect(events).toHaveLength(0);
+  });
+
   it('new present (with legacy-v1) / legacy present → no warning emitted without a logger', () => {
     // No logger → the warning is silently dropped. The cipher is still
     // constructed correctly.

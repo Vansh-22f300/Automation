@@ -38,16 +38,16 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # pnpm must be installed BEFORE setup-node: setup-node's `cache: pnpm`
       # shells out to pnpm to locate the store, and fails if it is missing.
       # No `version:` input on purpose — pnpm/action-setup reads
       # `packageManager` (pnpm@11.4.0) from package.json, keeping the repository
       # the single source of truth for the pnpm version.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           # package.json pins engines.node to ">=24.0.0 <25".
           node-version: '24'
@@ -114,11 +114,11 @@ jobs:
       TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ai_workforce_test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
           cache: pnpm
