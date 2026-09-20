@@ -140,7 +140,7 @@ const resolverFactory = (tenantId: string): ConnectionResolver =>
 // outcome surfaces as ambiguous rather than silently duplicating. Bound per tenant,
 // exactly like the resolver.
 const effectLedgerFactory = (tenantId: string): EffectLedger =>
-  new EffectLedgerRepository(database.db, tenantId);
+  new EffectLedgerRepository(new TenantScope(database.db, tenantId));
 
 /** The worker's job-validity check: does this run still exist for this tenant? */
 const runExists: RunExistenceCheck = async (tenantId, runId) => {

@@ -127,7 +127,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
 
   describe('reserve → settle success → replay', () => {
     it('acquires a fresh reservation and stores the result on success', async () => {
-      const ledger = new EffectLedgerRepository(handle.db, tenantA);
+      const ledger = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const reservation = reservationFor();
 
       const acquisition = await ledger.acquire(reservation);
@@ -142,13 +142,13 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
     });
 
     it('replays a succeeded effect for a later attempt — never re-runs it', async () => {
-      const ledger = new EffectLedgerRepository(handle.db, tenantA);
+      const ledger = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const reservation = reservationFor();
       await ledger.acquire(reservation);
       await ledger.settleSuccess(reservation, { ts: '123.456' });
 
       // A different attempt (fresh owner) observes the succeeded row.
-      const replayLedger = new EffectLedgerRepository(handle.db, tenantA);
+      const replayLedger = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const acquisition = await replayLedger.acquire(reservationFor({ owner: OWNER_2 }));
       expect(acquisition).toEqual({ kind: 'replay', result: { ts: '123.456' } });
     });
@@ -156,7 +156,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
 
   describe('settle failure dispositions', () => {
     it('release: returns a SAFE-retryable reservation to pending (owner NULL) so the next attempt re-acquires', async () => {
-      const ledger = new EffectLedgerRepository(handle.db, tenantA);
+      const ledger = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const reservation = reservationFor();
       await ledger.acquire(reservation);
 
@@ -170,7 +170,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
       expect(row!.owner).toBeNull();
 
       // The next attempt genuinely re-acquires the released reservation.
-      const next = new EffectLedgerRepository(handle.db, tenantA);
+      const next = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const acquisition = await next.acquire(reservationFor({ owner: OWNER_2 }));
       expect(acquisition.kind).toBe('acquired');
       const reacquired = await rowFor(reservation.idempotencyKey);
@@ -178,7 +178,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
     });
 
     it('permanent: settles failed terminally; a later attempt re-throws, never re-runs', async () => {
-      const ledger = new EffectLedgerRepository(handle.db, tenantA);
+      const ledger = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const reservation = reservationFor();
       await ledger.acquire(reservation);
       await ledger.settleFailure(reservation, {
@@ -189,13 +189,13 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
       const row = await rowFor(reservation.idempotencyKey);
       expect(row!.state).toBe('failed');
 
-      const next = new EffectLedgerRepository(handle.db, tenantA);
+      const next = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const acquisition = await next.acquire(reservationFor({ owner: OWNER_2 }));
       expect(acquisition.kind).toBe('failed');
     });
 
     it('ambiguous: settles ambiguous terminally; a later attempt sees ambiguous, never re-runs', async () => {
-      const ledger = new EffectLedgerRepository(handle.db, tenantA);
+      const ledger = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const reservation = reservationFor();
       await ledger.acquire(reservation);
       await ledger.settleFailure(reservation, {
@@ -206,7 +206,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
       const row = await rowFor(reservation.idempotencyKey);
       expect(row!.state).toBe('ambiguous');
 
-      const next = new EffectLedgerRepository(handle.db, tenantA);
+      const next = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const acquisition = await next.acquire(reservationFor({ owner: OWNER_2 }));
       expect(acquisition.kind).toBe('ambiguous');
     });
@@ -214,8 +214,8 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
 
   describe('concurrency: one uniqueness constraint arbitrates', () => {
     it('two concurrent acquires on the same key yield exactly one acquired', async () => {
-      const ledgerA = new EffectLedgerRepository(handle.db, tenantA);
-      const ledgerB = new EffectLedgerRepository(handle.db, tenantA);
+      const ledgerA = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
+      const ledgerB = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
 
       const [a, b] = await Promise.all([
         ledgerA.acquire(reservationFor({ owner: OWNER_1 })),
@@ -235,7 +235,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
   describe('crash recovery: owner set, lease expired → ambiguous', () => {
     it('settles a crashed attempt ambiguous on the next acquire and does not re-run', async () => {
       // Attempt 1 acquires, then "crashes": we force its lease into the past.
-      const ledger = new EffectLedgerRepository(handle.db, tenantA);
+      const ledger = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const reservation = reservationFor();
       await ledger.acquire(reservation);
       await handle.db
@@ -244,7 +244,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
         .where(and(eq(toolEffects.tenantId, tenantA), eq(toolEffects.idempotencyKey, reservation.idempotencyKey)));
 
       // Attempt 2 observes owner-set + lease-expired → ambiguous, never acquired.
-      const next = new EffectLedgerRepository(handle.db, tenantA);
+      const next = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const acquisition = await next.acquire(reservationFor({ owner: OWNER_2 }));
       expect(acquisition.kind).toBe('ambiguous');
 
@@ -257,12 +257,12 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
     it('defers with a retryAfterMs past the live lease horizon', async () => {
       // A fixed clock so the defer arithmetic is deterministic.
       const base = new Date('2026-01-01T00:00:00.000Z');
-      const holder = new EffectLedgerRepository(handle.db, tenantA, { now: () => base });
+      const holder = new EffectLedgerRepository(new TenantScope(handle.db, tenantA), { now: () => base });
       const reservation = reservationFor();
       await holder.acquire(reservation); // lease = base + 120s, live.
 
       // A second attempt at the same instant sees the live lease → defer.
-      const next = new EffectLedgerRepository(handle.db, tenantA, { now: () => base });
+      const next = new EffectLedgerRepository(new TenantScope(handle.db, tenantA), { now: () => base });
       const acquisition = await next.acquire(reservationFor({ owner: OWNER_2 }));
       expect(acquisition.kind).toBe('defer');
       if (acquisition.kind === 'defer') {
@@ -282,7 +282,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
       // re-acquire path is not applicable here; instead attempt 2 takes it over by
       // observing the expired lease → ambiguous. Attempt 1 then tries to settle
       // success and must be a no-op (its owner no longer matches a pending row).
-      const one = new EffectLedgerRepository(handle.db, tenantA);
+      const one = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       const reservation = reservationFor({ owner: OWNER_1 });
       await one.acquire(reservation);
       await handle.db
@@ -290,7 +290,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
         .set({ leaseExpiresAt: new Date(Date.now() - 1) })
         .where(and(eq(toolEffects.tenantId, tenantA), eq(toolEffects.idempotencyKey, reservation.idempotencyKey)));
 
-      const two = new EffectLedgerRepository(handle.db, tenantA);
+      const two = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       await two.acquire(reservationFor({ owner: OWNER_2 })); // → ambiguous, terminal
 
       // The superseded attempt 1 tries to record its success: must not overwrite.
@@ -304,12 +304,12 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('postgres effect ledger integra
 
   describe('tenant isolation', () => {
     it('a ledger scoped to tenant B cannot observe tenant A reservation', async () => {
-      const ledgerA = new EffectLedgerRepository(handle.db, tenantA);
+      const ledgerA = new EffectLedgerRepository(new TenantScope(handle.db, tenantA));
       await ledgerA.acquire(reservationFor());
 
       // Tenant B uses the SAME idempotency key string but its own run — the unique
       // constraint is (tenant_id, idempotency_key), so B gets its own fresh row.
-      const ledgerB = new EffectLedgerRepository(handle.db, tenantB);
+      const ledgerB = new EffectLedgerRepository(new TenantScope(handle.db, tenantB));
       const acquisition = await ledgerB.acquire({
         tenantId: tenantB,
         runId: runB,

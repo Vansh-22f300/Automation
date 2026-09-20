@@ -23,14 +23,15 @@
  *      queue uses, where a transition that touches zero rows is a lost race, not a
  *      silent success.
  *
- * The class is bound to one tenant (a ledger is built per run's tenant, like the
- * connection resolver), so every statement carries a `tenant_id` predicate and a
- * key from another tenant simply is not found.
+ * The class is bound to one tenant through `TenantScope` — it extends
+ * `TenantScopedRepository`, exactly like every other tenant-scoped repository, so
+ * `this.tenantId` comes from the scope and every statement carries a `tenant_id`
+ * predicate. A key from another tenant simply is not found. (A ledger is built per
+ * run's tenant, like the connection resolver: `new EffectLedgerRepository(scope)`.)
  */
 
 import { and, eq, isNull, lt } from 'drizzle-orm';
 
-import type { AppDatabase } from '@/db/client.js';
 import { toolEffects } from '@/db/schema.js';
 import type {
   EffectAcquisition,
@@ -40,6 +41,7 @@ import type {
   EffectReservation,
 } from '@/domain/effect-ledger.js';
 import { DEFAULT_LEASE_MS, EFFECT_SETTLEMENT_MARGIN_MS } from '@/domain/timing.js';
+import { TenantScope, TenantScopedRepository } from '@/repositories/tenant-scope.js';
 
 /**
  * How many times `acquire` re-reads and re-branches after losing a CAS race
@@ -62,14 +64,11 @@ export interface EffectLedgerRepositoryOptions {
   readonly now?: () => Date;
 }
 
-export class EffectLedgerRepository implements EffectLedger {
+export class EffectLedgerRepository extends TenantScopedRepository implements EffectLedger {
   private readonly now: () => Date;
 
-  constructor(
-    private readonly db: AppDatabase,
-    private readonly tenantId: string,
-    options: EffectLedgerRepositoryOptions = {},
-  ) {
+  constructor(scope: TenantScope, options: EffectLedgerRepositoryOptions = {}) {
+    super(scope);
     this.now = options.now ?? (() => new Date());
   }
 

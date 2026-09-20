@@ -79,6 +79,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('database integration', () => {
       'jobs',
       'llm_usage',
       'tenants',
+      'tool_effects',
       'users',
       'workflow_runs',
       'workflow_step_runs',
