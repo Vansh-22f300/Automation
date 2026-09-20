@@ -57,6 +57,7 @@ import { assertRunTransition } from '@/domain/run-state.js';
 import type { RunStatus } from '@/domain/run-state.js';
 import { createRetryPolicy } from '@/domain/retry-policy.js';
 import type { RetryPolicy } from '@/domain/retry-policy.js';
+import { DEFAULT_LEASE_MS } from '@/domain/timing.js';
 import type { StepUsage } from '@/domain/step-handler.js';
 import type { StepHandlerRegistry } from '@/domain/step-handler.js';
 import { parseWorkflowDefinition } from '@/domain/workflow-definition.js';
@@ -130,6 +131,23 @@ function toJobError(error: unknown): JobError {
     code: 'step_execution_error',
     message: error instanceof Error ? error.message : String(error),
   };
+}
+
+/**
+ * Read an explicit reschedule hint (`retryAfterMs`) off a failure reason's
+ * `details`, if present and well-formed. This is the sole channel by which the
+ * effect ledger's live-reservation defer reaches the retry scheduler: the ledger
+ * throws a `RetryableError` carrying `details.retryAfterMs`, `toJobError` preserves
+ * `details` verbatim, and the reason is a plain `JobError` (`Record<string,
+ * unknown>`) by the time it is settled — so the field arrives as `unknown` and must
+ * be narrowed here. Absent or malformed → undefined, and scheduling falls back to
+ * the backoff curve.
+ */
+function readRetryAfterMs(reason: JobError): number | undefined {
+  const details = reason['details'];
+  if (typeof details !== 'object' || details === null) return undefined;
+  const hint = (details as Record<string, unknown>)['retryAfterMs'];
+  return typeof hint === 'number' && Number.isFinite(hint) && hint >= 0 ? hint : undefined;
 }
 
 export class WorkflowExecutor implements StepDispatcher {
@@ -390,7 +408,15 @@ export class WorkflowExecutor implements StepDispatcher {
           .where(eq(workflowStepRuns.id, begun.stepRunId));
 
         if (reason.retryable === true && job.retryCount < job.maxAttempts) {
-          const delayMs = this.retryPolicy.backoffMs(job.retryCount);
+          // Prefer an explicit reschedule hint from the effect ledger over the
+          // backoff curve. The ledger sets `retryAfterMs` only when it deferred this
+          // attempt against another attempt's LIVE reservation, and the delay must
+          // outlast that reservation's lease — which the backoff budget (~15-31s
+          // total) cannot guarantee. Cap it at the job lease so a hint can never
+          // push a retry past the point the queue would reclaim the job anyway.
+          const hintedMs = readRetryAfterMs(reason);
+          const delayMs =
+            hintedMs !== undefined ? Math.min(hintedMs, DEFAULT_LEASE_MS) : this.retryPolicy.backoffMs(job.retryCount);
           const runAt = new Date(this.now().getTime() + delayMs);
           begun.log.warn(
             {
@@ -398,6 +424,7 @@ export class WorkflowExecutor implements StepDispatcher {
               retry_count: job.retryCount,
               max_attempts: job.maxAttempts,
               delay_ms: Math.round(delayMs),
+              ...(hintedMs !== undefined ? { retry_after_hint_ms: Math.round(hintedMs) } : {}),
               next_run_at: runAt.toISOString(),
             },
             'step_retry_scheduled',

@@ -15,6 +15,7 @@
 
 import { PermanentError, RetryableError } from '@/domain/errors.js';
 import type { ConnectionRef, ConnectionResolver } from '@/domain/connection.js';
+import type { EffectLedger } from '@/domain/effect-ledger.js';
 import type { ExecutionContext } from '@/domain/execution-context.js';
 import type {
   LlmProvider,
@@ -25,6 +26,7 @@ import type {
   LlmToolTurn,
 } from '@/domain/llm.js';
 import { compileOutputSchema } from '@/domain/output-schema.js';
+import { DEFAULT_EFFECT_LEASE_MS } from '@/domain/timing.js';
 import { ToolExecutor } from '@/domain/tool-executor.js';
 import type { ToolRegistry } from '@/domain/tool-registry.js';
 import type { LlmStepConfig, StepType, WorkflowStep } from '@/domain/workflow-definition.js';
@@ -126,11 +128,19 @@ export interface LlmToolDeps {
   readonly toolRegistry?: ToolRegistry;
   /** Builds a tenant-scoped connection resolver for the run's tenant. */
   readonly resolverFactory?: (tenantId: string) => ConnectionResolver;
+  /**
+   * Builds a tenant-scoped effect ledger for the run's tenant. Optional: when
+   * absent, tool calls run directly (the pre-ledger behaviour) — external effects
+   * are then plain at-least-once with no reservation. When present, every tool
+   * call the handler makes is reserved and made retry-safe.
+   */
+  readonly effectLedgerFactory?: (tenantId: string) => EffectLedger;
 }
 
 export class LlmStepHandler implements StepHandler {
   private readonly toolRegistry: ToolRegistry | undefined;
   private readonly resolverFactory: ((tenantId: string) => ConnectionResolver) | undefined;
+  private readonly effectLedgerFactory: ((tenantId: string) => EffectLedger) | undefined;
 
   constructor(
     private readonly provider: LlmProvider,
@@ -138,6 +148,7 @@ export class LlmStepHandler implements StepHandler {
   ) {
     this.toolRegistry = deps.toolRegistry;
     this.resolverFactory = deps.resolverFactory;
+    this.effectLedgerFactory = deps.effectLedgerFactory;
   }
 
   async execute(execution: StepExecution): Promise<StepResult> {
@@ -248,7 +259,11 @@ export class LlmStepHandler implements StepHandler {
 
     const registry = this.toolRegistry;
     const resolver = this.resolverFactory(tenantId);
-    const toolExecutor = new ToolExecutor(registry, resolver);
+    // The effect ledger is optional wiring: with it, every tool call this step
+    // makes is reserved and made retry-safe; without it the executor calls the
+    // connector directly, exactly as before the ledger existed.
+    const effectLedger = this.effectLedgerFactory?.(tenantId);
+    const toolExecutor = new ToolExecutor(registry, resolver, effectLedger);
 
     // Two maps, built once. `toolDefs` is the ONLY thing the model sees. `refByName`
     // holds the trusted connection binding; its provider is sourced from the REGISTRY
@@ -270,6 +285,11 @@ export class LlmStepHandler implements StepHandler {
       { provider: this.provider.name, model, tool_count: toolDefs.length, max_tool_rounds: maxRounds },
       'llm_step_started',
     );
+    // A per-step monotonic counter over EVERY tool call across all rounds. It is the
+    // final component of each effect's idempotency key, so a given call reserves the
+    // same ledger row on every re-execution of the step while two distinct calls never
+    // collide. It advances once per call issued, before the call runs.
+    let ordinal = 0;
     // TOOL_LOOP_PLACEHOLDER
     for (let round = 1; round <= maxRounds; round += 1) {
       let turn: LlmToolTurn;
@@ -312,7 +332,8 @@ export class LlmStepHandler implements StepHandler {
       // recoverable tool result and then hidden by a subsequent "final" answer.
       const outcomes: ToolCallOutcome[] = [];
       for (const call of turn.toolCalls) {
-        outcomes.push(await this.runToolCall({ call, refByName, toolExecutor, tenantId, execution, round }));
+        ordinal += 1;
+        outcomes.push(await this.runToolCall({ call, refByName, toolExecutor, tenantId, execution, round, ordinal }));
       }
 
       const failures = outcomes.filter((o) => o.failure !== undefined);
@@ -327,7 +348,16 @@ export class LlmStepHandler implements StepHandler {
           'llm_step_failed',
         );
         const message = `llm tool call(s) failed in round ${round}: ${codes.join(', ')}`;
-        const details = { round, codes };
+        // Carry forward the ledger's explicit reschedule hint if any failing call
+        // deferred against another attempt's live reservation. Take the longest such
+        // hint in the round so the retry lands past every live lease. Only meaningful
+        // on the retryable path — a permanent failure never reschedules.
+        const retryAfterMs = failures.reduce<number | undefined>((max, o) => {
+          const hint = o.failure!.retryAfterMs;
+          if (hint === undefined) return max;
+          return max === undefined ? hint : Math.max(max, hint);
+        }, undefined);
+        const details = { round, codes, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
         if (retryable) {
           throw new RetryableError('llm_tool_call_failed', message, { details });
         }
@@ -370,8 +400,9 @@ export class LlmStepHandler implements StepHandler {
     tenantId: string;
     execution: StepExecution;
     round: number;
+    ordinal: number;
   }): Promise<ToolCallOutcome> {
-    const { call, refByName, toolExecutor, tenantId, execution, round } = params;
+    const { call, refByName, toolExecutor, tenantId, execution, round, ordinal } = params;
     const logger = execution.logger;
     logger?.info({ tool: call.name, round, call_id: call.id }, 'llm_tool_call_requested');
 
@@ -388,6 +419,22 @@ export class LlmStepHandler implements StepHandler {
     }
 
     logger?.info({ tool: call.name, round, call_id: call.id }, 'llm_tool_call_started');
+    // Effect metadata lets the executor reserve this call in the ledger. It is
+    // supplied ONLY when the engine gave us both a run id and a fresh per-attempt
+    // stepRunId (the reservation owner): the key must be stable across attempts of
+    // the same step, and the owner must be unique per attempt. Absent either, the
+    // executor falls back to a direct connector call — the pre-ledger behaviour.
+    const effectMetadata =
+      execution.runId !== undefined && execution.stepRunId !== undefined
+        ? {
+            metadata: {
+              idempotencyKey: `${execution.runId}:${execution.step.key}:${call.name}:${ordinal}`,
+              ordinal,
+              stepKey: execution.step.key,
+              effectLeaseMs: DEFAULT_EFFECT_LEASE_MS,
+            },
+          }
+        : {};
     const result = await toolExecutor.execute(
       { id: call.id, name: call.name, arguments: call.arguments },
       {
@@ -396,6 +443,7 @@ export class LlmStepHandler implements StepHandler {
           toolName: call.name,
           ...(execution.runId !== undefined ? { runId: execution.runId } : {}),
           ...(execution.stepRunId !== undefined ? { stepRunId: execution.stepRunId } : {}),
+          ...effectMetadata,
         },
         connectionRef,
         ...(logger !== undefined ? { logger } : {}),
@@ -410,10 +458,11 @@ export class LlmStepHandler implements StepHandler {
     // decision. The model-facing `result` still carries only the safe `{code, message}`.
     const code = result.error?.code ?? 'tool_error';
     const retryable = result.error?.retryable ?? false;
+    const retryAfterMs = result.error?.retryAfterMs;
     logger?.warn({ tool: call.name, round, call_id: call.id, err_code: code }, 'llm_tool_call_failed');
     return {
       result: { id: call.id, error: { code, message: result.error?.message ?? 'tool execution failed' } },
-      failure: { code, retryable },
+      failure: { code, retryable, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
     };
   }
 }
@@ -428,7 +477,16 @@ export class LlmStepHandler implements StepHandler {
  */
 interface ToolCallOutcome {
   readonly result: LlmToolResult;
-  readonly failure?: { readonly code: string; readonly retryable: boolean };
+  readonly failure?: {
+    readonly code: string;
+    readonly retryable: boolean;
+    /**
+     * The ledger's explicit reschedule hint, propagated from the executor's
+     * {@link ToolError} when this call deferred against another attempt's live
+     * reservation. The round takes the max across failures into its retryable throw.
+     */
+    readonly retryAfterMs?: number;
+  };
 }
 
 /**
@@ -490,6 +548,11 @@ export interface DefaultStepHandlerRegistryOptions {
   readonly toolRegistry?: ToolRegistry;
   /** Builds a tenant-scoped connection resolver for a run's tenant. */
   readonly resolverFactory?: (tenantId: string) => ConnectionResolver;
+  /**
+   * Builds a tenant-scoped effect ledger for a run's tenant. Omitted → tool calls
+   * run directly (the pre-ledger behaviour); a no-tools step is unaffected either way.
+   */
+  readonly effectLedgerFactory?: (tenantId: string) => EffectLedger;
 }
 
 /** The registry the worker wires in production: every step type the MVP supports. */
@@ -499,6 +562,7 @@ export function defaultStepHandlerRegistry(
   const toolDeps: LlmToolDeps = {
     ...(options.toolRegistry !== undefined ? { toolRegistry: options.toolRegistry } : {}),
     ...(options.resolverFactory !== undefined ? { resolverFactory: options.resolverFactory } : {}),
+    ...(options.effectLedgerFactory !== undefined ? { effectLedgerFactory: options.effectLedgerFactory } : {}),
   };
   const llmHandler: StepHandler =
     options.llmProvider !== undefined

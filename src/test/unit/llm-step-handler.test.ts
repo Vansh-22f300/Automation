@@ -28,6 +28,7 @@ import type {
   SlackTransport,
 } from '@/connectors/slack/index.js';
 import type { AuthorizedConnection, ConnectionRef, ConnectionResolver } from '@/domain/connection.js';
+import type { EffectAcquisition, EffectFailureDisposition, EffectLedger, EffectReservation } from '@/domain/effect-ledger.js';
 import { PermanentError, RetryableError } from '@/domain/errors.js';
 import { ExecutionContext } from '@/domain/execution-context.js';
 import { LlmStepHandler } from '@/domain/step-handler.js';
@@ -610,4 +611,52 @@ describe('LlmStepHandler (tool-failure semantics)', () => {
     expect(provider.converseCalls).toBe(1);
     expect(provider.converseRequests.some((r) => r.messages.some((m) => m.role === 'tool'))).toBe(false);
   });
+
+  it('threads the ledger defer reschedule hint into the round-level RetryableError', async () => {
+    // When the effect ledger defers (another attempt holds a live reservation), the
+    // executor raises a retryable `effect_pending_elsewhere` carrying `retryAfterMs`.
+    // The handler must surface that hint on the round-level RetryableError so the
+    // engine can reschedule past the live lease instead of using the short backoff.
+    const provider = new FakeLlmProvider({
+      structuredData: { category: 'spam' },
+      converseTurns: [
+        { kind: 'tool_use', toolCalls: [slackCall({ channel: 'C123TEST', text: 'x' })] },
+        { kind: 'final' }, // must not be reached — the deferred round throws first
+      ],
+    });
+    const transport = new SequencedSlackTransport([]); // the connector must NEVER be called on a defer
+    const ledgerFactory = (): EffectLedger => new DeferringEffectLedger(123_000);
+    const handler = new LlmStepHandler(provider, {
+      toolRegistry: createSlackToolRegistry({ transport }),
+      resolverFactory: () => new FakeConnectionResolver(),
+      effectLedgerFactory: ledgerFactory,
+    });
+
+    const error = await runAndCatch(handler);
+
+    expect(error).toBeInstanceOf(RetryableError);
+    expect(error).toMatchObject({ code: 'llm_tool_call_failed', retryable: true });
+    expect((error as RetryableError).details).toMatchObject({ retryAfterMs: 123_000 });
+    // The reservation deferred, so the external effect was never attempted.
+    expect(transport.calls).toBe(0);
+  });
 });
+
+/**
+ * An {@link EffectLedger} that always defers — the "another attempt holds a live
+ * reservation" outcome. It never lets the connector run, exactly as a real live
+ * reservation would, so a test can prove the reschedule hint propagates without any
+ * database.
+ */
+class DeferringEffectLedger implements EffectLedger {
+  constructor(private readonly retryAfterMs: number) {}
+  acquire(_reservation: EffectReservation): Promise<EffectAcquisition> {
+    return Promise.resolve({ kind: 'defer', retryAfterMs: this.retryAfterMs });
+  }
+  settleSuccess(): Promise<void> {
+    return Promise.resolve();
+  }
+  settleFailure(_r: EffectReservation, _d: EffectFailureDisposition): Promise<void> {
+    return Promise.resolve();
+  }
+}

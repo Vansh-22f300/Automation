@@ -93,6 +93,25 @@ function render(view: RunInspection): string {
       lines.push(`  step=${t.stepKey}  rounds=${t.rounds}  used_tools=${t.usedTools}  tool_rounds=${t.toolRounds}`);
     }
   }
+  // External-effect ledger, detail mode only. `view.toolEffects` is present iff the
+  // run was fetched with --detail. An `ambiguous` effect is the reason this section
+  // exists — an external call whose outcome is unknown after a crash — so it is
+  // marked with a leading `!! AMBIGUOUS` an operator cannot miss when scanning.
+  if (view.toolEffects !== undefined) {
+    lines.push('');
+    lines.push(`external effects (${view.toolEffects.length}), execution order:`);
+    const ambiguousCount = view.toolEffects.filter((x) => x.ambiguous).length;
+    if (ambiguousCount > 0) {
+      lines.push(`  !! ${ambiguousCount} AMBIGUOUS effect(s) — outcome unknown, not auto-resent; reconcile manually`);
+    }
+    for (const x of view.toolEffects) {
+      const marker = x.ambiguous ? '!! AMBIGUOUS ' : '';
+      lines.push(
+        `  ${marker}step=${x.stepKey}  tool=${x.toolName}  #${x.ordinal}  ${x.provider}  state=${x.state}`,
+      );
+      if (x.error !== null) lines.push(`    error=${x.error.code}: ${x.error.message}`);
+    }
+  }
   const tot = view.usageTotals;
   lines.push('');
   lines.push(

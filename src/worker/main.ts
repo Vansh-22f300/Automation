@@ -48,6 +48,7 @@ import { createSlackToolRegistry } from '@/connectors/slack/index.js';
 import { createDatabase } from '@/db/client.js';
 import { workflowRuns } from '@/db/schema.js';
 import type { ConnectionResolver } from '@/domain/connection.js';
+import type { EffectLedger } from '@/domain/effect-ledger.js';
 import { isAppError } from '@/domain/errors.js';
 import { newId } from '@/domain/ids.js';
 import type { LlmProvider } from '@/domain/llm.js';
@@ -56,6 +57,7 @@ import { createRetryPolicy } from '@/domain/retry-policy.js';
 import { createClaudeProvider } from '@/llm/claude-provider.js';
 import { createLogger } from '@/observability/logger.js';
 import { ConnectionRepository } from '@/repositories/connection-repository.js';
+import { EffectLedgerRepository } from '@/repositories/effect-ledger-repository.js';
 import { WorkflowExecutor } from '@/repositories/execution-engine.js';
 import { PostgresJobQueue } from '@/repositories/job-queue.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
@@ -132,6 +134,13 @@ const toolRegistry = createSlackToolRegistry({ logger });
 const cipher = createCredentialCipher(env, { logger });
 const resolverFactory = (tenantId: string): ConnectionResolver =>
   new ConnectionRepository(new TenantScope(database.db, tenantId), cipher);
+// The effect ledger makes each tool call retry-safe: it reserves the external
+// effect under `(tenant_id, idempotency_key)` and settles the outcome durably, so a
+// redelivered job replays a stored success instead of resending, and an unknown
+// outcome surfaces as ambiguous rather than silently duplicating. Bound per tenant,
+// exactly like the resolver.
+const effectLedgerFactory = (tenantId: string): EffectLedger =>
+  new EffectLedgerRepository(database.db, tenantId);
 
 /** The worker's job-validity check: does this run still exist for this tenant? */
 const runExists: RunExistenceCheck = async (tenantId, runId) => {
@@ -155,6 +164,7 @@ const worker = new Worker({
       ...(llmProvider !== undefined ? { llmProvider } : {}),
       toolRegistry,
       resolverFactory,
+      effectLedgerFactory,
     }),
     logger,
     retryPolicy,

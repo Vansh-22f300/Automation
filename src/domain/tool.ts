@@ -48,9 +48,18 @@ export interface ToolError {
   readonly message: string;
   /**
    * Whether re-executing could plausibly succeed. Carried forward from the error's
-   * classification for the future retry engine (Step 11); 9A never acts on it.
+   * classification for the retry engine.
    */
   readonly retryable: boolean;
+  /**
+   * An explicit reschedule hint, in milliseconds, that must OVERRIDE the retry
+   * policy's backoff for this failure. Set only by the effect ledger when it
+   * defers an attempt against another attempt's LIVE reservation: the deferral
+   * has to outlast that reservation's lease, which the exponential backoff curve
+   * (a ~15-31s total budget) is far too short to guarantee. Absent for every
+   * ordinary failure, whose scheduling stays the retry policy's business.
+   */
+  readonly retryAfterMs?: number;
 }
 
 /**
@@ -94,6 +103,55 @@ export interface ConnectorRequest<Args = unknown> {
 }
 
 /**
+ * Whether repeating an external effect is *safe*, as asserted by the connector
+ * that raised the failure. This is orthogonal to the queue's `retryable` flag:
+ * `retryable` says a retry could succeed; `effectSafety` says whether re-running
+ * the operation risks a duplicate external effect.
+ *
+ * - `safe`      — the connector GUARANTEES the external write did NOT execute
+ *                 (e.g. a structured pre-flight rate-limit rejection, an HTTP 429
+ *                 before the request was accepted). Only then may the effect
+ *                 ledger release the reservation for a genuine re-execution.
+ * - `ambiguous` — the outcome cannot be established: the write may have happened.
+ *                 The ledger must NOT auto-resend a `hold_ambiguous` effect.
+ *
+ * A connector carries this on the raised error as `details.effectSafety` (see
+ * {@link EFFECT_SAFETY_DETAIL_KEY}). It is INTERNAL, TRUSTED metadata set in
+ * connector code — never derived from a model, tool arguments, or an external
+ * payload. The fail-safe rule is absolute: a missing or unrecognised value is
+ * treated as `ambiguous`. There is no third "unknown" state at rest — the
+ * ledger collapses anything that is not explicitly `safe` to `ambiguous`.
+ */
+export type EffectSafety = 'safe' | 'ambiguous';
+
+/**
+ * The key under which a connector tags an error's {@link ErrorDetails} with its
+ * {@link EffectSafety} assertion. Centralised so the connector that writes it and
+ * the ledger that reads it cannot drift on a string literal.
+ */
+export const EFFECT_SAFETY_DETAIL_KEY = 'effectSafety';
+
+/**
+ * How the effect ledger recovers a reservation whose outcome is unknown
+ * (`ambiguous`) — the connector-declared policy for its whole provider.
+ *
+ * - `resend_safe`    — resend automatically. ONLY valid for a genuinely
+ *                      idempotent effect (a provider-side idempotency key, or a
+ *                      naturally idempotent operation). Not implemented yet.
+ * - `reconcile`      — query the provider to discover whether the effect landed,
+ *                      then settle accordingly. Requires a provider read path.
+ *                      Not implemented yet.
+ * - `hold_ambiguous` — do nothing automatic: settle the effect `ambiguous`, fail
+ *                      the run operator-visibly, never resend. The only safe
+ *                      default for a non-idempotent effect, and the only policy
+ *                      implemented in this step.
+ *
+ * A connector without a `recoveryPolicy` is treated as `hold_ambiguous`: the
+ * safe default, never a silent resend.
+ */
+export type EffectRecoveryPolicy = 'resend_safe' | 'reconcile' | 'hold_ambiguous';
+
+/**
  * A provider-neutral executor for one provider's operations. It is handed validated
  * arguments and a resolved credential and returns a non-secret output, or throws a
  * classified error. It must never return the credential or a raw token in its
@@ -102,6 +160,13 @@ export interface ConnectorRequest<Args = unknown> {
 export interface Connector<Args = unknown> {
   /** Stable provider identifier (e.g. 'slack'). Matches the connection's provider. */
   readonly provider: string;
+  /**
+   * How the effect ledger should recover an ambiguous effect from this provider.
+   * Omitted ⇒ {@link EffectRecoveryPolicy} `hold_ambiguous` — the safe default.
+   * The ledger reads this only when it has already decided an outcome is
+   * ambiguous; a `safe` retryable failure is released regardless of this value.
+   */
+  readonly recoveryPolicy?: EffectRecoveryPolicy;
   execute(request: ConnectorRequest<Args>): Promise<unknown>;
 }
 

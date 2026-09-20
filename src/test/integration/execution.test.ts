@@ -323,6 +323,34 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('workflow execution engine inte
       expect(await pendingJobsFor(runId)).toHaveLength(1);
     });
 
+    it('prefers a ledger retryAfterMs hint over the backoff curve when scheduling a retry', async () => {
+      // The effect ledger, when it defers an attempt against another attempt's live
+      // reservation, raises a retryable failure carrying `retryAfterMs`. The engine
+      // must schedule the retry at that horizon, NOT the backoff curve — here the
+      // backoff is zero, so a hint-ignoring engine would set run_at ≈ now. A hint of
+      // 200s (under the 900s job-lease cap) must push run_at ~200s out instead.
+      const { runId } = await seed(tenantA, 'retry-hinted', 'first');
+      const deferringRegistry = new StepHandlerRegistry();
+      deferringRegistry.register('noop', {
+        execute: () =>
+          Promise.reject(
+            new RetryableError('effect_pending_elsewhere', 'another attempt holds a live reservation', {
+              details: { retryAfterMs: 200_000 },
+            }),
+          ),
+      });
+
+      const before = Date.now();
+      expect(await processOne(executorRetrying(deferringRegistry))).toBe('retried');
+
+      const [job] = await handle.db.select().from(jobs).where(eq(jobs.runId, runId));
+      expect(job!.status).toBe('pending');
+      // run_at is ~200s out (the hint), decisively past the zero-backoff "now".
+      const scheduledInMs = job!.runAt.getTime() - before;
+      expect(scheduledInMs).toBeGreaterThan(150_000);
+      expect(scheduledInMs).toBeLessThanOrEqual(200_000 + 5_000);
+    });
+
     it('exhausts the business budget and then fails the run terminally', async () => {
       const { runId } = await seed(tenantA, 'retry-exhaust', 'first');
       // Shrink the budget to keep the loop short: two retries, then terminal.

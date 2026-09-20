@@ -102,3 +102,64 @@ export const DEFAULT_LEASE_MS = 15 * 60 * 1_000;
  * Operators override it with `WORKER_SHUTDOWN_TIMEOUT_MS`.
  */
 export const DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+// ---------------------------------------------------------------------------
+// External-effect lease
+// ---------------------------------------------------------------------------
+//
+// A second, much shorter lease guards a single *external effect* (one tool call
+// reaching outside the system — see `tool_effects` and the effect ledger). It is
+// NOT the queue lease: the queue lease bounds a whole job (up to a 9m20s step),
+// whereas the effect lease bounds the reserve → connector-call → settle window
+// around one external call. Its job is to answer, when a second attempt finds a
+// reservation still `pending`: "is an attempt still working on this effect
+// (defer), or did one die holding it (ambiguous)?"
+//
+// THE INVARIANT (verified by `src/test/unit/timing.test.ts`):
+//
+//     TOOL_CALL_TIMEOUT_BUDGET_MS  <  DEFAULT_EFFECT_LEASE_MS  <  DEFAULT_LEASE_MS
+//              (10s, one connector call)   (120s)                   (15m, job lease)
+//
+// - The lower bound (10s < 120s) is what makes the lease *meaningful*. The
+//   connector caps a single call with an `AbortController` at 10s, and the
+//   executor settles the effect the moment that call returns — so in every
+//   healthy path the reservation settles far inside its lease. A lease at or
+//   below the connector timeout could expire while a legitimate call is still in
+//   flight, and a second attempt would conclude "crashed / ambiguous" about an
+//   effect that was simply still running: false ambiguity, and lost recoverable
+//   work. 120s clears 10s by more than 10×, absorbing GC pauses, pool waits and
+//   a slow settlement commit.
+// - The upper bound (120s < 15m) keeps the effect lease strictly shorter than
+//   the job that owns it. There is no point asserting an attempt still holds an
+//   effect for longer than the job could itself survive; and it guarantees a
+//   crashed attempt's effect lease expires (→ recoverable as ambiguous) well
+//   before its job lease would even be reaped.
+//
+// Deliberately NOT configurable per call, for the same reason the queue lease is
+// not: a lease a caller could shorten is a lease that cannot be reasoned about.
+
+/**
+ * The lease a single external-effect reservation is granted: 120 seconds. Sits
+ * an order of magnitude above one connector call (10s) and well below the job
+ * lease (15m) — see the invariant above.
+ */
+export const DEFAULT_EFFECT_LEASE_MS = 120_000;
+
+/**
+ * Extra buffer a deferring attempt waits *past* a live reservation's lease
+ * horizon before it re-checks the ledger.
+ *
+ * When an attempt finds an effect `pending` with a still-live lease (another
+ * attempt is working it), it does not touch the row — it reschedules its own job
+ * for `(lease_expires_at − now) + EFFECT_SETTLEMENT_MARGIN_MS`. Because there is
+ * no lease renewal, one deferral must land *after* the owner has either settled
+ * the effect or crashed and let the lease lapse; the margin is the safety gap on
+ * top of the lease horizon that absorbs settlement-commit latency and worker/DB
+ * clock skew, so the deferring attempt never wakes up racing the lease expiry.
+ *
+ * This is an ADDITIVE buffer, not a term inside the lease invariant above: it is
+ * added to the *remaining* lease, so it is by design free to exceed the lease
+ * itself. Its only hard requirement is to be positive. 110s comfortably clears
+ * the 30s statement/idle-in-transaction timeouts that bound a settlement commit.
+ */
+export const EFFECT_SETTLEMENT_MARGIN_MS = 110_000;

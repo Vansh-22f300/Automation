@@ -18,8 +18,10 @@ import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_SLACK_TIMEOUT_MS } from '@/connectors/slack/slack-client.js';
 import {
+  DEFAULT_EFFECT_LEASE_MS,
   DEFAULT_LEASE_MS,
   DEFAULT_WORKER_SHUTDOWN_TIMEOUT_MS,
+  EFFECT_SETTLEMENT_MARGIN_MS,
   LEASE_SAFETY_MARGIN_MS,
   LLM_ROUND_TIMEOUT_BUDGET_MS,
   MAX_LEGITIMATE_STEP_DURATION_MS,
@@ -92,6 +94,44 @@ describe('DEFAULT_LEASE_MS', () => {
       STEP_OVERHEAD_BUDGET_MS;
 
     expect(DEFAULT_LEASE_MS).toBeGreaterThan(pessimistic);
+  });
+});
+
+describe('DEFAULT_EFFECT_LEASE_MS', () => {
+  it('is the documented 120 seconds', () => {
+    expect(DEFAULT_EFFECT_LEASE_MS).toBe(120_000);
+  });
+
+  it('sits strictly above one connector call and below the job lease', () => {
+    // The load-bearing effect-lease invariant:
+    //   max connector execution < effect lease < job lease.
+    // Break either bound and the effect ledger either declares a still-running
+    // call "ambiguous" (lower bound) or asserts an effect held longer than its
+    // own job could survive (upper bound).
+    expect(TOOL_CALL_TIMEOUT_BUDGET_MS).toBeLessThan(DEFAULT_EFFECT_LEASE_MS);
+    expect(DEFAULT_EFFECT_LEASE_MS).toBeLessThan(DEFAULT_LEASE_MS);
+  });
+
+  it('clears one connector call by more than a factor of ten', () => {
+    // Not a taste check: the settlement after a returned connector call must fit
+    // comfortably inside the lease, so the healthy path never brushes expiry.
+    expect(DEFAULT_EFFECT_LEASE_MS).toBeGreaterThan(TOOL_CALL_TIMEOUT_BUDGET_MS * 10);
+  });
+});
+
+describe('EFFECT_SETTLEMENT_MARGIN_MS', () => {
+  it('is a positive additive defer buffer', () => {
+    // Added to the *remaining* lease when deferring against a live reservation,
+    // so it is deliberately free to exceed the lease; its only hard requirement
+    // is to be positive so one deferral lands strictly past the lease horizon.
+    expect(EFFECT_SETTLEMENT_MARGIN_MS).toBeGreaterThan(0);
+  });
+
+  it('clears the 30s statement/idle-in-transaction settlement bound', () => {
+    // A settlement commit is bounded by the 30s statement and
+    // idle-in-transaction timeouts in `db/client.ts`; the margin must exceed
+    // that so a deferring attempt cannot wake while the owner is still settling.
+    expect(EFFECT_SETTLEMENT_MARGIN_MS).toBeGreaterThan(30_000);
   });
 });
 

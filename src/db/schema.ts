@@ -158,6 +158,46 @@ export const workflowStepRunStatus = pgEnum('workflow_step_run_status', [
  */
 export const connectionStatus = pgEnum('connection_status', ['active', 'disabled', 'error']);
 
+/**
+ * The durable state of a single external effect — one attempt to run one tool
+ * call against one external provider, keyed by an idempotency key stable across
+ * job retries.
+ *
+ *   pending → succeeded
+ *           ↘ failed
+ *           ↘ ambiguous
+ *   pending → pending (owner released to NULL: a prior attempt failed in a way
+ *             the connector guaranteed the external write did NOT happen, so the
+ *             next attempt may safely re-execute)
+ *
+ * The four states are the whole point of this table and must be read precisely:
+ * - `pending`   — reserved; an attempt either holds it (owner set, lease live)
+ *                 or released it as safe-to-retry (owner NULL, re-executable).
+ * - `succeeded` — the external effect completed; the stored result is replayed
+ *                 to any later attempt instead of re-executing.
+ * - `failed`    — a deterministic (permanent) failure; the effect did not happen
+ *                 and never will for these arguments. Re-thrown, never re-run.
+ * - `ambiguous` — TERMINAL. The external operation may or may not have happened
+ *                 and the outcome cannot be established (a lost response after a
+ *                 request that could have been delivered, or an attempt that
+ *                 crashed holding the reservation). A `hold_ambiguous` connector
+ *                 never automatically re-runs it; the run fails operator-visibly.
+ *
+ * This is deliberately NOT exactly-once. External effects remain at-least-once
+ * across the irreducible crash window between "external side effect executed"
+ * and "durable settlement committed". This table's job is to make the common
+ * paths safe (replay a known success, re-run only a guaranteed-not-executed
+ * failure) and to make the unknowable path SAFE-BY-DEFAULT (ambiguous, no
+ * silent resend) — not to eliminate a window that no single-writer external
+ * transport allows us to close.
+ */
+export const toolEffectState = pgEnum('tool_effect_state', [
+  'pending',
+  'succeeded',
+  'failed',
+  'ambiguous',
+]);
+
 
 // ---------------------------------------------------------------------------
 // tenants
@@ -908,6 +948,142 @@ export const connections = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// tool_effects
+// ---------------------------------------------------------------------------
+
+/**
+ * The durable ledger of external effects — the idempotency and recovery record
+ * for every tool call that reaches outside the system (posting a Slack message,
+ * later: sending mail, opening a PR).
+ *
+ * WHY THIS TABLE EXISTS. The engine runs a step handler *outside* any database
+ * transaction (the two-transaction model — beginStep, then the handler, then
+ * settleStep). A tool call inside that handler is an external side effect that
+ * has already happened by the time control returns. Two failure shapes make a
+ * naive "just retry the job" unsafe:
+ *
+ *   1. Sequential retry after a lost settlement. The effect succeeded, but the
+ *      process died (or the settling transaction was lost) before the success
+ *      was recorded. The job is redelivered and, without this ledger, the effect
+ *      runs a SECOND time.
+ *   2. Concurrent duplicate execution. A job's lease expired (the worker stalled
+ *      but did not die), the reaper handed the job to a second worker, and now
+ *      two workers execute the same tool call at once.
+ *
+ * The ledger closes both by making a DB uniqueness constraint the ONE
+ * concurrency boundary. An attempt reserves its effect with a single
+ * `INSERT … ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING *`:
+ * exactly one attempt wins the row, everyone else observes the existing row and
+ * branches on its state. There is no SELECT-before-INSERT, so there is no
+ * time-of-check/time-of-use gap for two workers to both pass.
+ *
+ * WHAT IT DELIBERATELY IS NOT. This is not exactly-once. Between "Slack accepted
+ * the POST" and "we committed `succeeded`" there is an irreducible window; a
+ * crash inside it leaves the effect done but the row `pending` with a live-then-
+ * expired lease, which is exactly the `ambiguous` outcome — recorded, surfaced,
+ * and never silently resent. At-least-once with a safe-by-default unknown path
+ * is the honest guarantee an external transport permits.
+ *
+ * COLUMNS THAT CARRY THE STATE MACHINE.
+ * - `idempotency_key` — `<runId>:<stepKey>:<toolName>:<ordinal>`. Stable across
+ *   job retries (it excludes attempt/retryCount/stepRunId and the model call id),
+ *   so a redelivered job reserves the SAME key and collides with its own prior
+ *   attempt. `ordinal` is a per-step monotonic counter over all tool calls across
+ *   rounds; the key is stable only insofar as the model re-emits the same
+ *   tool-call sequence on re-execution (documented limitation, not a guarantee).
+ * - `owner` — the `stepRunId` of the attempt currently holding the reservation,
+ *   or NULL. It is the CAS discriminator that separates the two `pending` shapes:
+ *   owner NULL means a prior attempt released the effect as guaranteed-safe to
+ *   re-run; owner NOT NULL with an EXPIRED lease means an attempt crashed holding
+ *   it — indistinguishable from a completed-but-unsettled effect, hence ambiguous.
+ * - `lease_expires_at` — the effect lease (`DEFAULT_EFFECT_LEASE_MS`), sized so
+ *   the longest possible connector execution finishes well inside it and the
+ *   job lease outlives it: max connector exec < effect lease < job lease. A live
+ *   lease means "an attempt is still working; defer, do not touch". There is no
+ *   renewal, so a live lease is deferred against at most once.
+ * - `result` / `error` — the NORMALISED, non-secret connector outcome. Never a
+ *   token, header, credential, prompt, or raw argument set: only what a later
+ *   attempt needs to replay a success or re-throw a permanent failure.
+ *
+ * Tenant safety is the composite foreign key `(tenant_id, run_id) →
+ * workflow_runs(tenant_id, id)`, exactly as `jobs`, `workflow_step_runs` and
+ * `llm_usage` have it — an effect for another tenant's run is unrepresentable.
+ */
+export const toolEffects = pgTable(
+  'tool_effects',
+  {
+    id: primaryId(),
+    /** Denormalised from the run's tenant; kept honest by the composite FK below. */
+    tenantId: uuid('tenant_id').notNull(),
+    /** The run whose step made this external call. */
+    runId: uuid('run_id').notNull(),
+    /** The step key within the run's pinned definition that issued the call. */
+    stepKey: text('step_key').notNull(),
+    /** The tool that produced the effect, e.g. `send_slack_message`. */
+    toolName: text('tool_name').notNull(),
+    /**
+     * Per-step monotonic index of this tool call across all provider rounds of
+     * the step. Part of the idempotency key; disambiguates two calls to the same
+     * tool within one step.
+     */
+    ordinal: integer('ordinal').notNull(),
+    /**
+     * `<runId>:<stepKey>:<toolName>:<ordinal>` — the reservation key. Unique per
+     * tenant (see the constraint below), so the atomic INSERT … ON CONFLICT on it
+     * is the sole concurrency boundary for the effect.
+     */
+    idempotencyKey: text('idempotency_key').notNull(),
+    /** Stable provider identifier, e.g. `slack`. Mirrors the connector's provider. */
+    provider: text('provider').notNull(),
+    state: toolEffectState('state').notNull().default('pending'),
+    /**
+     * The `stepRunId` of the attempt holding the reservation, or NULL. NULL is
+     * load-bearing: it marks a `pending` row a prior attempt released as
+     * guaranteed-safe to re-execute. Not a foreign key — it is a CAS token whose
+     * only job is to be compared, not to enforce referential integrity.
+     */
+    owner: uuid('owner'),
+    /** When the effect lease expires. Live ⇒ an attempt is working; defer. */
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true, mode: 'date' }),
+    /** The normalised, non-secret success result, replayed to later attempts. Null unless succeeded. */
+    result: jsonb('result').$type<unknown>(),
+    /** The normalised, log-safe failure, re-thrown to later attempts. Null unless failed/ambiguous. */
+    error: jsonb('error').$type<Record<string, unknown>>(),
+    ...timestamps(),
+  },
+  (t) => [
+    /**
+     * The effect's run must be in the effect's tenant — the same composite-FK
+     * tenant guard `jobs`/`workflow_step_runs`/`llm_usage` use.
+     */
+    foreignKey({
+      name: 'tool_effects_tenant_id_run_id_fkey',
+      columns: [t.tenantId, t.runId],
+      foreignColumns: [workflowRuns.tenantId, workflowRuns.id],
+    }).onDelete('cascade'),
+
+    /**
+     * THE concurrency boundary. Reservation is `INSERT … ON CONFLICT
+     * (tenant_id, idempotency_key) DO NOTHING RETURNING *`; this constraint is
+     * what makes exactly one concurrent attempt win the row. Scoped to the tenant
+     * so keys are independent across tenants.
+     */
+    unique('tool_effects_tenant_id_idempotency_key_key').on(t.tenantId, t.idempotencyKey),
+
+    /**
+     * The recovery-sweep path: reservations still `pending` and their lease
+     * horizon. A partial index over `lease_expires_at`, restricted to `pending`
+     * rows, so an operator (or a future reconcile policy) can find stuck or
+     * expired-lease reservations without scanning settled effects. Mirrors the
+     * shape of `jobs_running_lease_expires_at_idx`.
+     */
+    index('tool_effects_pending_lease_expires_at_idx')
+      .on(t.leaseExpiresAt)
+      .where(sql`${t.state} = 'pending'`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Relations
 // ---------------------------------------------------------------------------
 //
@@ -926,6 +1102,7 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   stepRuns: many(workflowStepRuns),
   llmUsage: many(llmUsage),
   connections: many(connections),
+  toolEffects: many(toolEffects),
 }));
 
 export const usersRelations = relations(users, ({ one }) => ({
@@ -971,6 +1148,7 @@ export const workflowRunsRelations = relations(workflowRuns, ({ one, many }) => 
   jobs: many(jobs),
   stepRuns: many(workflowStepRuns),
   llmUsage: many(llmUsage),
+  toolEffects: many(toolEffects),
 }));
 
 export const workflowStepRunsRelations = relations(workflowStepRuns, ({ one, many }) => ({
@@ -998,6 +1176,11 @@ export const jobsRelations = relations(jobs, ({ one }) => ({
 
 export const connectionsRelations = relations(connections, ({ one }) => ({
   tenant: one(tenants, { fields: [connections.tenantId], references: [tenants.id] }),
+}));
+
+export const toolEffectsRelations = relations(toolEffects, ({ one }) => ({
+  tenant: one(tenants, { fields: [toolEffects.tenantId], references: [tenants.id] }),
+  run: one(workflowRuns, { fields: [toolEffects.runId], references: [workflowRuns.id] }),
 }));
 
 // ---------------------------------------------------------------------------
@@ -1039,3 +1222,6 @@ export type NewLlmUsage = typeof llmUsage.$inferInsert;
 
 export type Connection = typeof connections.$inferSelect;
 export type NewConnection = typeof connections.$inferInsert;
+
+export type ToolEffect = typeof toolEffects.$inferSelect;
+export type NewToolEffect = typeof toolEffects.$inferInsert;

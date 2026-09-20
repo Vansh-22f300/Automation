@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { Event, Job, LlmUsage, Workflow, WorkflowRun, WorkflowStepRun, WorkflowVersion } from '@/db/schema.js';
+import type { Event, Job, LlmUsage, ToolEffect, Workflow, WorkflowRun, WorkflowStepRun, WorkflowVersion } from '@/db/schema.js';
 import { assembleRunInspection } from '@/domain/run-inspection.js';
 import type { RawRunData } from '@/domain/run-inspection.js';
 
@@ -116,6 +116,29 @@ const usage = (over: Partial<LlmUsage> = {}): LlmUsage =>
     createdAt: T(1_100),
     ...over,
   }) as LlmUsage;
+
+// Seeded with values that MUST NOT cross the inspection boundary — the idempotency
+// key, the owner/lease tokens, the stored result, and an error carrying a `details`
+// payload — so the safe-fields test can prove each is absent from the DTO.
+const toolEffect = (over: Partial<ToolEffect> = {}): ToolEffect =>
+  ({
+    id: 'te-1',
+    tenantId: 'tenant-1',
+    runId: 'run-1',
+    stepKey: 'a',
+    toolName: 'send_slack_message',
+    ordinal: 1,
+    idempotencyKey: 'run-1:a:send_slack_message:1',
+    provider: 'slack',
+    state: 'succeeded',
+    owner: 'sr-1',
+    leaseExpiresAt: null,
+    result: { channel: 'C123', ts: '1700000000.000100' },
+    error: null,
+    createdAt: T(1_120),
+    updatedAt: T(1_130),
+    ...over,
+  }) as ToolEffect;
 
 const base = (over: Partial<RawRunData> = {}): RawRunData => ({
   run: run(),
@@ -231,5 +254,92 @@ describe('assembleRunInspection — run error', () => {
       { detail: false, now: 2_000 },
     );
     expect(view.run.error).toEqual({ code: 'boom', message: 'nope' });
+  });
+});
+
+describe('assembleRunInspection — tool effects', () => {
+  it('shapes ledger rows into the DTO in detail mode: state, tool, ordinal, provider', () => {
+    const view = assembleRunInspection(
+      base({ toolEffects: [toolEffect()] }),
+      { detail: true, now: 2_000 },
+    );
+    expect(view.toolEffects).toEqual([
+      {
+        stepKey: 'a',
+        toolName: 'send_slack_message',
+        ordinal: 1,
+        provider: 'slack',
+        state: 'succeeded',
+        ambiguous: false,
+        error: null,
+      },
+    ]);
+  });
+
+  it('omits tool effects entirely on the summary (non-detail) surface', () => {
+    const view = assembleRunInspection(
+      base({ toolEffects: [toolEffect()] }),
+      { detail: false, now: 2_000 },
+    );
+    expect(view.toolEffects).toBeUndefined();
+  });
+
+  it('exposes only safe fields — never the idempotency key, owner, lease, result, or error details', () => {
+    const view = assembleRunInspection(
+      base({
+        toolEffects: [
+          toolEffect({
+            state: 'ambiguous',
+            error: {
+              code: 'effect_ambiguous',
+              message: 'crashed mid-send',
+              details: { token: 'xoxb-do-not-leak', channel: 'C-secret' },
+            },
+          }),
+        ],
+      }),
+      { detail: true, now: 2_000 },
+    );
+    const effect = view.toolEffects![0]!;
+    // Only the seven safe keys, nothing else.
+    expect(Object.keys(effect).sort()).toEqual(
+      ['ambiguous', 'error', 'ordinal', 'provider', 'state', 'stepKey', 'toolName'].sort(),
+    );
+    // toSafeError keeps {code, message}; it drops the details payload.
+    expect(effect.error).toEqual({ code: 'effect_ambiguous', message: 'crashed mid-send' });
+    const serialized = JSON.stringify(view.toolEffects);
+    expect(serialized).not.toContain('run-1:a:send_slack_message'); // idempotency key
+    expect(serialized).not.toContain('xoxb-do-not-leak'); // error details / secret
+    expect(serialized).not.toContain('C-secret'); // error details
+    expect(serialized).not.toContain('1700000000.000100'); // stored result ts
+    expect(serialized).not.toContain('sr-1'); // owner (step-run id token)
+  });
+
+  it('represents an ambiguous effect distinctly from a plain failure', () => {
+    const view = assembleRunInspection(
+      base({
+        steps: [
+          stepRun({ id: 'sr-1', stepKey: 'a', startedAt: T(1_100) }),
+          stepRun({ id: 'sr-2', stepKey: 'b', startedAt: T(1_300) }),
+        ],
+        toolEffects: [
+          // Out of execution order on input; expected sorted by step order then ordinal.
+          toolEffect({ id: 'te-b', stepKey: 'b', ordinal: 1, state: 'failed', error: { code: 'http_500', message: 'bad gateway' } }),
+          toolEffect({ id: 'te-a2', stepKey: 'a', ordinal: 2, state: 'ambiguous', error: { code: 'effect_ambiguous', message: 'unknown' } }),
+          toolEffect({ id: 'te-a1', stepKey: 'a', ordinal: 1, state: 'succeeded' }),
+        ],
+      }),
+      { detail: true, now: 2_000 },
+    );
+    expect(view.toolEffects!.map((e) => [e.stepKey, e.ordinal, e.state, e.ambiguous])).toEqual([
+      ['a', 1, 'succeeded', false],
+      ['a', 2, 'ambiguous', true],
+      ['b', 1, 'failed', false],
+    ]);
+    // `ambiguous` is a distinct boolean, not conflated with the `failed` state.
+    const failed = view.toolEffects!.find((e) => e.state === 'failed')!;
+    expect(failed.ambiguous).toBe(false);
+    const ambiguous = view.toolEffects!.find((e) => e.state === 'ambiguous')!;
+    expect(ambiguous.ambiguous).toBe(true);
   });
 });

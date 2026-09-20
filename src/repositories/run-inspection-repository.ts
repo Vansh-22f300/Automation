@@ -20,6 +20,7 @@ import {
   events,
   jobs,
   llmUsage,
+  toolEffects,
   workflowRuns,
   workflowStepRuns,
   workflowVersions,
@@ -134,7 +135,9 @@ export class RunInspectionRepository
       );
     if (run === undefined) return null;
 
-    const [workflowRows, versionRows, eventRows, steps, jobRows, usage] =
+    const detail = options.detail ?? false;
+
+    const [workflowRows, versionRows, eventRows, steps, jobRows, usage, effects] =
       await Promise.all([
         this.db
           .select()
@@ -179,6 +182,19 @@ export class RunInspectionRepository
           .where(
             this.scope.where(llmUsage.tenantId, eq(llmUsage.runId, runId)),
           ),
+        // Effect-ledger rows back only the detail-mode triage view, so the summary
+        // path (CLI list, API) pays for no extra query. The assembler orders them.
+        detail
+          ? this.db
+              .select()
+              .from(toolEffects)
+              .where(
+                this.scope.where(
+                  toolEffects.tenantId,
+                  eq(toolEffects.runId, runId),
+                ),
+              )
+          : Promise.resolve([]),
       ]);
 
     const workflow = workflowRows[0];
@@ -190,8 +206,17 @@ export class RunInspectionRepository
       return null;
 
     return assembleRunInspection(
-      { run, workflow, version, event, steps, jobs: jobRows, llmUsage: usage },
-      { detail: options.detail ?? false, now: this.now().getTime() },
+      {
+        run,
+        workflow,
+        version,
+        event,
+        steps,
+        jobs: jobRows,
+        llmUsage: usage,
+        toolEffects: effects,
+      },
+      { detail, now: this.now().getTime() },
     );
   }
 

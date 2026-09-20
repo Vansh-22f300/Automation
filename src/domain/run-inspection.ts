@@ -23,6 +23,7 @@ import type {
   Event,
   Job,
   LlmUsage,
+  ToolEffect,
   Workflow,
   WorkflowRun,
   WorkflowStepRun,
@@ -138,6 +139,35 @@ export interface ToolActivityDto {
   readonly toolRounds: number;
 }
 
+/**
+ * One durable external-effect ledger row, projected to the safe fields an operator
+ * needs to triage a run after a crash — above all, to spot an `ambiguous` effect
+ * (an external call whose outcome is unknown and was deliberately NOT auto-resent).
+ *
+ * Deliberately narrow. It carries the effect's `state`, which tool produced it, its
+ * per-step `ordinal`, the `provider`, and the already-safe `{code, message}` of a
+ * failure (via {@link toSafeError}, which drops `details` and redacts the message).
+ * It NEVER carries the idempotency key, the stored result, the owner/lease tokens,
+ * tool arguments, credentials, or a raw error/`details` payload — none of which an
+ * operator needs to identify a stuck effect, and some of which could be sensitive.
+ */
+export interface ToolEffectDto {
+  /** The step key that issued the call. Null only if the row's step is unknown. */
+  readonly stepKey: string;
+  /** The tool that produced the effect, e.g. `send_slack_message`. */
+  readonly toolName: string;
+  /** Per-step monotonic index of the call across rounds — disambiguates repeats. */
+  readonly ordinal: number;
+  /** The connector's provider, e.g. `slack`. A stable, non-secret identifier. */
+  readonly provider: string;
+  /** pending | succeeded | failed | ambiguous. `ambiguous` is the crash-triage signal. */
+  readonly state: string;
+  /** True iff `state === 'ambiguous'` — surfaced explicitly so callers need not string-match. */
+  readonly ambiguous: boolean;
+  /** The safe {code, message} of a failed/ambiguous effect; null otherwise. Never `details`. */
+  readonly error: SafeErrorDto | null;
+}
+
 /** Token/latency totals across every metered round of the run. */
 export interface UsageTotalsDto {
   readonly rounds: number;
@@ -157,6 +187,12 @@ export interface RunInspection {
   readonly jobs: readonly JobDto[];
   readonly llmUsage: readonly LlmUsageDto[];
   readonly tools: readonly ToolActivityDto[];
+  /**
+   * Durable external-effect ledger rows for the run, ordered by step-execution order
+   * then `ordinal`. Present only in detail mode — the operator-triage surface where
+   * spotting an `ambiguous` effect matters. The summary surfaces never carry it.
+   */
+  readonly toolEffects?: readonly ToolEffectDto[];
   readonly usageTotals: UsageTotalsDto;
 }
 
@@ -169,6 +205,8 @@ export interface RawRunData {
   readonly steps: readonly WorkflowStepRun[];
   readonly jobs: readonly Job[];
   readonly llmUsage: readonly LlmUsage[];
+  /** Effect-ledger rows for this run. Optional so summary callers can omit the query. */
+  readonly toolEffects?: readonly ToolEffect[];
 }
 
 /** Assembly options: whether to attach raw detail, and "now" for lease liveness. */
@@ -318,5 +356,46 @@ export function assembleRunInspection(data: RawRunData, options: AssembleOptions
     { rounds: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, latencyMs: 0 },
   );
 
-  return { run, workflow, version, event, steps, jobs, llmUsage: llmUsageDtos, tools, usageTotals };
+  // External-effect ledger rows, attached only in detail mode (the triage surface).
+  // Ordered by the step's first-execution order, then per-step `ordinal`, so an
+  // operator reads them in the sequence the run issued them. Rows whose step key is
+  // not among this run's steps (should not happen) sort last. Only the safe fields
+  // cross the boundary: never the idempotency key, stored result, owner/lease, or a
+  // raw error payload — `toSafeError` reduces a failure to {code, message}.
+  const toolEffectsDto: ToolEffectDto[] | undefined = detail
+    ? (() => {
+        const stepKeyOrder = new Map<string, number>();
+        orderedSteps.forEach((s, i) => {
+          if (!stepKeyOrder.has(s.stepKey)) stepKeyOrder.set(s.stepKey, i);
+        });
+        return [...(data.toolEffects ?? [])]
+          .sort((a, b) => {
+            const ai = stepKeyOrder.get(a.stepKey) ?? Number.MAX_SAFE_INTEGER;
+            const bi = stepKeyOrder.get(b.stepKey) ?? Number.MAX_SAFE_INTEGER;
+            return ai === bi ? a.ordinal - b.ordinal : ai - bi;
+          })
+          .map((e) => ({
+            stepKey: e.stepKey,
+            toolName: e.toolName,
+            ordinal: e.ordinal,
+            provider: e.provider,
+            state: e.state,
+            ambiguous: e.state === 'ambiguous',
+            error: toSafeError(e.error),
+          }));
+      })()
+    : undefined;
+
+  return {
+    run,
+    workflow,
+    version,
+    event,
+    steps,
+    jobs,
+    llmUsage: llmUsageDtos,
+    tools,
+    ...(toolEffectsDto !== undefined ? { toolEffects: toolEffectsDto } : {}),
+    usageTotals,
+  };
 }

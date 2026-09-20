@@ -27,6 +27,7 @@ import {
   jobs,
   llmUsage,
   tenants,
+  toolEffects,
   workflowRuns,
   workflowStepRuns,
 } from "@/db/schema.js";
@@ -73,6 +74,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
 
     beforeEach(async () => {
       await handle.db.delete(llmUsage);
+      await handle.db.delete(toolEffects);
       await handle.db.delete(workflowStepRuns);
       await handle.db.delete(jobs);
       await handle.db.delete(workflowRuns);
@@ -261,6 +263,73 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
       expect(view!.jobs[0]!.leased).toBe(true);
       // The worker id is never surfaced.
       expect(JSON.stringify(view)).not.toContain("worker-1");
+    });
+
+    it("exposes an ambiguous external effect in detail mode: state, tool, ordinal — never secrets", async () => {
+      const runId = await seedRun(tenantA, "ambiguous-effect", "notify");
+      const [stepRun] = await handle.db
+        .insert(workflowStepRuns)
+        .values({
+          tenantId: tenantA,
+          runId,
+          stepKey: "notify",
+          stepType: "llm",
+          status: "failed",
+          startedAt: new Date(1_000),
+          finishedAt: new Date(1_050),
+          durationMs: 50,
+        })
+        .returning({ id: workflowStepRuns.id });
+
+      // A crash left this Slack send with an unknown outcome: the ledger settled it
+      // `ambiguous` (deliberately not auto-resent). The row carries fields that MUST
+      // NOT surface — the idempotency key, the owner/lease token, the stored result,
+      // and an error whose details hold a bot token — so the assertions prove they
+      // are absent while state/tool/ordinal are present for an operator to triage.
+      await handle.db.insert(toolEffects).values({
+        tenantId: tenantA,
+        runId,
+        stepKey: "notify",
+        toolName: "send_slack_message",
+        ordinal: 1,
+        idempotencyKey: `${runId}:notify:send_slack_message:1`,
+        provider: "slack",
+        state: "ambiguous",
+        owner: stepRun!.id,
+        leaseExpiresAt: null,
+        result: null,
+        error: {
+          code: "effect_ambiguous",
+          message: "worker crashed after dispatch, before settlement",
+          details: { botToken: "xoxb-super-secret", channel: "C-private" },
+        },
+      });
+
+      // Summary surface: no tool-effects section at all.
+      const summary = await repo(tenantA).getRun(runId);
+      expect(summary!.toolEffects).toBeUndefined();
+
+      // Detail surface: the ambiguous effect is present with exactly the safe fields.
+      const detailed = await repo(tenantA).getRun(runId, { detail: true });
+      expect(detailed!.toolEffects).toHaveLength(1);
+      const effect = detailed!.toolEffects![0]!;
+      expect(effect.state).toBe("ambiguous");
+      expect(effect.ambiguous).toBe(true);
+      expect(effect.toolName).toBe("send_slack_message");
+      expect(effect.ordinal).toBe(1);
+      expect(effect.provider).toBe("slack");
+      // toSafeError keeps {code, message}, drops the details payload.
+      expect(effect.error).toEqual({
+        code: "effect_ambiguous",
+        message: "worker crashed after dispatch, before settlement",
+      });
+
+      // Nothing sensitive crosses the boundary.
+      const serialized = JSON.stringify(detailed!.toolEffects);
+      expect(serialized).not.toContain("xoxb-super-secret"); // secret in error.details
+      expect(serialized).not.toContain("C-private"); // error.details
+      expect(serialized).not.toContain(`${runId}:notify:send_slack_message:1`); // idempotency key
+      expect(serialized).not.toContain(stepRun!.id); // owner token
     });
 
     it("lists runs newest first, filters safely, and paginates without duplicates", async () => {

@@ -110,25 +110,47 @@ describe('SlackConnector error mapping', () => {
     expect((e as RetryableError).code).toBe('slack_rate_limited');
   });
 
-  it('classifies HTTP 429 as retryable and retains Retry-After as safe metadata (no retry here)', async () => {
+  it('classifies HTTP 429 as retryable and effect-safe, retaining Retry-After (no retry here)', async () => {
     const e = await run(
       new FakeSlackTransport({ response: { status: 429, retryAfterSeconds: 30, body: { ok: false, error: 'ratelimited' } } }),
     );
     expect(e).toBeInstanceOf(RetryableError);
     expect((e as RetryableError).code).toBe('slack_rate_limited');
-    expect((e as RetryableError).details).toEqual({ retryAfterSeconds: 30 });
+    // A 429 is Slack rejecting at the edge: the write did not run, so effect-safe.
+    expect((e as RetryableError).details).toEqual({ retryAfterSeconds: 30, effectSafety: 'safe' });
   });
 
-  it('classifies a transient HTTP 5xx as retryable', async () => {
+  it('tags a structured ratelimited body effect-safe too (no 429 status)', async () => {
+    const e = await run(new FakeSlackTransport({ response: { status: 200, body: { ok: false, error: 'rate_limited' } } }));
+    expect(e).toBeInstanceOf(RetryableError);
+    expect((e as RetryableError).code).toBe('slack_rate_limited');
+    expect((e as RetryableError).details).toEqual({ effectSafety: 'safe' });
+  });
+
+  it('classifies a transient HTTP 5xx as retryable and effect-AMBIGUOUS', async () => {
     const e = await run(new FakeSlackTransport({ response: { status: 503, body: { ok: false, error: 'service_unavailable' } } }));
     expect(e).toBeInstanceOf(RetryableError);
     expect((e as RetryableError).code).toBe('slack_http_5xx');
+    // A 5xx can be returned after the write applied — never assume it did not post.
+    expect((e as RetryableError).details).toEqual({ status: 503, effectSafety: 'ambiguous' });
   });
 
-  it('classifies a transport/network/timeout failure as retryable', async () => {
+  it.each(['internal_error', 'service_unavailable', 'fatal_error', 'request_timeout'])(
+    'classifies a 2xx ok:false %s as retryable and effect-AMBIGUOUS',
+    async (code) => {
+      const e = await run(new FakeSlackTransport({ response: { status: 200, body: { ok: false, error: code } } }));
+      expect(e).toBeInstanceOf(RetryableError);
+      expect((e as RetryableError).code).toBe(code);
+      expect((e as RetryableError).details).toEqual({ effectSafety: 'ambiguous' });
+    },
+  );
+
+  it('classifies a transport/network/timeout failure as retryable and effect-AMBIGUOUS', async () => {
     const e = await run(new FakeSlackTransport({ throwError: new Error('aborted') }));
     expect(e).toBeInstanceOf(RetryableError);
     expect((e as RetryableError).code).toBe('slack_network_error');
+    // The abort/reset can fire after Slack accepted the POST — cannot claim safe.
+    expect((e as RetryableError).details).toEqual({ effectSafety: 'ambiguous' });
     // The underlying cause is preserved but carries no token.
     expect(JSON.stringify((e as RetryableError).message)).not.toContain(BOT_TOKEN);
   });
