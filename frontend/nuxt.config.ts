@@ -1,24 +1,6 @@
 import { defineNuxtConfig } from 'nuxt/config';
 
 /**
- * Parse a positive integer env var, falling back to `defaultValue` when the
- * input is missing, non-numeric, or out of the inclusive `[min, max]` range.
- */
-function parsePositiveInt(
-  raw: string | undefined,
-  defaultValue: number,
-  min: number,
-  max: number,
-): number {
-  if (raw === undefined) return defaultValue;
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
-    return defaultValue;
-  }
-  return parsed;
-}
-
-/**
  * Frontend BFF configuration.
  *
  * The browser talks to the Nitro server at same-origin /backend/*. Nitro then
@@ -36,14 +18,18 @@ export default defineNuxtConfig({
   ssr: false,
   css: ['~/assets/css/main.css'],
   runtimeConfig: {
-    // Server-only: the Fastify API key. Sourced from `NUXT_API_KEY`.
-    apiKey: process.env.NUXT_API_KEY ?? '',
-    // Server-only: the Fastify base URL. Sourced from `NUXT_BACKEND_URL`.
-    backendUrl: process.env.NUXT_BACKEND_URL ?? 'http://127.0.0.1:3000',
-    // Server-only: upstream timeout in milliseconds. Sourced from
-    // `NUXT_BFF_TIMEOUT_MS`. Tests set this to a few hundred ms so the
-    // timeout-exceeded path can be exercised without a 10 s wait.
-    bffTimeoutMs: parsePositiveInt(process.env.NUXT_BFF_TIMEOUT_MS, 10_000, 100, 60_000),
+    // Server-only. Empty-string default so the API key is NEVER read from
+    // `process.env` at build time (which would serialize the secret into the
+    // Nitro server bundle). Nuxt overrides this at runtime from the matching
+    // `NUXT_API_KEY` environment variable.
+    apiKey: '',
+    // Server-only. Safe non-secret localhost default for local development;
+    // overridden at runtime from `NUXT_BACKEND_URL` in deployed environments.
+    backendUrl: 'http://127.0.0.1:3000',
+    // Server-only. Non-secret numeric default; overridden at runtime from
+    // `NUXT_BFF_TIMEOUT_MS`. The BFF route and forwarder both re-validate and
+    // clamp the effective value to the inclusive range [100, 60000] ms.
+    bffTimeoutMs: 10_000,
     public: {
       // Client-side: the same-origin path the browser uses to reach the BFF.
       // Sourced from `NUXT_PUBLIC_API_BASE`.
