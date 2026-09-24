@@ -22,7 +22,7 @@ importers:
         specifier: ^26.5.1
         version: 26.5.1
       '@vue/test-utils':
-        specifier: ^2.4.6
+        specifier: ^2.5.1
         version: 2.5.1(@vue/compiler-dom@3.5.42)(@vue/server-renderer@3.5.42)(vue@3.5.42(typescript@5.9.3))
       happy-dom:
         specifier: 15.11.7
