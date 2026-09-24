@@ -140,7 +140,7 @@ The visible application lives in [`frontend/`](frontend/), a Nuxt 3 + Vue 3 SPA 
 
 **Two experiences, one design system:**
 
-- **`/` — public product landing** (layout `landing.vue`, **no API dependency**): dark cinematic canvas (`#050508` void, layered elevated surfaces), subtle aurora (mint/lilac/bloom) + grid + noise behind content, sticky dark-glass nav with scroll progress, oversized hero (tight tracking, gradient accent) + layered product hero visualization (workflow surface + running run timeline with floating lease/encrypted metadata), capability strip, editorial problem→solution bento, **bento capabilities** (large pinned-version surface + supporting cards) instead of uniform 3-card rows, **product showcase** built from real workflow/run/connection concepts (large run-detail surface + workflow catalog + connections), 4-step timeline, reliability bento, philosophy, FAQ and final CTA. Renders correctly with no `NUXT_PUBLIC_API_KEY` and no backend running — pure static marketing, capability-based proof only (no fake logos, testimonials, pricing or metrics; illustrative content is explicitly labeled).
+- **`/` — public product landing** (layout `landing.vue`, **no API dependency**): dark cinematic canvas (`#050508` void, layered elevated surfaces), subtle aurora (mint/lilac/bloom) + grid + noise behind content, sticky dark-glass nav with scroll progress, oversized hero (tight tracking, gradient accent) + layered product hero visualization (workflow surface + running run timeline with floating lease/encrypted metadata), capability strip, editorial problem→solution bento, **bento capabilities** (large pinned-version surface + supporting cards) instead of uniform 3-card rows, **product showcase** built from real workflow/run/connection concepts (large run-detail surface + workflow catalog + connections), 4-step timeline, reliability bento, philosophy, FAQ and final CTA. Renders correctly with no API key configured and no backend running — pure static marketing, capability-based proof only (no fake logos, testimonials, pricing or metrics; illustrative content is explicitly labeled).
 - **Authenticated workspace** (`/workflows`, `/runs`, `/runs/:runId`, `/connections` — layout `default.vue`): **same cinematic system as landing** — void `#050508` canvas with subtle aurora, glass/dark elevated surfaces, `workspace-bento` (large catalog/feed + side metrics), premium page headers (eyebrow + large title + ambient glow), **workflows as hybrid workflow-card grid** (name/status/version/trigger + illustrative webhook→steps→run + hover), **runs as command-center feed** (`run-feed-item` with status-dot pulse, workflow/current-step/duration, dark filter bar, URL-synced), **run detail as execution inspector** (bento hero + duration/LLM metrics, central timeline with luminous dots + vertical gradient line, jobs/tools/trigger as dark card-sheen surfaces, redacted `details`), **connections as dark registry** (`connection-card` with provider initials + metadata + secure indicators). Sidebar void/panel with gradient active, mobile drawer/topbar preserved, `prefers-reduced-motion` respected, color-independent status (dot + text), 320-1440+ no overflow.
 
 Design language: *Linear × Vercel × Raycast × premium developer tools* — dark cinematic throughout (landing is marketing expression, workspace is product console), restrained glass/gradient-border/bento/product surfaces, `prefers-reduced-motion` respected, keyboard-visible focus, color-independent status (dot + text), 320-1440+ no overflow.
@@ -149,7 +149,7 @@ Start the API first, then in another terminal:
 
 ```bash
 cd frontend
-pnpm dev        # http://localhost:3001 (Vite proxies /backend -> 127.0.0.1:3000)
+pnpm dev        # http://localhost:3001 (Nitro serves the /backend BFF -> 127.0.0.1:3000)
 pnpm typecheck  # nuxt typecheck (strict)
 pnpm build      # nuxt build
 ```
@@ -157,12 +157,14 @@ pnpm build      # nuxt build
 Create `frontend/.env` from [`frontend/.env.example`](frontend/.env.example):
 
 ```
-NUXT_PUBLIC_API_KEY=<tenant bearer key>   # required for /workflows,/runs,/connections; landing needs none
-NUXT_PUBLIC_API_BASE=/backend             # default; override only if not using Vite proxy
-NUXT_BACKEND_URL=http://127.0.0.1:3000    # Vite dev proxy target
+NUXT_API_KEY=<tenant bearer key>        # SERVER-ONLY: injected by the Nitro BFF; never shipped to the browser
+NUXT_BACKEND_URL=http://127.0.0.1:3000  # SERVER-ONLY: the Fastify base URL the BFF forwards to
+NUXT_PUBLIC_API_BASE=/backend           # PUBLIC: the same-origin path the browser calls
 ```
 
-`NUXT_PUBLIC_API_KEY` is development-only browser config — never commit a real key. All authenticated pages send `Authorization: Bearer <key>`; `GET /healthz` is public. The Vite proxy keeps requests same-origin so Fastify needs no CORS policy.
+The browser only ever calls the same-origin path `NUXT_PUBLIC_API_BASE` (default `/backend`); it sends no `Authorization` header and never sees the API key. The Nitro **BFF** route (`server/routes/backend/[...path].ts`) forwards each `GET`/`HEAD` to Fastify with a server-only `Authorization: Bearer <NUXT_API_KEY>`. The full request chain is **Browser → Nuxt/Nitro BFF → Fastify API → Neon/Postgres**. Because the browser talks only to the same-origin BFF, Fastify needs no CORS policy. `NUXT_API_KEY` and `NUXT_BACKEND_URL` are server-only — never commit a real key; `GET /healthz` remains public.
+
+The SPA sets `ssr: false`, but it still requires the **Nitro server**: `/backend/*` is a server route, not a static file, so the app must be hosted somewhere that runs Nitro. Static-only hosting (a bare `.output/public` upload) has no BFF and is unsupported — see [Frontend deployment (Vercel)](#frontend-deployment-vercel).
 
 **Frontend architecture:**
 
@@ -1429,6 +1431,56 @@ both services.
   available for a liveness probe.
 - The worker is a background service with no port and therefore no HTTP health
   check; Render supervises it by process liveness.
+
+## Frontend deployment (Vercel)
+
+The frontend in [`frontend/`](frontend/) is a Nuxt 3 SPA (`ssr: false`) with a
+Nitro **BFF**. The browser calls only the same-origin path `/backend/*`; the
+Nitro server route forwards each request to Fastify with a server-only API key.
+The full request chain in production is:
+
+**Browser → Vercel (Nuxt SPA + Nitro BFF, `/backend/*`) → Render (Fastify API) → Neon/Postgres.**
+
+Because `/backend/*` is a **server route**, the deploy target must run the Nitro
+server. A static-only upload (`.output/public` alone) has no BFF and is
+unsupported.
+
+### Vercel project settings
+
+- **Root Directory:** `frontend`.
+- **Framework preset:** Nuxt.js (Vercel detects it automatically).
+- **Build/Output:** leave the defaults. Nitro auto-detects Vercel's `vercel`
+  preset and Vercel runs the BFF as serverless functions automatically — no
+  `nitro.preset` change and **no `vercel.json` is required** currently.
+- `.output/` is local build output and is **gitignored**; Vercel runs its own
+  build and produces its own artifact, so nothing under `.output/` is deployed
+  from the repo.
+
+### Frontend environment variables (Vercel)
+
+Set these on the Vercel project (names only — never commit the values):
+
+| Variable | Visibility | Purpose |
+| --- | --- | --- |
+| `NUXT_API_KEY` | **Private (server-only)** | Fastify tenant bearer key the BFF injects. Never shipped to the browser. |
+| `NUXT_BACKEND_URL` | **Private (server-only)** | Upstream Fastify base URL the BFF forwards to (e.g. `https://<your-api>.onrender.com`). |
+| `NUXT_BFF_TIMEOUT_MS` | **Private (server-only)** | Optional BFF upstream timeout in ms; clamped to `[100, 60000]`. |
+| `NUXT_PUBLIC_API_BASE` | **Public** | Same-origin path the browser calls (`/backend`). The only browser-shipped value. |
+
+### Temporary Render Free backend behavior
+
+While the Fastify API runs on **Render Free** (demo mode — see
+[docs/deploy-free.md](docs/deploy-free.md)), the service **sleeps after ~15
+minutes** without inbound traffic, and the **first request after sleep pays a
+cold start** (~1 minute, which can stack with a Neon wake). A **best-effort
+keep-alive** piggybacks on the existing every-5-minute worker workflow
+(`.github/workflows/worker-free.yml`): when a `RENDER_API_URL` Actions variable
+is set, each run also sends one unauthenticated `GET /healthz` to keep the API
+warm. It is **best-effort, not a guarantee** — GitHub scheduled workflows can be
+delayed or dropped — so a cold start can still occur. See
+[docs/deploy-free.md](docs/deploy-free.md) for setup and the external-monitor
+alternative. The paid [`render.yaml`](render.yaml) blueprint above is always-on
+and has no sleep behavior.
 
 ## Current status
 

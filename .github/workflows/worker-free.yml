@@ -132,3 +132,46 @@ jobs:
         run: |
           timeout --signal=SIGTERM --kill-after=30s --preserve-status 240s \
             node dist/worker/main.js
+
+      # Best-effort keep-alive for the Render Free API (optional; piggybacks this
+      # already-scheduled run — no second workflow, no extra runner).
+      #
+      # Render Free spins a web service down after ~15 minutes without inbound
+      # traffic; the next request then pays a cold start. This job wakes about
+      # every 5 minutes anyway, so one lightweight GET keeps the API warm.
+      #
+      # BEST-EFFORT, NOT A GUARANTEE: GitHub scheduled workflows can be delayed or
+      # dropped, so a window may be missed and the service may still sleep. For a
+      # hard warm-up SLA use an external uptime monitor or the paid always-on
+      # service (see docs/deploy-free.md).
+      #
+      # Rules baked in here:
+      #   * Runs only when the RENDER_API_URL Actions variable is set (repo- or
+      #     worker-free-environment-scoped). Unset -> logs "skipped" and succeeds.
+      #     No Render URL is hard-coded in this repo.
+      #   * Hits the PUBLIC, unauthenticated, DB-free /healthz only. Never sends a
+      #     credential, never touches /v1/* or /readyz (which would open a Neon
+      #     connection just to keep Render warm).
+      #   * if: always() plus a short-timeout curl whose failure is swallowed, so
+      #     it runs even if the worker step failed and never fails the job itself.
+      #     Logs whether it was attempted/skipped and the HTTP result — never a
+      #     credential (none is used).
+      - name: Keep-alive ping (best-effort)
+        if: always()
+        env:
+          RENDER_API_URL: ${{ vars.RENDER_API_URL }}
+        run: |
+          if [ -z "${RENDER_API_URL}" ]; then
+            echo "keep-alive: skipped (RENDER_API_URL not set)"
+            exit 0
+          fi
+          url="${RENDER_API_URL%/}/healthz"
+          echo "keep-alive: GET ${url}"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            --connect-timeout 10 --max-time 25 "${url}" || true)"
+          if [ -n "${code}" ] && [ "${code}" != "000" ]; then
+            echo "keep-alive: HTTP ${code} (service reached)"
+          else
+            echo "keep-alive: no HTTP response within timeout (ignored)"
+          fi
+          exit 0

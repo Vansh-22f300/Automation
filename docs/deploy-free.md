@@ -51,7 +51,8 @@ goes to GitHub Actions.
 - **Sleeps after 15 minutes** with no inbound traffic. The first request after
   that pays a **cold start of ~1 minute** while the instance spins back up (a
   loading page is shown to browsers meanwhile). This is normal and expected for a
-  demo — it is not a bug.
+  demo — it is not a bug. An optional best-effort keep-alive can reduce how often
+  this happens — see [Keep-alive for the Render Free API](#keep-alive-for-the-render-free-api-best-effort).
 - 750 free instance-hours/month per workspace (a single sleepy demo fits easily),
   single instance only, **no shell/SSH**, **no persistent disk**, and **no
   `preDeployCommand`** (which is why migrations are run manually — see below).
@@ -195,6 +196,43 @@ Free mode is a **batch/polling** model, not real-time:
 If you need low, predictable latency, that is what the paid always-on worker is
 for — switch back (below).
 
+### Keep-alive for the Render Free API (best-effort)
+
+Render Free spins the API down after ~15 minutes without inbound traffic (see
+[Free tier limitations](#free-tier-limitations-you-must-expect)). The worker
+workflow already runs about every 5 minutes, so it can **piggyback** a single
+lightweight request to keep the API warm — no second workflow and no extra
+schedule.
+
+The keep-alive step in [`worker-free.yml`](../.github/workflows/worker-free.yml):
+
+- runs **only when the `RENDER_API_URL` Actions variable is set**; with no URL
+  configured it logs `skipped` and succeeds (no Render URL is hard-coded in the
+  repo);
+- sends one unauthenticated `GET {RENDER_API_URL}/healthz` — the **public,
+  DB-free** liveness endpoint. It never sends a credential, never hits `/v1/*`,
+  and never uses `/readyz` (which would open a Neon connection merely to keep
+  Render warm);
+- is **fail-safe**: a short-timeout `curl` whose failure is swallowed, run with
+  `if: always()`, so it fires even if the worker session failed and its own
+  result never fails the job. It logs whether it was attempted or skipped and the
+  HTTP status, never any secret.
+
+**Set the URL** under **Settings → Secrets and variables → Actions → Variables**
+(a repo variable, or an environment variable on the `worker-free` environment)
+named `RENDER_API_URL`, value `https://<your-api-name>.onrender.com` (no trailing
+`/healthz` — the step appends it). It is a plain **variable, not a secret**: the
+API base URL is not sensitive and `/healthz` needs no auth.
+
+> **Best-effort, not a guarantee.** GitHub scheduled workflows are best-effort and
+> can be delayed or dropped, so a 15-minute window may occasionally be missed and
+> the service can still sleep. If you need a reliable warm-up with no repo change,
+> point an **external uptime monitor** (e.g. UptimeRobot or cron-job.org) at
+> `https://<your-api-name>.onrender.com/healthz` on a sub-15-minute interval — it
+> runs entirely outside GitHub Actions, costs zero runner minutes, and needs no
+> workflow edit. Or switch to the paid always-on service (below), which never
+> sleeps.
+
 ### Secret setup (GitHub Environment `worker-free`)
 
 The worker needs two secrets, scoped to a GitHub **Environment** named
@@ -232,13 +270,19 @@ Security notes:
 with a **server-only** `Authorization: Bearer <NUXT_API_KEY>`. The API key is
 never shipped to the browser.
 
-When the frontend is deployed later (e.g. Vercel/Netlify/Render — anywhere that
-runs the Nitro server, not a static-only host), set:
+The frontend deploys to **Vercel**: set **Root Directory** to `frontend`, use the
+**Nuxt.js** framework preset, and leave the build defaults — Nitro auto-detects
+Vercel's `vercel` preset and runs the BFF as serverless functions, so **no
+`vercel.json` is required**. Any host that runs the Nitro server works; a
+static-only host does not (it has no BFF). `.output/` is local, gitignored build
+output — Vercel builds its own artifact. Set these (names only — never commit the
+values):
 
 ```
-NUXT_API_KEY=<the Fastify tenant API key>          # server-only, never public
-NUXT_BACKEND_URL=https://<your-api-name>.onrender.com   # server-only upstream
-NUXT_PUBLIC_API_BASE=/backend                      # same-origin browser path
+NUXT_API_KEY=<the Fastify tenant API key>              # server-only, never public
+NUXT_BACKEND_URL=https://<your-api-name>.onrender.com  # server-only upstream (the Render API)
+NUXT_BFF_TIMEOUT_MS=10000                              # server-only, optional (BFF upstream timeout)
+NUXT_PUBLIC_API_BASE=/backend                          # public: same-origin browser path
 ```
 
 Because the browser talks only to the same-origin BFF and the BFF reaches
