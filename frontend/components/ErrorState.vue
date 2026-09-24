@@ -5,9 +5,12 @@ defineProps<{ message: string }>();
 defineEmits<{ retry: [] }>();
 
 function friendly(message: string): string {
-  if (message.includes("NUXT_PUBLIC_API_KEY") || message.includes("Add NUXT_PUBLIC_API_KEY")) return "Missing API key — add NUXT_PUBLIC_API_KEY to frontend/.env and restart the dev server.";
+  // The browser now reaches Fastify only through the same-origin Nitro BFF, so
+  // these messages describe the BFF's states, not a browser-held API key.
+  if (message.includes("not configured") || message.includes("proxy")) return "Server not configured — set NUXT_API_KEY for the Nitro BFF and restart the server.";
+  if (message.includes("did not respond in time") || message.includes("timed out")) return "The API took too long to respond — please try again.";
   if (message.includes("could not be reached") || message.includes("backend")) return "Backend unavailable — start the Fastify API on :3000 (pnpm dev) and refresh.";
-  if (message.toLowerCase().includes("unauthorized") || message.includes("401")) return "Not authorized — check your API key and tenant.";
+  if (message.toLowerCase().includes("unauthorized") || message.includes("401")) return "Not authorized — check the server API key and tenant.";
   return message;
 }
 </script>

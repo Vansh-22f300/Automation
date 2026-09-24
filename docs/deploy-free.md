@@ -225,17 +225,26 @@ Security notes:
 
 ## Frontend
 
-**Not deployed in free mode yet.** When the Nuxt frontend is deployed later
-(Vercel), it will need its API base pointed at the Render web service's **public
-origin**, for example:
+**Not deployed in free mode yet.** The Nuxt app is an SPA (`ssr: false`) with a
+**Nitro BFF**: the browser only ever calls the same-origin path
+`NUXT_PUBLIC_API_BASE` (default `/backend`), and the Nitro server route at
+`frontend/server/routes/backend/[...path].ts` forwards each GET/HEAD to Fastify
+with a **server-only** `Authorization: Bearer <NUXT_API_KEY>`. The API key is
+never shipped to the browser.
+
+When the frontend is deployed later (e.g. Vercel/Netlify/Render — anywhere that
+runs the Nitro server, not a static-only host), set:
 
 ```
-NUXT_PUBLIC_API_BASE=https://<your-api-name>.onrender.com
+NUXT_API_KEY=<the Fastify tenant API key>          # server-only, never public
+NUXT_BACKEND_URL=https://<your-api-name>.onrender.com   # server-only upstream
+NUXT_PUBLIC_API_BASE=/backend                      # same-origin browser path
 ```
 
-not the dev-only `/backend` Vite proxy path. Cross-origin browser calls will also
-require addressing CORS on the API (it currently ships no CORS layer). That work
-is out of scope for this free-mode setup.
+Because the browser talks only to the same-origin BFF and the BFF reaches
+Fastify server-to-server, **no CORS layer on the API is required** (and none
+ships). The deploy target must execute the Nitro server; a static-only export
+would have no BFF and is unsupported.
 
 ## First-deploy checklist
 

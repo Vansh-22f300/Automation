@@ -19,9 +19,17 @@ export class ApiClientError extends Error {
 
 interface ApiClientOptions {
   readonly baseUrl: string;
-  readonly apiKey: string;
 }
 
+/**
+ * Browser-side Fastify API client.
+ *
+ * The browser never talks to Fastify directly: it talks to the same-origin
+ * Nuxt Nitro BFF at `<baseUrl>/<path>`, which then forwards the request to
+ * Fastify with a server-only API key. This client therefore sends NO
+ * Authorization header (the server-side API key is not the browser's
+ * concern) and NO cookie (the BFF strips incoming cookies).
+ */
 export class ApiClient {
   constructor(private readonly options: ApiClientOptions) {}
 
@@ -84,18 +92,9 @@ export class ApiClient {
 
   private async request<T>(
     path: string,
-    requiresAuthentication: boolean,
+    _requiresAuthentication: boolean,
   ): Promise<T> {
     const headers = new Headers({ Accept: "application/json" });
-    if (requiresAuthentication) {
-      if (this.options.apiKey === "") {
-        throw new ApiClientError(
-          0,
-          "Add NUXT_PUBLIC_API_KEY to frontend/.env to inspect runs.",
-        );
-      }
-      headers.set("Authorization", `Bearer ${this.options.apiKey}`);
-    }
 
     let response: Response;
     try {

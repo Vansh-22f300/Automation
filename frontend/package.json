@@ -11,15 +11,21 @@
     "dev": "nuxt dev --port 3001",
     "build": "nuxt build",
     "preview": "nuxt preview",
-    "typecheck": "nuxt typecheck"
+    "typecheck": "nuxt typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@lucide/vue": "1.41.0",
     "nuxt": "3.21.11"
   },
   "devDependencies": {
+    "@nuxt/test-utils": "3.23.0",
     "@types/node": "^26.5.1",
+    "@vue/test-utils": "^2.5.1",
+    "happy-dom": "15.11.7",
     "typescript": "^5.7.3",
+    "vitest": "3.2.7",
     "vue-tsc": "^2.2.0"
   }
 }
