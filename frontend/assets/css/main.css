@@ -1522,6 +1522,7 @@ td .mono, .cell-id { font-family: var(--font-mono); font-size: var(--fs-sm); col
 .product-stack {
   position: relative;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--sp-3);
 }
 .floating-meta {
@@ -1633,6 +1634,8 @@ td .mono, .cell-id { font-family: var(--font-mono); font-size: var(--fs-sm); col
 @media (max-width: 900px) {
   .bento-grid { grid-template-columns: 1fr; }
   .bento-card--large, .bento-card--medium, .bento-card--wide { grid-column: span 1; }
+  /* Landing bento cards carry inline grid-column spans that outrank the rules above; reset them so no card is squeezed into an implicit track. */
+  .bento-grid > * { grid-column: auto !important; }
 }
 @media (min-width: 900px) and (max-width: 1120px) {
   .bento-grid { grid-template-columns: repeat(2, 1fr); }
@@ -1643,6 +1646,7 @@ td .mono, .cell-id { font-family: var(--font-mono); font-size: var(--fs-sm); col
 /* product surface — for showcase */
 .product-surface {
   position: relative;
+  min-width: 0;
   border-radius: 20px;
   border: 1px solid var(--landing-border);
   background: linear-gradient(165deg, rgba(16,16,26,0.96), rgba(10,10,17,0.98));
