@@ -151,7 +151,7 @@ const year = new Date().getFullYear();
                 </div>
               </div>
 
-              <div style="display:flex;gap:8px;align-items:center;padding:10px 12px;border-radius:999px;background:rgba(255,255,255,0.04);border:1px solid var(--landing-border);color:var(--landing-faint);font-size:11px;letter-spacing:0.06em;text-transform:uppercase;font-weight:600">
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:center;padding:10px 12px;border-radius:999px;background:rgba(255,255,255,0.04);border:1px solid var(--landing-border);color:var(--landing-faint);font-size:11px;letter-spacing:0.06em;text-transform:uppercase;font-weight:600">
                 <span style="width:6px;height:6px;border-radius:999px;background:var(--landing-mint)" aria-hidden="true" /> Workflows
                 <span style="opacity:0.4" aria-hidden="true">·</span> AI execution <span style="opacity:0.4">·</span> Webhooks <span style="opacity:0.4">·</span> Run visibility
               </div>

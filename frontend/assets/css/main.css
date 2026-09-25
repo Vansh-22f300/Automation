@@ -1207,6 +1207,10 @@ td .mono, .cell-id { font-family: var(--font-mono); font-size: var(--fs-sm); col
   .timeline { grid-template-columns: 1fr; }
   .footer-grid { grid-template-columns: 1fr; }
   .hero-actions .button { width: 100%; justify-content: center; }
+  /* Decorative peek-out badges overlap the cards and hug the viewport edge on
+     phones. Hide them here; descendant selector beats the base .floating-meta
+     rule that sits later in the file (media queries add no specificity). */
+  .product-hero-wrap .floating-meta { display: none; }
 }
 
 /* Enhanced status (icon support) */
