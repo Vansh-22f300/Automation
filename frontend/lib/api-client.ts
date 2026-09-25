@@ -1,7 +1,6 @@
 import type {
   ApiErrorResponse,
   ConnectionListResponse,
-  HealthStatus,
   RunInspection,
   RunListResponse,
   WorkflowListResponse,
@@ -33,14 +32,9 @@ interface ApiClientOptions {
 export class ApiClient {
   constructor(private readonly options: ApiClientOptions) {}
 
-  async getHealth(): Promise<HealthStatus> {
-    return this.request<HealthStatus>("/healthz", false);
-  }
-
   async getRun(runId: string): Promise<RunInspection> {
     return this.request<RunInspection>(
       `/v1/runs/${encodeURIComponent(runId)}`,
-      true,
     );
   }
 
@@ -50,7 +44,6 @@ export class ApiClient {
   ): Promise<WorkflowListResponse> {
     return this.request<WorkflowListResponse>(
       this.withQuery("/v1/workflows", { limit, cursor }),
-      true,
     );
   }
 
@@ -64,7 +57,6 @@ export class ApiClient {
   ): Promise<RunListResponse> {
     return this.request<RunListResponse>(
       this.withQuery("/v1/runs", options),
-      true,
     );
   }
 
@@ -74,7 +66,6 @@ export class ApiClient {
   ): Promise<ConnectionListResponse> {
     return this.request<ConnectionListResponse>(
       this.withQuery("/v1/connections", { limit, cursor }),
-      true,
     );
   }
 
@@ -90,10 +81,7 @@ export class ApiClient {
     return rendered === "" ? path : `${path}?${rendered}`;
   }
 
-  private async request<T>(
-    path: string,
-    _requiresAuthentication: boolean,
-  ): Promise<T> {
+  private async request<T>(path: string): Promise<T> {
     const headers = new Headers({ Accept: "application/json" });
 
     let response: Response;

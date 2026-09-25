@@ -83,9 +83,9 @@ const statusTone = computed(() => inspection.value?.run.status ?? 'queued');
       </div>
 
       <section v-if="inspection.run.error" class="panel failure-panel" role="alert" style="border-radius:16px">
-        <p style="margin:0 0 6px; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#ff9a9a; font-weight:600">Run failure</p>
-        <h2 style="margin:0; color:#ff9a9a">{{ inspection.run.error.code }}</h2>
-        <p style="margin:8px 0 0; color:#ffb4b4">{{ inspection.run.error.message }}</p>
+        <p style="margin:0 0 6px; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--landing-danger); font-weight:600">Run failure</p>
+        <h2 style="margin:0; color:var(--landing-danger)">{{ inspection.run.error.code }}</h2>
+        <p style="margin:8px 0 0; color:var(--landing-danger-soft)">{{ inspection.run.error.message }}</p>
       </section>
 
       <!-- Execution — dominant central structure -->
@@ -124,7 +124,7 @@ const statusTone = computed(() => inspection.value?.run.status ?? 'queued');
                   <span>Started: {{ formatDate(step.startedAt) }}</span>
                   <span v-if="step.finishedAt">Finished: {{ formatDate(step.finishedAt) }}</span>
                 </p>
-                <p v-if="step.error" style="margin:10px 0 0;padding:10px 12px;border-radius:10px;background:rgba(42,16,16,0.7);border:1px solid rgba(255,107,107,0.22);color:#ffb4b4;font-size:12px"><strong style="color:#ff9a9a">{{ step.error.code }}:</strong> {{ step.error.message }}</p>
+                <p v-if="step.error" style="margin:10px 0 0;padding:10px 12px;border-radius:10px;background:rgba(42,16,16,0.7);border:1px solid rgba(255,107,107,0.22);color:var(--landing-danger-soft);font-size:12px"><strong style="color:var(--landing-danger)">{{ step.error.code }}:</strong> {{ step.error.message }}</p>
                 <details style="margin-top:12px">
                   <summary style="cursor:pointer;color:var(--landing-dim);font-size:11px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;display:inline-flex;gap:6px;align-items:center">Summaries (redacted) <span style="font-size:10px">▾</span></summary>
                   <div style="margin-top:10px;display:grid;gap:8px">
@@ -154,7 +154,7 @@ const statusTone = computed(() => inspection.value?.run.status ?? 'queued');
                 <div style="min-width:0">
                   <strong style="font-size:13px;color:var(--landing-mist)">{{ job.stepKey }}</strong>
                   <p style="margin:2px 0 0;color:var(--landing-faint);font-size:11px">Attempt {{ job.attempt }} · {{ job.retryCount }}/{{ job.maxAttempts }} retries · {{ formatDate(job.runAt) }}</p>
-                  <p v-if="job.lastError" style="margin:4px 0 0;color:#ff9a9a;font-size:11px">{{ job.lastError.code }}: {{ job.lastError.message }}</p>
+                  <p v-if="job.lastError" style="margin:4px 0 0;color:var(--landing-danger);font-size:11px">{{ job.lastError.code }}: {{ job.lastError.message }}</p>
                 </div>
                 <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
                   <StatusBadge :status="job.status" />

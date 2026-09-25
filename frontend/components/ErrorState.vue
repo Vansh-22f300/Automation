@@ -17,9 +17,9 @@ function friendly(message: string): string {
 
 <template>
   <div class="state-panel state-error" role="alert" aria-live="polite" style="color:var(--landing-dim)">
-    <span style="display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.22);color:#ff8a8a"><AlertCircle :size="18" aria-hidden="true" /></span>
+    <span style="display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.22);color:var(--landing-danger-strong)"><AlertCircle :size="18" aria-hidden="true" /></span>
     <div>
-      <h2 style="color:#ff9a9a">Couldn’t load this view</h2>
+      <h2 style="color:var(--landing-danger)">Couldn’t load this view</h2>
       <p style="color:var(--landing-dim)">{{ friendly(message) }}</p>
     </div>
     <button class="button button-secondary" type="button" style="border-radius:999px" @click="$emit('retry')">

@@ -44,7 +44,6 @@ const year = new Date().getFullYear();
         <NuxtLink to="/" class="landing-brand" aria-label="AI Workforce home">
           <span class="landing-brand-mark" aria-hidden="true"><span style="font-size:14px;font-weight:650">◈</span></span>
           <strong>AI Workforce</strong>
-          <span style="display:none">Operations workspace</span>
         </NuxtLink>
 
         <nav class="landing-links" :class="{ 'is-open': isMenuOpen }" aria-label="Primary">
@@ -64,12 +63,14 @@ const year = new Date().getFullYear();
     </header>
 
     <!-- Hero — cinematic -->
-    <section class="hero">
+    <section id="main" tabindex="-1" class="hero">
       <div aria-hidden="true" class="bg-grid-dark" style="position:absolute;inset:0;opacity:1;mask-image:linear-gradient(to bottom, transparent, black 18%, black 78%, transparent);-webkit-mask-image:linear-gradient(to bottom, transparent, black 18%, black 78%, transparent)" />
-      <!-- aurora blobs -->
-      <div aria-hidden="true" class="ambient-blob" style="left:12%;top:-12%;width:720px;height:620px;background:rgba(183,164,251,0.14);filter:blur(140px);animation:drift-a 26s ease-in-out infinite alternate" />
-      <div aria-hidden="true" class="ambient-blob" style="right:-6%;top:6%;width:640px;height:540px;background:rgba(139,245,201,0.11);filter:blur(130px);animation:drift-b 34s ease-in-out infinite alternate" />
-      <div aria-hidden="true" class="ambient-blob" style="left:28%;bottom:-18%;width:680px;height:520px;background:rgba(245,168,224,0.10);filter:blur(140px);animation:drift-c 22s ease-in-out infinite alternate" />
+      <!-- aurora blobs — clipped to the hero by .hero-aura (no hero overflow:hidden needed) -->
+      <div aria-hidden="true" class="hero-aura">
+        <div aria-hidden="true" class="ambient-blob" style="left:12%;top:-12%;width:720px;height:620px;background:rgba(183,164,251,0.14);filter:blur(140px);animation:drift-a 26s ease-in-out infinite alternate" />
+        <div aria-hidden="true" class="ambient-blob" style="right:-6%;top:6%;width:640px;height:540px;background:rgba(139,245,201,0.11);filter:blur(130px);animation:drift-b 34s ease-in-out infinite alternate" />
+        <div aria-hidden="true" class="ambient-blob" style="left:28%;bottom:-18%;width:680px;height:520px;background:rgba(245,168,224,0.10);filter:blur(140px);animation:drift-c 22s ease-in-out infinite alternate" />
+      </div>
 
       <div class="landing-inner" style="position:relative;z-index:2">
         <div class="hero-grid">
@@ -245,7 +246,7 @@ const year = new Date().getFullYear();
           </article>
 
           <article class="bento-card card-sheen reveal">
-            <div style="width:36px;height:36px;border-radius:12px;display:grid;place-items:center;background:rgba(139,245,201,0.12);border:1px solid rgba(139,245,201,0.22);color:var(--landing-mint)">🔗</div>
+            <div style="width:36px;height:36px;border-radius:12px;display:grid;place-items:center;background:rgba(139,245,201,0.12);border:1px solid rgba(139,245,201,0.22);color:var(--landing-mint)">◇</div>
             <h3>Connected tools</h3>
             <p>Provider credentials encrypted at rest (AES-256-GCM), never rendered. Used via connections.</p>
             <div class="bento-visual" style="display:flex;gap:8px;align-items:center">
@@ -436,7 +437,7 @@ const year = new Date().getFullYear();
           </div>
           <div>
             <strong>Resources</strong>
-            <a href="https://github.com" target="_blank" rel="noreferrer">GitHub</a>
+            <a href="https://github.com/Vansh-22f300/Automation" target="_blank" rel="noreferrer">GitHub</a>
             <a href="#faq">FAQ</a>
             <span style="color:var(--landing-faint);font-size:13px">No fake docs — API is the source of truth.</span>
           </div>

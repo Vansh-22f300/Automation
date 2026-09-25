@@ -38,10 +38,11 @@ export default defineNuxtConfig({
   },
   app: {
     head: {
+      htmlAttrs: { lang: 'en' },
       title: 'AI Workforce',
       meta: [
         { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-        { name: 'theme-color', content: '#f6f7f9' },
+        { name: 'theme-color', content: '#050508' },
       ],
       link: [
         { rel: 'preconnect', href: 'https://fonts.googleapis.com' },

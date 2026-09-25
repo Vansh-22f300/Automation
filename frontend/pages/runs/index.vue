@@ -87,7 +87,7 @@ function clearFilters() {
         <div style="padding:14px 20px; display:flex; gap:16px; flex-wrap:wrap; border-bottom:1px solid var(--landing-border); background:rgba(255,255,255,0.02)">
           <span style="display:inline-flex; gap:8px; align-items:center; font-size:12px; color:var(--landing-dim)"><span class="status-dot status-dot--success" aria-hidden="true" />{{ succeeded }} succeeded</span>
           <span style="display:inline-flex; gap:8px; align-items:center; font-size:12px; color:var(--landing-dim)"><span class="status-dot status-dot--running" aria-hidden="true" />{{ active }} active</span>
-          <span style="display:inline-flex; gap:8px; align-items:center; font-size:12px; color:#ff9a9a"><span class="status-dot status-dot--failed" aria-hidden="true" />{{ failed }} failed</span>
+          <span style="display:inline-flex; gap:8px; align-items:center; font-size:12px; color:var(--landing-danger)"><span class="status-dot status-dot--failed" aria-hidden="true" />{{ failed }} failed</span>
         </div>
         <div style="padding:10px 20px; display:flex; gap:8px; align-items:center; font-size:11px; color:var(--landing-faint)">
           <Clock3 :size="12" aria-hidden="true" style="color:var(--landing-lilac)" />
@@ -105,10 +105,10 @@ function clearFilters() {
           </div>
         </article>
         <article class="metric-card card-sheen" style="min-height:96px; padding:16px 18px; display:flex; align-items:center; gap:12px; margin:0">
-          <span style="display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.22);color:#ff8a8a"><AlertCircle :size="16" aria-hidden="true" /></span>
+          <span style="display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.22);color:var(--landing-danger-strong)"><AlertCircle :size="16" aria-hidden="true" /></span>
           <div>
             <p style="margin:0;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;font-weight:600">Failed</p>
-            <strong style="font-size:22px;margin:2px 0 0;color:#ff8a8a">{{ failed }}</strong>
+            <strong style="font-size:22px;margin:2px 0 0;color:var(--landing-danger-strong)">{{ failed }}</strong>
             <span style="font-size:11px">needs attention</span>
           </div>
         </article>

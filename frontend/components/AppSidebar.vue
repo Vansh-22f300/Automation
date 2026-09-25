@@ -15,6 +15,13 @@ const navigation = [
   { label: "Runs", to: "/runs", icon: PlaySquare },
   { label: "Connections", to: "/connections", icon: Cable },
 ];
+
+// Prefix-aware active match so sibling detail routes (e.g. /runs/:runId) still
+// highlight their parent nav item — NuxtLink's exact router-link-active does not.
+const route = useRoute();
+function isActive(to: string): boolean {
+  return route.path === to || route.path.startsWith(`${to}/`);
+}
 </script>
 
 <template>
@@ -47,6 +54,7 @@ const navigation = [
         :key="item.to"
         :to="item.to"
         class="nav-link"
+        :class="{ 'router-link-active': isActive(item.to) }"
         @click="$emit('close')"
       >
         <component :is="item.icon" :size="16" aria-hidden="true" />

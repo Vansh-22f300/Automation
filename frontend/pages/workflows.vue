@@ -108,7 +108,6 @@ async function loadPrevious(): Promise<void> {
           <h2 style="margin:0;font-size:14px;color:var(--landing-mist)">Workflow catalog</h2>
           <p style="margin:4px 0 0;font-size:12px;color:var(--landing-faint)">Every workflow is a premium surface — name, status, version, trigger, and runs.</p>
         </div>
-        <span class="pill" style="border-radius:999px; display:none" aria-hidden="true">{{ items.length }} visible</span>
       </div>
 
       <div style="padding:16px">

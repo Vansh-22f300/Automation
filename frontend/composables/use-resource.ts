@@ -3,7 +3,7 @@ import { onMounted, ref } from 'vue';
 export function useResource<T>(loader: () => Promise<T>, immediate = true) {
   const data = ref<T>();
   const error = ref<string>();
-  const pending = ref(false);
+  const pending = ref(immediate);
 
   async function refresh(): Promise<void> {
     pending.value = true;
