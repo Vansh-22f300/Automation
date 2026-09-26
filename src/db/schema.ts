@@ -394,6 +394,45 @@ export const sessions = pgTable(
   ],
 );
 
+/**
+ * A record of one password login attempt, used only to throttle brute force.
+ *
+ * **Global and identifier-keyed, deliberately not a foreign key to `users`.**
+ * The general per-IP rate limiter is in-memory and does not survive across the
+ * serverless instances the app runs on, and it cannot see that ten attempts
+ * from ten IPs all target one account. This table is the durable, account-scoped
+ * counterpart: the login service records a row per *failed* attempt and counts
+ * recent rows for the same `identifier` before verifying a password.
+ *
+ * `identifier` is the **normalised email** the attempt was made against, stored
+ * even when no such user exists. That is the point — keying on a user id would
+ * mean unknown addresses could not be throttled and would take a visibly
+ * different path, turning the throttle into a user-existence oracle. Keying on
+ * the submitted identifier throttles known and unknown addresses identically.
+ *
+ * Rows are immutable events (no `updated_at`); the service prunes ones older
+ * than the window opportunistically, so the table stays small without a reaper.
+ */
+export const loginAttempts = pgTable(
+  'login_attempts',
+  {
+    id: primaryId(),
+    /** The normalised (lower-cased, trimmed) email the attempt targeted. */
+    identifier: text('identifier').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    /**
+     * Serves both hot paths: counting an identifier's attempts since a cutoff,
+     * and pruning rows older than the window. Leading with `identifier` keeps the
+     * per-account count an index range scan.
+     */
+    index('login_attempts_identifier_created_at_idx').on(t.identifier, t.createdAt),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // workflows
 // ---------------------------------------------------------------------------
@@ -1358,6 +1397,9 @@ export type NewPasswordCredential = typeof passwordCredentials.$inferInsert;
 
 export type Session = typeof sessions.$inferSelect;
 export type NewSession = typeof sessions.$inferInsert;
+
+export type LoginAttempt = typeof loginAttempts.$inferSelect;
+export type NewLoginAttempt = typeof loginAttempts.$inferInsert;
 
 export type Workflow = typeof workflows.$inferSelect;
 export type NewWorkflow = typeof workflows.$inferInsert;

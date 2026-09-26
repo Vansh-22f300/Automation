@@ -41,6 +41,16 @@ function extractCredential(request: FastifyRequest): string {
 }
 
 /**
+ * Read the raw bearer token off a request, applying the same extraction rules as
+ * the auth hook. Used by the logout handler, which must revoke *the very token it
+ * was authenticated with* — it re-reads the presented token rather than trusting
+ * any id from the body or URL, so a caller can only ever end its own session.
+ */
+export function readBearerToken(request: FastifyRequest): string {
+  return extractCredential(request);
+}
+
+/**
  * Read the authenticated context off a request, or fail loudly.
  *
  * Routes registered inside the authenticated scope can rely on `request.auth`
@@ -54,6 +64,38 @@ export function requireAuth(request: FastifyRequest): AuthContext {
   return request.auth;
 }
 
+/** The context of a human-session caller: a person acting within one tenant. */
+export interface HumanSessionContext {
+  readonly tenantId: string;
+  readonly userId: string;
+}
+
+/**
+ * Narrow the request's context to a human session, or reject with a 401.
+ *
+ * The `/auth/*` authenticated scope is guarded by the session authenticator, so
+ * in practice only session tokens reach it. This is the explicit, defence-in-depth
+ * check that a human-only route can never be satisfied by a machine credential:
+ * an API-key context carries `apiKeyId` and no `userId`, so it fails here even in
+ * the impossible event it reached this scope. The human-only routes (logout,
+ * current session) go through this rather than bare `requireAuth`.
+ */
+export function requireHumanSession(request: FastifyRequest): HumanSessionContext {
+  const auth = requireAuth(request);
+  if (auth.userId === undefined) {
+    throw new UnauthorizedError();
+  }
+  return { tenantId: auth.tenantId, userId: auth.userId };
+}
+
+/** Register a bearer-token `onRequest` hook on an encapsulated scope. */
+function registerBearerAuth(scope: ApiServer, authenticator: Authenticator): void {
+  scope.addHook('onRequest', async (request) => {
+    const credential = extractCredential(request);
+    request.auth = await authenticator.authenticate(credential);
+  });
+}
+
 /**
  * Attach API-key authentication to a Fastify scope.
  *
@@ -65,8 +107,21 @@ export function requireAuth(request: FastifyRequest): AuthContext {
  * including health.)
  */
 export function registerApiKeyAuth(scope: ApiServer, authenticator: Authenticator): void {
-  scope.addHook('onRequest', async (request) => {
-    const credential = extractCredential(request);
-    request.auth = await authenticator.authenticate(credential);
-  });
+  registerBearerAuth(scope, authenticator);
+}
+
+/**
+ * Attach *human-session* authentication to a Fastify scope — the `/auth/logout`
+ * and `/auth/session` routes.
+ *
+ * Deliberately a separate entry point from {@link registerApiKeyAuth}, guarded by
+ * a distinct authenticator (the session authenticator, resolving opaque session
+ * tokens against the `sessions` table). This keeps the two credential kinds on
+ * structurally separate paths: a session token presented to the `/v1` API-key
+ * scope has no key prefix and is rejected there, and an API key presented here
+ * hashes to a value that is not a live session and is rejected here. Neither
+ * authenticator is weakened to accept the other's credential.
+ */
+export function registerSessionAuth(scope: ApiServer, authenticator: Authenticator): void {
+  registerBearerAuth(scope, authenticator);
 }

@@ -15,6 +15,12 @@ import { createLogger } from "@/observability/logger.js";
 import { buildApp } from "@/api/app.js";
 import { ApiKeyAuthenticator } from "@/auth/api-key-authenticator.js";
 import { DrizzleApiKeyStore } from "@/auth/api-key-store.js";
+import { AuthService } from "@/auth/auth-service.js";
+import { DrizzleAuthUserStore } from "@/auth/auth-user-store.js";
+import { DrizzleLoginThrottle } from "@/auth/login-throttle.js";
+import { argon2PasswordHasher } from "@/auth/password.js";
+import { SessionAuthenticator } from "@/auth/session-authenticator.js";
+import { DrizzleSessionStore } from "@/auth/session-store.js";
 import { ApiKeyRepository } from "@/repositories/api-key-repository.js";
 import { ConnectionRepository } from "@/repositories/connection-repository.js";
 import { PostgresJobQueue } from "@/repositories/job-queue.js";
@@ -43,6 +49,17 @@ const cipher = createCredentialCipher(env, { logger });
 // passes its own transaction so event + run + job commit atomically.
 const queue = new PostgresJobQueue(database.db);
 
+// Human-session authentication, wired additively alongside the API-key path.
+// One tenant-blind session store backs both the authenticator (resolve a token
+// to its tenant+user) and the login/logout service (mint and revoke sessions).
+const sessionStore = new DrizzleSessionStore(database.db);
+const authService = new AuthService(
+  new DrizzleAuthUserStore(database.db),
+  argon2PasswordHasher,
+  sessionStore,
+  new DrizzleLoginThrottle(database.db),
+);
+
 const app = await buildApp({
   logger,
   // `TRUST_PROXY` is validated in `src/config/env.ts`; `false` by default so
@@ -51,6 +68,10 @@ const app = await buildApp({
   // list of proxy CIDRs) and the limiter then keys by the forwarded client IP.
   trustProxy: env.TRUST_PROXY,
   authenticator: new ApiKeyAuthenticator(new DrizzleApiKeyStore(database.db)),
+  // Human sessions: a distinct authenticator over the same session store, so a
+  // session token guards `/auth/*` without ever being accepted on `/v1/*`.
+  sessionAuthenticator: new SessionAuthenticator(sessionStore),
+  authService,
   checkDatabase: () => database.ping(),
   // One tenant-scoped service per authenticated request — the repository is
   // pinned to that tenant and cannot reach across tenants.

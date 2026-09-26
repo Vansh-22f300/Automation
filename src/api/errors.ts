@@ -91,6 +91,29 @@ export class RateLimitedError extends ApiError {
   override readonly code = 'rate_limited';
 }
 
+/**
+ * 409 — credentials are valid, but the account's state needs a choice before the
+ * request can complete. Used for the one legitimate multi-tenant login case: a
+ * verified user who is an active member of more than one tenant, where no session
+ * can be minted until a tenant is selected (a later, explicit design).
+ *
+ * This is raised *only after* a password has already verified, so it reveals
+ * nothing a failed login would hide — an attacker without the password never sees
+ * it. The `code` and message disclose only that a selection is required, never how
+ * many tenants exist nor their names or ids.
+ */
+export class TenantSelectionRequiredError extends ApiError {
+  override readonly statusCode = 409;
+  override readonly code = 'tenant_selection_required';
+
+  constructor(
+    message = 'This account belongs to multiple workspaces; a workspace must be selected to sign in',
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+  }
+}
+
 /** Type guard for `ApiError` subclasses (including `RateLimitedError`). */
 export function isApiError(error: unknown): error is ApiError {
   return error instanceof ApiError;

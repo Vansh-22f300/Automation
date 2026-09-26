@@ -24,6 +24,7 @@ import { registerApiKeyAuth } from "@/api/auth-hook.js";
 import { registerErrorHandling } from "@/api/error-handler.js";
 import { registerApiKeyRoutes } from "@/api/routes/api-keys.js";
 import type { ApiKeyServiceFactory } from "@/api/routes/api-keys.js";
+import { registerAuthRoutes } from "@/api/routes/auth.js";
 import { registerConnectionRoutes } from "@/api/routes/connections.js";
 import type { ConnectionServiceFactory } from "@/api/routes/connections.js";
 import { registerHealthRoute } from "@/api/routes/health.js";
@@ -38,12 +39,22 @@ import type { WebhookIngestorFactory } from "@/api/routes/webhooks.js";
 import type { WebhookSignatureResolverFactory } from "@/api/routes/webhooks.js";
 import type { ApiServer } from "@/api/types.js";
 import type { Authenticator } from "@/auth/context.js";
+import type { AuthService } from "@/auth/auth-service.js";
 import { RateLimitedError } from "@/api/errors.js";
 import { newId } from "@/domain/ids.js";
 
 export interface AppDependencies {
-  /** Resolves credentials to a tenant. */
+  /** Resolves API-key credentials to a tenant (guards `/v1/*`). */
   readonly authenticator: Authenticator;
+  /**
+   * Resolves opaque human *session* tokens (guards the authenticated `/auth/*`
+   * routes). Separate from `authenticator` so the two credential kinds stay on
+   * structurally distinct paths — an API key cannot satisfy a session route and
+   * vice versa. Additive: it does not alter the existing API-key authentication.
+   */
+  readonly sessionAuthenticator: Authenticator;
+  /** Human login/logout/current-session use-cases behind `/auth/*`. */
+  readonly authService: AuthService;
   /** Probes database reachability for `/readyz`. */
   readonly checkDatabase: DatabaseHealthCheck;
   /** Builds a tenant-scoped API-key service for an authenticated request. */
@@ -204,6 +215,15 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
   // proves the process can serve traffic by probing the database.
   registerHealthRoute(app);
   registerReadyzRoute(app, deps.checkDatabase);
+
+  // Human authentication. `POST /auth/login` is public (registered at the top
+  // level, subject to the global IP limiter and the account throttle); logout and
+  // current-session live in their own session-guarded scope inside this helper.
+  // Kept entirely separate from the API-key `/v1/*` surface below.
+  await registerAuthRoutes(app, {
+    authService: deps.authService,
+    sessionAuthenticator: deps.sessionAuthenticator,
+  });
 
   // Everything below requires a valid API key. Encapsulated so the auth hook does
   // not touch the public route above. The plugin callback's instance is typed
