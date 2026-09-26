@@ -18,7 +18,7 @@
  * whose name does not contain "test".
  */
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { DatabaseHandle } from '@/db/client.js';
@@ -59,7 +59,12 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('database integration', () => {
 
   afterAll(async () => {
     if (handle === undefined) return;
-    // Cascades remove users, workflows and versions.
+    // Deleting a tenant cascades to its workflows and versions (and, once they
+    // exist, memberships and sessions) — but NOT to users, which are global
+    // now. Remove the users this suite created explicitly so it stays idempotent.
+    await handle.db
+      .delete(users)
+      .where(inArray(users.email, ['casing@example.com', 'second@example.com']));
     for (const id of [tenantId, otherTenantId]) {
       if (id !== undefined) await handle.db.delete(tenants).where(eq(tenants.id, id));
     }
@@ -78,6 +83,9 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('database integration', () => {
       'events',
       'jobs',
       'llm_usage',
+      'memberships',
+      'password_credentials',
+      'sessions',
       'tenants',
       'tool_effects',
       'users',
@@ -102,20 +110,20 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('database integration', () => {
     await handle.db.delete(tenants).where(eq(tenants.id, tenant!.id));
   });
 
-  it('treats email uniqueness as case-insensitive within a tenant', async () => {
-    await handle.db.insert(users).values({ tenantId, email: 'casing@example.com' });
+  it('treats email uniqueness as case-insensitive and global', async () => {
+    await handle.db.insert(users).values({ email: 'casing@example.com' });
 
     const error = await handle.db
       .insert(users)
-      .values({ tenantId, email: 'Casing@Example.com' })
+      .values({ email: 'Casing@Example.com' })
       .then(() => undefined, (caught: unknown) => caught);
 
     expect(sqlStateOf(error)).toBe(UNIQUE_VIOLATION);
   });
 
-  it('allows the same email in a different tenant', async () => {
+  it('accepts a distinct email as a separate global account', async () => {
     await expect(
-      handle.db.insert(users).values({ tenantId: otherTenantId, email: 'casing@example.com' }),
+      handle.db.insert(users).values({ email: 'second@example.com' }),
     ).resolves.toBeDefined();
   });
 

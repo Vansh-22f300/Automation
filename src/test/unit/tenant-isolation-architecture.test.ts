@@ -15,9 +15,12 @@
  *          optional `tenantId` constructor option that activates a
  *          tenant predicate when set, or a per-invocation `tenantId` field
  *          on the runtime argument, e.g. `ClaimedJob.tenantId`).
- *   - The single legitimate "operates on tenant data with a bare db and no
- *     tenant mechanism" exception is `DrizzleApiKeyStore`, because
- *     authentication is the one path that runs *before* the tenant is known.
+ *   - The legitimate "operates on tenant data with a bare db and no tenant
+ *     mechanism" exceptions are the two authentication stores
+ *     (`DrizzleApiKeyStore`, `DrizzleSessionStore`), because authentication is
+ *     the one path that runs *before* the tenant is known. Both live under
+ *     `src/auth/` and are confined by the bare-db auth-exception guard at the
+ *     bottom of this file.
  *
  * This test reads the source of every file under [src/repositories/](src/repositories/)
  * and enforces that contract. It is a build-time guard against the most
@@ -75,12 +78,14 @@ const KNOWN_TENANT_AWARE_BY_RUNTIME = new Set<string>([
 
 /**
  * The single legitimate "operates on tenant data with a bare db and no
- * tenant mechanism" exception. The class header documents why.
+ * tenant mechanism" exception *within this directory*. The class header of
+ * each real exception documents why.
  *
- * NOTE: the only known bare-db class is `DrizzleApiKeyStore`, but it lives in
- * [src/auth/api-key-store.ts](src/auth/api-key-store.ts), not in
- * [src/repositories/](src/repositories/). The list is intentionally empty so
- * the test fails loudly if a future author adds a class to
+ * NOTE: the known bare-db classes are `DrizzleApiKeyStore` and
+ * `DrizzleSessionStore`, but both live under [src/auth/](src/auth/), not in
+ * [src/repositories/](src/repositories/), and are confined by the bare-db
+ * auth-exception guard at the bottom of this file. This list is intentionally
+ * empty so the test fails loudly if a future author adds a class to
  * [src/repositories/](src/repositories/) that takes a bare `db` and queries
  * a tenant-scoped table.
  */
@@ -106,7 +111,8 @@ const NOT_A_REPOSITORY = new Set<string>([
  * so without the camelCase form here the static check would miss it.
  */
 const TENANT_SCOPED_TABLE_NAMES = [
-  'users',
+  'memberships',
+  'sessions',
   'workflows',
   'workflow_versions',
   'workflowVersions',
@@ -377,53 +383,91 @@ describe('tenant-isolation architecture', () => {
     });
   });
 
-  describe('the bare-db exception is read-only and confined to authentication', () => {
-    // `DrizzleApiKeyStore` is the single tenant-blind path. It must:
-    //   - not extend TenantScopedRepository (it has no tenant at use time),
-    //   - take a bare `AppDatabase` (verified above),
-    //   - not be imported anywhere except the authenticator seam and the
-    //     tests that legitimately exercise that seam.
-    it('DrizzleApiKeyStore is only imported by the authenticator seam', () => {
-      const handle = readFileSync(
-        join(process.cwd(), 'src/auth/api-key-store.ts'),
-        'utf8',
-      );
-      // The store itself is the only class declared here.
-      expect(/export\s+class\s+DrizzleApiKeyStore\b/.test(handle)).toBe(true);
+  describe('each bare-db auth exception is confined to its authenticator seam', () => {
+    // There are exactly two deliberately tenant-blind data paths, and both live
+    // under `src/auth/` for the same chicken-and-egg reason: the caller presents
+    // a credential *in order to discover* which tenant it belongs to, so the
+    // resolving lookup cannot itself carry a tenant predicate.
+    //
+    //   - `DrizzleApiKeyStore`  resolves the tenant from an API-key prefix.
+    //   - `DrizzleSessionStore` resolves the tenant/user from a session token.
+    //
+    // Each must be reachable only from its own seam: the store's own file, the
+    // composition root that wires it, and the tests that exercise that seam.
+    // Anywhere else is a smuggling attempt — a bare-db, unscoped store escaping
+    // into ordinary application code where it could run cross-tenant queries.
+    //
+    // The scan strips comments first (see `stripComments`): a sibling auth file
+    // that *names* the other exception in its documentation, to explain the
+    // parallel, is not a reference to guard against. Only real code — imports,
+    // `new`, string/regex literals — counts.
+    interface BareDbAuthException {
+      readonly className: string;
+      /** Where the class is declared; must contain its `export class`. */
+      readonly declaringFile: string;
+      /** Files allowed to reference the class in real (non-comment) code. */
+      readonly allowed: ReadonlySet<string>;
+    }
 
-      // Search the rest of the codebase for `DrizzleApiKeyStore` references.
-      // Allowed:
-      //   - the declaring file
-      //   - the authenticator seam (the only production consumer)
-      //   - the composition root that wires the authenticator
-      //   - integration tests that exercise the authenticator via this store
-      //   - this architecture test
-      // Anywhere else is a smuggling attempt.
-      const allowedImports = new Set<string>([
-        'src/auth/api-key-store.ts',
-        'src/auth/api-key-authenticator.ts',
-        'src/api/server.ts',
-        'src/test/unit/tenant-isolation-architecture.test.ts',
-        'src/test/integration/api-keys.test.ts',
-        'src/test/integration/tenant-isolation.test.ts',
-      ]);
-      const violations: string[] = [];
-      walk('src', (path, source) => {
-        const rel = relative(process.cwd(), path).replace(/\\/g, '/');
-        if (allowedImports.has(rel)) return;
-        if (/\bDrizzleApiKeyStore\b/.test(source)) {
-          violations.push(rel);
+    const THIS_TEST = 'src/test/unit/tenant-isolation-architecture.test.ts';
+
+    const EXCEPTIONS: readonly BareDbAuthException[] = [
+      {
+        className: 'DrizzleApiKeyStore',
+        declaringFile: 'src/auth/api-key-store.ts',
+        allowed: new Set<string>([
+          'src/auth/api-key-store.ts', // the declaration
+          'src/auth/api-key-authenticator.ts', // the authenticator seam
+          'src/api/server.ts', // composition root
+          THIS_TEST, // this guard (names it in string/regex literals)
+          'src/test/integration/api-keys.test.ts',
+          'src/test/integration/tenant-isolation.test.ts',
+          'src/test/integration/auth.test.ts', // exercises the assembled auth seam
+        ]),
+      },
+      {
+        className: 'DrizzleSessionStore',
+        declaringFile: 'src/auth/session-store.ts',
+        allowed: new Set<string>([
+          'src/auth/session-store.ts', // the declaration
+          'src/api/server.ts', // composition root
+          THIS_TEST, // this guard (names it in string/regex literals)
+          'src/test/integration/sessions.test.ts',
+          'src/test/integration/auth.test.ts', // exercises the assembled auth seam
+        ]),
+      },
+    ];
+
+    for (const exc of EXCEPTIONS) {
+      it(`${exc.className} is only referenced from its authenticator seam`, () => {
+        // The store is declared where we expect (and only there).
+        const handle = readFileSync(join(process.cwd(), exc.declaringFile), 'utf8');
+        expect(
+          new RegExp(`export\\s+class\\s+${exc.className}\\b`).test(handle),
+        ).toBe(true);
+
+        const token = new RegExp(`\\b${exc.className}\\b`);
+        const violations: string[] = [];
+        walk('src', (path, source) => {
+          const rel = relative(process.cwd(), path).replace(/\\/g, '/');
+          if (exc.allowed.has(rel)) return;
+          // Match real code only — a comment that names the *other* exception to
+          // document the parallel is not a smuggling attempt.
+          if (token.test(stripComments(source))) {
+            violations.push(rel);
+          }
+        });
+        if (violations.length > 0) {
+          throw new Error(
+            `${exc.className} must only be referenced from its authenticator seam.\n` +
+              `Unexpected references in:\n  - ${violations.join('\n  - ')}`,
+          );
         }
+        expect(violations).toEqual([]);
       });
-      if (violations.length > 0) {
-        throw new Error(
-          `DrizzleApiKeyStore must only be referenced from the authenticator seam.\n` +
-            `Unexpected references in:\n  - ${violations.join('\n  - ')}`,
-        );
-      }
-      expect(violations).toEqual([]);
-    });
+    }
   });
+
 });
 
 /**
@@ -444,4 +488,18 @@ function walk(dir: string, visit: (path: string, source: string) => void): void 
     const source = readFileSync(child, 'utf8');
     visit(child, source);
   }
+}
+
+/**
+ * Strip `//` line comments and `/* … *\/` block comments so a class named only
+ * in documentation (e.g. one auth store's header explaining the parallel to the
+ * other) is not mistaken for a real code reference. Deliberately coarse, like
+ * the rest of this guard: the `[^:]` guard leaves `http://…` URLs intact, and
+ * the identifiers we scan for never appear inside string literals that also
+ * carry `//`, so no real reference is lost.
+ */
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
 }

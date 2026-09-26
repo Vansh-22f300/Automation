@@ -23,8 +23,17 @@
 export interface AuthContext {
   /** The tenant every downstream query must be scoped to. */
   readonly tenantId: string;
-  /** Which API key authenticated this request (for audit / last-used). */
-  readonly apiKeyId: string;
+  /**
+   * Which API key authenticated this request (for audit / last-used). Present
+   * only for API-key callers; a human session leaves it absent. Optional so the
+   * session path need not fabricate a key id it does not have.
+   */
+  readonly apiKeyId?: string;
+  /**
+   * Which user authenticated this request. Present only for human sessions; an
+   * API-key caller (which acts as the tenant, not a person) leaves it absent.
+   */
+  readonly userId?: string;
 }
 
 /**
