@@ -88,6 +88,15 @@ export class DrizzleSessionStore implements SessionStore {
   }
 
   async findActiveByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null> {
+    // INTENTIONALLY UNSCOPED (see this file's header): the pre-tenant discovery
+    // lookup. The token *is* the credential that resolves the tenant, so no
+    // tenant predicate can precede it — and one taken from the caller would be
+    // unsafe. We match on the unique token hash alone; the tenant/user come
+    // *out* of the joined row, never in. This is the session counterpart to
+    // `DrizzleApiKeyStore.findByPrefix`, and is quarantined the same way — the
+    // "bare-db auth exception" guard in tenant-isolation-architecture.test.ts
+    // confines it to the session-authenticator seam.
+    //
     // `now()` is evaluated by Postgres (transaction time), so expiry does not
     // depend on the app server's clock. The join is guaranteed by the composite
     // FK; membership status/role come back for the authenticator to judge.
