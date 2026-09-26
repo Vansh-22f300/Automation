@@ -13,6 +13,7 @@ import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "@/api/app.js";
+import { inertHumanAuth } from "./human-auth-stubs.js";
 import type { ApiServer } from "@/api/types.js";
 import type { AuthContext, Authenticator } from "@/auth/context.js";
 
@@ -41,6 +42,7 @@ async function makeApp(): Promise<Harness> {
 
   const app = await buildApp({
     logger: captureLogger(),
+    ...inertHumanAuth(),
     authenticator,
     checkDatabase: async () => {
       checkCalls.count += 1;

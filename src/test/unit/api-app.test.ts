@@ -24,6 +24,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { buildApp } from "@/api/app.js";
 import { UnauthorizedError } from "@/api/errors.js";
 import type { ApiServer } from "@/api/types.js";
+import type { AuthService } from "@/auth/auth-service.js";
 import type { AuthContext, Authenticator } from "@/auth/context.js";
 import { generateApiKey } from "@/auth/api-key.js";
 import { newId } from "@/domain/ids.js";
@@ -144,6 +145,27 @@ async function makeApp(): Promise<Harness> {
   const app = await buildApp({
     logger,
     authenticator: backend.authenticator,
+    // Human-session auth is not exercised by this suite (it covers the public
+    // routes and the API-key `/v1/*` surface only). Supply inert stand-ins so
+    // buildApp's dependency set is satisfied without loosening anything: a
+    // session authenticator that accepts no token, and an auth service whose
+    // use-cases are never reached from these routes.
+    sessionAuthenticator: {
+      authenticate: async (): Promise<AuthContext> => {
+        throw new UnauthorizedError();
+      },
+    },
+    authService: {
+      login: async () => {
+        throw new Error("not used");
+      },
+      logout: async () => {
+        throw new Error("not used");
+      },
+      getCurrentSession: async () => {
+        throw new Error("not used");
+      },
+    } as unknown as AuthService,
     checkDatabase: async () => {
       if (!dbHealthy.value)
         throw new Error("connection refused to 10.0.0.9:5432");

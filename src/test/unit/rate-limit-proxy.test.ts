@@ -25,6 +25,7 @@ import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "@/api/app.js";
+import { inertHumanAuth } from "./human-auth-stubs.js";
 import { UnauthorizedError } from "@/api/errors.js";
 import type { ApiServer } from "@/api/types.js";
 import type { AuthContext, Authenticator } from "@/auth/context.js";
@@ -51,6 +52,7 @@ async function makeApp(opts: {
 }): Promise<ApiServer> {
   const base = {
     logger: silentLogger(),
+    ...inertHumanAuth(),
     authenticator,
     checkDatabase: async () => undefined,
     // Minimal tenant-scoped services — only /v1/api-keys is hit in these tests.

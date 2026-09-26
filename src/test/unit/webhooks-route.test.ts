@@ -14,6 +14,7 @@ import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "@/api/app.js";
+import { inertHumanAuth } from "./human-auth-stubs.js";
 import { UnauthorizedError } from "@/api/errors.js";
 import type { ApiServer } from "@/api/types.js";
 import type { AuthContext, Authenticator } from "@/auth/context.js";
@@ -93,6 +94,7 @@ async function makeApp(): Promise<Harness> {
   const openResolver = new OpenSignatureResolver();
   const app = await buildApp({
     logger: silentLogger(),
+    ...inertHumanAuth(),
     authenticator,
     checkDatabase: async () => undefined,
     apiKeyServiceFor: () => {
@@ -375,6 +377,7 @@ describe("POST /v1/webhooks/:source — signature verification (route-level log 
     const ingestor = new RecordingIngestor();
     const app = await buildApp({
       logger: capturingLogger,
+      ...inertHumanAuth(),
       authenticator,
       checkDatabase: async () => undefined,
       apiKeyServiceFor: () => {
@@ -462,6 +465,7 @@ describe("POST /v1/webhooks/:source — signature verification (route-level log 
     const ingestor = new RecordingIngestor();
     const app = await buildApp({
       logger: capturingLogger,
+      ...inertHumanAuth(),
       authenticator,
       checkDatabase: async () => undefined,
       apiKeyServiceFor: () => {

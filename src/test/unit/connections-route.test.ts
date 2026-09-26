@@ -2,6 +2,7 @@ import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "@/api/app.js";
+import { inertHumanAuth } from "./human-auth-stubs.js";
 import { UnauthorizedError } from "@/api/errors.js";
 import type { ApiServer } from "@/api/types.js";
 import type { AuthContext, Authenticator } from "@/auth/context.js";
@@ -109,6 +110,7 @@ interface Harness {
 async function makeApp(): Promise<Harness> {
   const app = await buildApp({
     logger: silentLogger(),
+    ...inertHumanAuth(),
     authenticator,
     checkDatabase: async () => undefined,
     apiKeyServiceFor: () => ({

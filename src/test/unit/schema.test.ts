@@ -19,6 +19,11 @@ import {
   events,
   jobStatus,
   jobs,
+  membershipRole,
+  membershipStatus,
+  memberships,
+  passwordCredentials,
+  sessions,
   tenantStatus,
   tenants,
   triggerType,
@@ -54,6 +59,9 @@ function columnNames(entries: readonly unknown[]): string[] {
 const ALL_TABLES = {
   tenants,
   users,
+  memberships,
+  password_credentials: passwordCredentials,
+  sessions,
   workflows,
   workflow_versions: workflowVersions,
   api_keys: apiKeys,
@@ -61,8 +69,12 @@ const ALL_TABLES = {
   workflow_runs: workflowRuns,
   jobs,
 };
+// users is deliberately absent here: it is global now, not tenant-scoped.
+// password_credentials is global too (a password belongs to the person, not a
+// tenant), so only memberships and sessions join a user to a tenant.
 const TENANT_SCOPED = {
-  users,
+  memberships,
+  sessions,
   workflows,
   workflow_versions: workflowVersions,
   api_keys: apiKeys,
@@ -165,6 +177,8 @@ describe('enumerated columns', () => {
   it('constrain status and trigger values at the type level', () => {
     expect(tenantStatus.enumValues).toEqual(['active', 'suspended']);
     expect(userStatus.enumValues).toEqual(['active', 'disabled']);
+    expect(membershipRole.enumValues).toEqual(['owner', 'member']);
+    expect(membershipStatus.enumValues).toEqual(['active', 'disabled']);
     expect(workflowStatus.enumValues).toEqual(['draft', 'active', 'disabled']);
     expect(triggerType.enumValues).toEqual(['webhook']);
     expect(workflowRunStatus.enumValues).toEqual([
@@ -194,15 +208,19 @@ describe('enumerated columns', () => {
 });
 
 describe('users', () => {
-  it('is unique per tenant on a case-insensitive email', () => {
+  it('is globally unique on a case-insensitive email', () => {
     const index = getTableConfig(users).indexes.find(
-      (i) => i.config.name === 'users_tenant_id_email_key',
+      (i) => i.config.name === 'users_email_key',
     );
 
     expect(index).toBeDefined();
     expect(index?.config.unique).toBe(true);
-    // tenant_id leads, then lower(email) as an expression.
-    expect(columnNames(index?.config.columns ?? [])).toEqual(['tenant_id', '(expression)']);
+    // lower(email) as an expression, with no leading tenant_id: identity is global.
+    expect(columnNames(index?.config.columns ?? [])).toEqual(['(expression)']);
+  });
+
+  it('is no longer tenant-scoped — one global account per person', () => {
+    expect([...columns(users).keys()]).not.toContain('tenant_id');
   });
 
   it('holds no authentication material', () => {
@@ -509,5 +527,137 @@ describe('jobs', () => {
     expect(columnNames(reaping?.config.columns ?? [])).toEqual(['lease_expires_at']);
     // Restricted to running rows so the reaper sweep never scans settled work.
     expect(reaping?.config.where).toBeDefined();
+  });
+});
+
+describe('memberships', () => {
+  it('joins a user to a tenant with a NOT NULL uuid tenant_id and user_id', () => {
+    for (const name of ['tenant_id', 'user_id'] as const) {
+      const c = column(memberships, name);
+      expect(c.getSQLType()).toBe('uuid');
+      expect(c.notNull).toBe(true);
+    }
+  });
+
+  it('permits one membership per (tenant, user)', () => {
+    const unique = getTableConfig(memberships).uniqueConstraints.find(
+      (u) => u.name === 'memberships_tenant_id_user_id_key',
+    );
+
+    expect(unique).toBeDefined();
+    expect(columnNames(unique?.columns ?? [])).toEqual(['tenant_id', 'user_id']);
+  });
+
+  it('cascades from both its tenant and its user, orphaning neither', () => {
+    const targets = getTableConfig(memberships).foreignKeys.map((fk) => ({
+      columns: columnNames(fk.reference().columns),
+      table: getTableConfig(fk.reference().foreignTable).name,
+      onDelete: fk.onDelete,
+    }));
+
+    expect(targets).toEqual(
+      expect.arrayContaining([
+        { columns: ['tenant_id'], table: 'tenants', onDelete: 'cascade' },
+        { columns: ['user_id'], table: 'users', onDelete: 'cascade' },
+      ]),
+    );
+  });
+
+  it('carries a minimal role and status, not a permissions table', () => {
+    expect(column(memberships, 'role').getSQLType()).toBe('membership_role');
+    expect(column(memberships, 'status').getSQLType()).toBe('membership_status');
+    expect(column(memberships, 'role').hasDefault).toBe(true);
+    expect(column(memberships, 'status').hasDefault).toBe(true);
+
+    const names = [...columns(memberships).keys()];
+    for (const forbidden of ['permission', 'permissions', 'scopes']) {
+      expect(names).not.toContain(forbidden);
+    }
+  });
+});
+
+describe('password_credentials', () => {
+  it('stores only a KDF hash, never a plaintext password', () => {
+    const names = [...columns(passwordCredentials).keys()];
+
+    expect(names).toContain('password_hash');
+    expect(column(passwordCredentials, 'password_hash').notNull).toBe(true);
+    // No column that could hold the password itself or a stray token.
+    for (const forbidden of ['password', 'plaintext', 'secret', 'token']) {
+      expect(names).not.toContain(forbidden);
+    }
+  });
+
+  it('binds exactly one credential to one user, cascading on user delete', () => {
+    const unique = getTableConfig(passwordCredentials).uniqueConstraints.find(
+      (u) => u.name === 'password_credentials_user_id_key',
+    );
+    expect(unique).toBeDefined();
+    expect(columnNames(unique?.columns ?? [])).toEqual(['user_id']);
+
+    const foreignKeys = getTableConfig(passwordCredentials).foreignKeys;
+    expect(foreignKeys).toHaveLength(1);
+    expect(getTableConfig(foreignKeys[0]!.reference().foreignTable).name).toBe('users');
+    expect(foreignKeys[0]?.onDelete).toBe('cascade');
+  });
+
+  it('is not tenant-scoped — a password is global to the person', () => {
+    expect([...columns(passwordCredentials).keys()]).not.toContain('tenant_id');
+  });
+});
+
+describe('sessions', () => {
+  it('stores only a token hash, never the plaintext token', () => {
+    const names = [...columns(sessions).keys()];
+
+    expect(names).toContain('token_hash');
+    // token_hash is fine; a bare token/secret/password column is not.
+    for (const forbidden of ['token', 'plaintext', 'secret', 'password']) {
+      expect(names).not.toContain(forbidden);
+    }
+  });
+
+  it('resolves a session by a unique token hash', () => {
+    const index = getTableConfig(sessions).indexes.find(
+      (i) => i.config.name === 'sessions_token_hash_key',
+    );
+
+    expect(index).toBeDefined();
+    expect(index?.config.unique).toBe(true);
+    expect(columnNames(index?.config.columns ?? [])).toEqual(['token_hash']);
+  });
+
+  it('must expire; revocation is a nullable soft delete', () => {
+    expect(column(sessions, 'expires_at').notNull).toBe(true);
+
+    const revokedAt = column(sessions, 'revoked_at');
+    expect(revokedAt.notNull).toBe(false);
+    expect(revokedAt.hasDefault).toBe(false);
+
+    // A session is created, then maybe revoked — no generic updated_at.
+    expect([...columns(sessions).keys()]).not.toContain('updated_at');
+  });
+
+  it('is tenant-bound through a composite FK onto a membership', () => {
+    const foreignKeys = getTableConfig(sessions).foreignKeys;
+    expect(foreignKeys).toHaveLength(1);
+
+    const reference = foreignKeys[0]?.reference();
+    // (tenant_id, user_id) → memberships(tenant_id, user_id): a session cannot
+    // exist without the membership, so it can never outlive one.
+    expect(columnNames(reference?.columns ?? [])).toEqual(['tenant_id', 'user_id']);
+    expect(getTableConfig(reference!.foreignTable).name).toBe('memberships');
+    expect(columnNames(reference?.foreignColumns ?? [])).toEqual(['tenant_id', 'user_id']);
+    expect(foreignKeys[0]?.onDelete).toBe('cascade');
+  });
+
+  it('has a supporting index for the composite FK and session listing', () => {
+    const index = getTableConfig(sessions).indexes.find(
+      (i) => i.config.name === 'sessions_tenant_id_user_id_idx',
+    );
+
+    expect(index).toBeDefined();
+    expect(index?.config.unique).toBe(false);
+    expect(columnNames(index?.config.columns ?? [])).toEqual(['tenant_id', 'user_id']);
   });
 });
