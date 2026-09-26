@@ -94,6 +94,26 @@ const timestamps = () => ({
 
 export const tenantStatus = pgEnum('tenant_status', ['active', 'suspended']);
 export const userStatus = pgEnum('user_status', ['active', 'disabled']);
+
+/**
+ * A person's role within one tenant. Deliberately minimal — two values, not a
+ * permission matrix. `owner` administers the tenant; `member` is everyone else.
+ * This is the *only* authorization primitive introduced here: enough to tell
+ * "can administer" from "can use" when sign-in lands, without committing to a
+ * roles/permissions table a real RBAC design would own. Widening it later is an
+ * `ALTER TYPE … ADD VALUE`.
+ */
+export const membershipRole = pgEnum('membership_role', ['owner', 'member']);
+
+/**
+ * Whether a person's membership in a tenant is currently usable. Distinct from
+ * `user_status`, which disables the human globally: a membership may be
+ * `disabled` (access revoked from this one tenant) while the user stays active
+ * elsewhere. Soft-disabling keeps the row — and its audit trail — rather than
+ * deleting it (which would cascade the person's sessions in this tenant away).
+ */
+export const membershipStatus = pgEnum('membership_status', ['active', 'disabled']);
+
 export const workflowStatus = pgEnum('workflow_status', ['draft', 'active', 'disabled']);
 
 /**
@@ -221,21 +241,21 @@ export const tenants = pgTable('tenants', {
 // ---------------------------------------------------------------------------
 
 /**
- * A human who belongs to exactly one tenant.
+ * A human. **Global** — identity is not scoped to a tenant. A person has one
+ * account across the whole platform and reaches individual tenants through
+ * `memberships`. (This table used to carry a `tenant_id`; sign-in needs one
+ * global identity per email, so that column is gone — the same person no longer
+ * needs a duplicate row per tenant.)
  *
- * Intentionally free of authentication material. No password hash, no session,
- * no OAuth identity, no role — those belong to the step that actually
- * implements sign-in, and inventing columns now would guess wrong. This table
- * exists so that things which must attribute an action to a person (audit
- * entries, human approvals) have somewhere to point.
+ * Still intentionally free of authentication material. No password hash, no
+ * session token — those live in `password_credentials` and `sessions`, the
+ * dedicated tables the auth step owns. This table only answers "who is this
+ * person": the thing audit entries and human approvals point at.
  */
 export const users = pgTable(
   'users',
   {
     id: primaryId(),
-    tenantId: uuid('tenant_id')
-      .notNull()
-      .references(() => tenants.id, { onDelete: 'cascade' }),
     email: text('email').notNull(),
     /** Display name. Optional — an invited user may have no name yet. */
     name: text('name'),
@@ -244,15 +264,133 @@ export const users = pgTable(
   },
   (t) => [
     /**
-     * Unique per tenant, case-insensitively. The same person may legitimately
-     * hold accounts in two tenants, so the constraint is scoped rather than
-     * global. `lower(email)` is enforced in the index instead of trusting every
-     * caller to normalise: "Bob@x.com" and "bob@x.com" are one account.
-     *
-     * Also serves as the tenant-scoped lookup index (leading column tenant_id),
-     * so no separate index on tenant_id is warranted.
+     * Globally unique, case-insensitively. One account per email address across
+     * the whole platform — the identity a person signs in with, and the lookup
+     * index for "find the user for this email". `lower(email)` is enforced here
+     * rather than trusting every caller to normalise, so "Bob@x.com" and
+     * "bob@x.com" are one account. (Was per-tenant; users are global now, so the
+     * tenant column leading this index is dropped along with it.)
      */
-    uniqueIndex('users_tenant_id_email_key').on(t.tenantId, sql`lower(${t.email})`),
+    uniqueIndex('users_email_key').on(sql`lower(${t.email})`),
+  ],
+);
+
+/**
+ * A person's membership in one tenant — the join that keeps users global while
+ * keeping every *use* of the platform tenant-scoped. A user may belong to many
+ * tenants; a tenant has many users; each (tenant, user) pairing is one row.
+ *
+ * Deliberately a minimal membership, not an RBAC system: a single `role`
+ * (owner/member) is the only authorization primitive, and `status` lets a
+ * tenant disable a member without deleting the row. No permissions table, no
+ * scopes — those belong to a later, explicit design.
+ */
+export const memberships = pgTable(
+  'memberships',
+  {
+    id: primaryId(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    role: membershipRole('role').notNull().default('member'),
+    status: membershipStatus('status').notNull().default('active'),
+    ...timestamps(),
+  },
+  (t) => [
+    /**
+     * One membership per (tenant, user). Also the composite unique that
+     * `sessions(tenant_id, user_id)` references — Postgres will only point a
+     * composite FK at a column set that carries an explicit unique constraint.
+     * Its leading `tenant_id` also backs the tenant FK's cascade.
+     */
+    unique('memberships_tenant_id_user_id_key').on(t.tenantId, t.userId),
+    /** Backs the user FK's cascade and "which tenants does this user belong to". */
+    index('memberships_user_id_idx').on(t.userId),
+  ],
+);
+
+/**
+ * A user's password credential, in its own table so the authentication secret
+ * is isolated from the identity record. **`password_hash` stores only the
+ * output of a password KDF** (e.g. argon2id) — never a plaintext password, and
+ * never the API-key SHA-256 scheme. Password *hashing* is the next phase; this
+ * table only reserves the column's durable shape.
+ *
+ * One row per user (`unique(user_id)`), global like the user: a person has a
+ * single password regardless of how many tenants they belong to. Deleting the
+ * user removes the credential. Deliberately absent for now: reset tokens,
+ * email-verification tokens, failed-attempt counters — separate later concerns,
+ * not columns to guess at.
+ */
+export const passwordCredentials = pgTable(
+  'password_credentials',
+  {
+    id: primaryId(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    /** Password KDF output only. Never plaintext, never the API-key hash scheme. */
+    passwordHash: text('password_hash').notNull(),
+    ...timestamps(),
+  },
+  (t) => [
+    /** One credential per user; also the lookup and the user FK's cascade index. */
+    unique('password_credentials_user_id_key').on(t.userId),
+  ],
+);
+
+/**
+ * A logged-in session, tenant-bound. A session is always one person acting in
+ * one tenant: `(tenant_id, user_id)` is a composite foreign key onto
+ * `memberships(tenant_id, user_id)`, so a session cannot exist unless that
+ * person is actually a member of that tenant — and revoking the membership (or
+ * deleting the user or the tenant) cascades the session away. That single
+ * composite FK is the only referential integrity the row needs; separate FKs to
+ * users and tenants would be redundant and could disagree with the membership.
+ *
+ * **`token_hash` stores only a hash of the session token**, never the token —
+ * the same discipline as `api_keys.key_hash`. The plaintext token is returned
+ * to the client once and never persisted; token *hashing* and the login/logout
+ * code that mints and clears sessions are the next phase.
+ *
+ * `expires_at` is mandatory (a session with no expiry is a permanent
+ * credential); `revoked_at` is a nullable soft-delete for explicit logout,
+ * mirroring `api_keys.revoked_at`.
+ */
+export const sessions = pgTable(
+  'sessions',
+  {
+    id: primaryId(),
+    tenantId: uuid('tenant_id').notNull(),
+    userId: uuid('user_id').notNull(),
+    /** A hash of the session token, never the token itself. */
+    tokenHash: text('token_hash').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+    /** Set on explicit logout/revocation; null while the session is live. */
+    revokedAt: timestamp('revoked_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    /**
+     * Bound to a real membership in the same tenant. Deleting that membership
+     * (directly, or via user/tenant delete) cascades the session away — no
+     * orphans. A single-column FK on user_id would let a session name a
+     * (tenant, user) pair with no membership; this makes that unrepresentable.
+     */
+    foreignKey({
+      name: 'sessions_tenant_id_user_id_fkey',
+      columns: [t.tenantId, t.userId],
+      foreignColumns: [memberships.tenantId, memberships.userId],
+    }).onDelete('cascade'),
+    /** Every authenticated request resolves a session by its token hash. */
+    uniqueIndex('sessions_token_hash_key').on(t.tokenHash),
+    /** Backs the composite FK's cascade and "list/revoke this member's sessions". */
+    index('sessions_tenant_id_user_id_idx').on(t.tenantId, t.userId),
   ],
 );
 
@@ -1092,7 +1230,8 @@ export const toolEffects = pgTable(
 // enforces. They exist so joins can be expressed by name.
 
 export const tenantsRelations = relations(tenants, ({ many }) => ({
-  users: many(users),
+  memberships: many(memberships),
+  sessions: many(sessions),
   workflows: many(workflows),
   workflowVersions: many(workflowVersions),
   apiKeys: many(apiKeys),
@@ -1105,8 +1244,23 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   toolEffects: many(toolEffects),
 }));
 
-export const usersRelations = relations(users, ({ one }) => ({
-  tenant: one(tenants, { fields: [users.tenantId], references: [tenants.id] }),
+export const usersRelations = relations(users, ({ one, many }) => ({
+  memberships: many(memberships),
+  passwordCredential: one(passwordCredentials),
+  sessions: many(sessions),
+}));
+
+export const membershipsRelations = relations(memberships, ({ one }) => ({
+  tenant: one(tenants, { fields: [memberships.tenantId], references: [tenants.id] }),
+  user: one(users, { fields: [memberships.userId], references: [users.id] }),
+}));
+
+export const passwordCredentialsRelations = relations(passwordCredentials, ({ one }) => ({
+  user: one(users, { fields: [passwordCredentials.userId], references: [users.id] }),
+}));
+
+export const sessionsRelations = relations(sessions, ({ one }) => ({
+  user: one(users, { fields: [sessions.userId], references: [users.id] }),
 }));
 
 export const apiKeysRelations = relations(apiKeys, ({ one }) => ({
@@ -1195,6 +1349,15 @@ export type NewTenant = typeof tenants.$inferInsert;
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
+
+export type Membership = typeof memberships.$inferSelect;
+export type NewMembership = typeof memberships.$inferInsert;
+
+export type PasswordCredential = typeof passwordCredentials.$inferSelect;
+export type NewPasswordCredential = typeof passwordCredentials.$inferInsert;
+
+export type Session = typeof sessions.$inferSelect;
+export type NewSession = typeof sessions.$inferInsert;
 
 export type Workflow = typeof workflows.$inferSelect;
 export type NewWorkflow = typeof workflows.$inferInsert;

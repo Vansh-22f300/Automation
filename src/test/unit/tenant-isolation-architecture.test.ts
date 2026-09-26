@@ -106,7 +106,8 @@ const NOT_A_REPOSITORY = new Set<string>([
  * so without the camelCase form here the static check would miss it.
  */
 const TENANT_SCOPED_TABLE_NAMES = [
-  'users',
+  'memberships',
+  'sessions',
   'workflows',
   'workflow_versions',
   'workflowVersions',

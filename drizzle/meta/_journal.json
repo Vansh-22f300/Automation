@@ -92,6 +92,13 @@
       "when": 1789896857047,
       "tag": "0012_ambitious_princess_powerful",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1790358545313,
+      "tag": "0013_add_auth_identity",
+      "breakpoints": true
     }
   ]
 }
