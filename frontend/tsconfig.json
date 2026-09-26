@@ -9,6 +9,7 @@
     "./composables/**/*.ts",
     "./layouts/**/*.vue",
     "./lib/**/*.ts",
+    "./middleware/**/*.ts",
     "./pages/**/*.vue",
     "./types/**/*.ts"
   ],

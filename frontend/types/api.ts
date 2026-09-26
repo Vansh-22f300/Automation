@@ -170,3 +170,33 @@ export interface UsageTotals {
 export interface HealthStatus {
   readonly status: string;
 }
+
+/**
+ * Human-auth identity shapes returned by the BFF's `/backend/auth/*` routes.
+ *
+ * The opaque session token is deliberately absent from every one of these
+ * types: it lives ONLY in the HttpOnly `aw_session` cookie and the server-side
+ * BFF flow, and must never become browser-readable. `LoginResponse.session`
+ * therefore carries `expiresAt` only — never `token`.
+ */
+export interface AuthUser {
+  readonly id: string;
+  readonly email: string;
+  readonly name: string;
+}
+
+export interface AuthTenant {
+  readonly id: string;
+  readonly name: string;
+}
+
+export interface AuthSession {
+  readonly user: AuthUser;
+  readonly tenant: AuthTenant;
+}
+
+export interface LoginResponse {
+  readonly user: AuthUser;
+  readonly tenant: AuthTenant;
+  readonly session: { readonly expiresAt: string };
+}

@@ -3,12 +3,20 @@ import {
   Activity,
   Cable,
   LayoutDashboard,
+  LogOut,
   PlaySquare,
   Workflow,
 } from "@lucide/vue";
 
 withDefaults(defineProps<{ open?: boolean }>(), { open: false });
-defineEmits<{ close: [] }>();
+const emit = defineEmits<{ close: [] }>();
+
+const { user, tenant, logout } = useAuth();
+async function onLogout(): Promise<void> {
+  emit("close");
+  await logout();
+  await navigateTo("/login");
+}
 
 const navigation = [
   { label: "Workflows", to: "/workflows", icon: Workflow },
@@ -61,12 +69,32 @@ function isActive(to: string): boolean {
         <span>{{ item.label }}</span>
       </NuxtLink>
     </nav>
-    <div class="sidebar-footer">
-      <span class="environment-dot" style="background:var(--landing-mint); box-shadow:0 0 0 4px rgba(139,245,201,0.14)" aria-hidden="true" />
-      <div>
-        <strong style="font-size:11px; letter-spacing:0.06em; text-transform:uppercase; color:var(--landing-faint)">Local development</strong>
-        <p style="font-size:11px">Fastify via Nuxt proxy</p>
+    <div class="sidebar-footer" style="flex-direction:column; align-items:stretch; gap:10px">
+      <div style="display:flex; align-items:center; gap:8px; min-width:0">
+        <span class="environment-dot" style="background:var(--landing-mint); box-shadow:0 0 0 4px rgba(139,245,201,0.14)" aria-hidden="true" />
+        <div style="min-width:0">
+          <strong style="font-size:12px; letter-spacing:0; text-transform:none; color:var(--landing-mist); white-space:nowrap; overflow:hidden; text-overflow:ellipsis">{{ tenant?.name ?? 'Workspace' }}</strong>
+          <p style="font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis" :title="user?.email ?? undefined">{{ user?.email ?? 'Signed in' }}</p>
+        </div>
       </div>
+      <button class="button sidebar-logout" type="button" @click="onLogout">
+        <LogOut :size="15" aria-hidden="true" />
+        Sign out
+      </button>
     </div>
   </aside>
 </template>
+
+<style scoped>
+.sidebar-logout {
+  width: 100%;
+  justify-content: center;
+  border-color: var(--landing-border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--landing-dim);
+}
+.sidebar-logout:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--landing-mist);
+}
+</style>

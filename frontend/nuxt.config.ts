@@ -30,6 +30,11 @@ export default defineNuxtConfig({
     // `NUXT_BFF_TIMEOUT_MS`. The BFF route and forwarder both re-validate and
     // clamp the effective value to the inclusive range [100, 60000] ms.
     bffTimeoutMs: 10_000,
+    // Server-only. Comma-separated list of extra origins the BFF's CSRF check
+    // accepts on state-changing auth routes, IN ADDITION to this server's own
+    // origin. Empty by default (same-origin only). Overridden at runtime from
+    // `NUXT_TRUSTED_ORIGINS`. Never a broad wildcard such as `*.vercel.app`.
+    trustedOrigins: '',
     public: {
       // Client-side: the same-origin path the browser uses to reach the BFF.
       // Sourced from `NUXT_PUBLIC_API_BASE`.
