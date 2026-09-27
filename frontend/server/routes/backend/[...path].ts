@@ -1,29 +1,35 @@
 /**
- * Nitro BFF: `/backend/*` → Fastify.
+ * Nitro BFF data plane: `/backend/*` → Fastify.
  *
  * Same-origin entry point for the browser. The browser sends GET/HEAD requests
  * to `/backend/<fastify-path>`; this handler:
  *
  *   1. Rejects non-GET/HEAD methods with 405.
- *   2. Returns 503 if NUXT_API_KEY or NUXT_BACKEND_URL is missing.
- *   3. Builds a fresh outbound request with only an allowlist of request headers.
- *      In particular: `authorization` and `cookie` are stripped (the client may
- *      have set them) and a server-only `Authorization: Bearer <NUXT_API_KEY>`
- *      is injected. Exactly one Authorization header reaches Fastify.
+ *   2. Returns 503 if NUXT_BACKEND_URL is missing.
+ *   3. Reads the HttpOnly `aw_session` cookie server-side and forwards the
+ *      human's opaque session token as the upstream credential. It builds a
+ *      fresh outbound request with only an allowlist of request headers: any
+ *      browser-supplied `authorization` and `cookie` are stripped, and a single
+ *      server-derived `Authorization: Bearer <session-token>` is injected when
+ *      a session exists. With no session cookie no Authorization is sent and
+ *      Fastify decides (public routes answer; `/v1/*` returns 401). Exactly one
+ *      Authorization header — chosen by the server, never the browser — reaches
+ *      Fastify, so the backend's session authenticator alone establishes the
+ *      user and tenant. The machine API key is never used on this plane.
  *   4. Forwards the URL path and query string to Fastify.
  *   5. Enforces a bounded upstream timeout. Returns 504 on timeout.
  *   6. Surfaces upstream 2xx bodies verbatim. Wraps upstream 4xx/5xx bodies in
  *      a safe envelope derived from Fastify's `{ error: { code, message, ... } }`
  *      shape when present, otherwise a generic upstream error envelope.
  *   7. Forwards only an allowlist of response headers (content-type, cache-control,
- *      etag, vary, x-request-id). Never the upstream `set-cookie` or any
- *      echo of the API key.
+ *      etag, vary, x-request-id). Never the upstream `set-cookie`.
  *
- * The API key value never appears in any response header, body, error envelope,
- * log line, or stack trace; the handler reads it from server-only runtime config
- * and only uses it for outbound authorization.
+ * The session token never appears in any response header, body, error envelope,
+ * log line, or stack trace; the handler reads it from the HttpOnly cookie and
+ * only uses it for outbound authorization. It is never exposed to browser JS.
  */
 import { getMethod, getQuery, getRequestHeaders, getRouterParam } from 'h3';
+import { readSessionCookie } from '../../utils/auth-cookie';
 import {
   type BffForwardOptions,
   type BffForwardResult,
@@ -59,19 +65,8 @@ export default defineEventHandler(async (event): Promise<unknown> => {
   }
 
   const config = useRuntimeConfig(event);
-  const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
   const backendUrl =
     typeof config.backendUrl === 'string' ? config.backendUrl.trim() : '';
-
-  if (apiKey === '') {
-    setResponseStatus(event, 503);
-    return {
-      error: {
-        code: 'bff_unconfigured',
-        message: 'The BFF is not configured with a server API key.',
-      },
-    };
-  }
 
   if (backendUrl === '') {
     setResponseStatus(event, 503);
@@ -83,13 +78,19 @@ export default defineEventHandler(async (event): Promise<unknown> => {
     };
   }
 
+  // The only credential this plane forwards is the human's own session token,
+  // read server-side from the HttpOnly cookie. It is never readable by browser
+  // JS and never chosen by the caller. When absent we forward nothing and let
+  // Fastify reject protected routes; the machine API key is not used here.
+  const sessionToken = readSessionCookie(event);
+
   const pathSegments = getRouterParam(event, 'path') ?? '';
   const query = getQuery(event);
 
   const options: BffForwardOptions = {
     method: method as 'GET' | 'HEAD',
     backendUrl,
-    apiKey,
+    bearerToken: sessionToken,
     pathSegments,
     query: query as Record<string, string | string[] | undefined>,
     requestHeaders: getRequestHeaders(event) as Record<string, string | string[] | undefined>,

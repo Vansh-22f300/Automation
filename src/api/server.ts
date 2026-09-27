@@ -15,6 +15,7 @@ import { createLogger } from "@/observability/logger.js";
 import { buildApp } from "@/api/app.js";
 import { ApiKeyAuthenticator } from "@/auth/api-key-authenticator.js";
 import { DrizzleApiKeyStore } from "@/auth/api-key-store.js";
+import { CompositeAuthenticator } from "@/auth/composite-authenticator.js";
 import { AuthService } from "@/auth/auth-service.js";
 import { DrizzleAuthUserStore } from "@/auth/auth-user-store.js";
 import { DrizzleLoginThrottle } from "@/auth/login-throttle.js";
@@ -50,9 +51,12 @@ const cipher = createCredentialCipher(env, { logger });
 const queue = new PostgresJobQueue(database.db);
 
 // Human-session authentication, wired additively alongside the API-key path.
-// One tenant-blind session store backs both the authenticator (resolve a token
-// to its tenant+user) and the login/logout service (mint and revoke sessions).
+// One tenant-blind session store backs the authenticator (resolve a token to its
+// tenant+user) and the login/logout service (mint and revoke sessions). A single
+// SessionAuthenticator instance is shared: it both guards `/auth/*` and is one
+// arm of the composite that guards `/v1/*`.
 const sessionStore = new DrizzleSessionStore(database.db);
+const sessionAuthenticator = new SessionAuthenticator(sessionStore);
 const authService = new AuthService(
   new DrizzleAuthUserStore(database.db),
   argon2PasswordHasher,
@@ -67,10 +71,18 @@ const app = await buildApp({
   // trusted reverse proxy / PaaS the operator sets `TRUST_PROXY=true` (or a
   // list of proxy CIDRs) and the limiter then keys by the forwarded client IP.
   trustProxy: env.TRUST_PROXY,
-  authenticator: new ApiKeyAuthenticator(new DrizzleApiKeyStore(database.db)),
-  // Human sessions: a distinct authenticator over the same session store, so a
-  // session token guards `/auth/*` without ever being accepted on `/v1/*`.
-  sessionAuthenticator: new SessionAuthenticator(sessionStore),
+  // The `/v1/*` surface accepts either a machine API key or a human browser
+  // session, routed by credential structure. Neither authenticator is weakened:
+  // `parseApiKey` sends `awk_` credentials to the API-key authenticator and
+  // everything else (opaque session tokens) to the session authenticator, so the
+  // tenant is always established by the matching store, never by the caller.
+  authenticator: new CompositeAuthenticator(
+    new ApiKeyAuthenticator(new DrizzleApiKeyStore(database.db)),
+    sessionAuthenticator,
+  ),
+  // Human sessions also guard `/auth/*` on their own (an API key can never
+  // satisfy a session route). Same instance as the composite's session arm.
+  sessionAuthenticator,
   authService,
   checkDatabase: () => database.ping(),
   // One tenant-scoped service per authenticated request — the repository is
