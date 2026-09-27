@@ -384,13 +384,19 @@ describe('tenant-isolation architecture', () => {
   });
 
   describe('each bare-db auth exception is confined to its authenticator seam', () => {
-    // There are exactly two deliberately tenant-blind data paths, and both live
+    // There are exactly three deliberately tenant-blind data paths, and all live
     // under `src/auth/` for the same chicken-and-egg reason: the caller presents
     // a credential *in order to discover* which tenant it belongs to, so the
     // resolving lookup cannot itself carry a tenant predicate.
     //
-    //   - `DrizzleApiKeyStore`  resolves the tenant from an API-key prefix.
-    //   - `DrizzleSessionStore` resolves the tenant/user from a session token.
+    //   - `DrizzleApiKeyStore`   resolves the tenant from an API-key prefix.
+    //   - `DrizzleSessionStore`  resolves the tenant/user from a session token.
+    //   - `DrizzleAuthUserStore` resolves, from an email + password, the user and
+    //     the active memberships (a tenant-scoped table) that email can reach.
+    //
+    // (`DrizzleLoginThrottle` is deliberately *not* here: it touches only
+    // `login_attempts`, which has no `tenant_id`, so it is not a tenant-scoped
+    // data path at all.)
     //
     // Each must be reachable only from its own seam: the store's own file, the
     // composition root that wires it, and the tests that exercise that seam.
@@ -433,6 +439,16 @@ describe('tenant-isolation architecture', () => {
           'src/api/server.ts', // composition root
           THIS_TEST, // this guard (names it in string/regex literals)
           'src/test/integration/sessions.test.ts',
+          'src/test/integration/auth.test.ts', // exercises the assembled auth seam
+        ]),
+      },
+      {
+        className: 'DrizzleAuthUserStore',
+        declaringFile: 'src/auth/auth-user-store.ts',
+        allowed: new Set<string>([
+          'src/auth/auth-user-store.ts', // the declaration
+          'src/api/server.ts', // composition root
+          THIS_TEST, // this guard (names it in string/regex literals)
           'src/test/integration/auth.test.ts', // exercises the assembled auth seam
         ]),
       },

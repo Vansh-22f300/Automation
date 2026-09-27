@@ -1097,15 +1097,19 @@ constructed _from_ a scope, never from a bare handle, so an instance is
 intrinsically pinned to one tenant and its queries cannot omit the tenant
 predicate. There are no generic "fetch across all tenants" helpers.
 
-The one unavoidable exception — resolving _which_ tenant a presented API key
-belongs to, before any tenant is known — is confined to a single narrow
-`ApiKeyStore` used only by the authenticator, and named to make its exceptional
-nature obvious. PostgreSQL Row-Level Security will later back this with a
+The unavoidable exception is credential resolution — mapping a presented
+credential to its tenant _before_ any tenant is known. Each such lookup is
+confined to a single narrow store used only by its authenticator seam, and named
+to make its exceptional nature obvious: `DrizzleApiKeyStore` (tenant from an
+API-key prefix), `DrizzleSessionStore` (tenant and user from a session token),
+and `DrizzleAuthUserStore` (user and reachable active memberships from an
+email + password). PostgreSQL Row-Level Security will later back these with a
 database-enforced guarantee; until then this pattern is the boundary, and it is
 proven end-to-end by the tenant-isolation tests. The authentication mechanism
 itself sits behind a framework-free `Authenticator` seam that yields
-`request.auth.tenantId`, so it can be swapped for sessions, OAuth or RBAC later
-without touching route code.
+`request.auth.tenantId` (plus a user id for human sessions), so tenant API-key
+auth and human-session auth coexist and OAuth or RBAC can be added later without
+touching route code.
 
 Tenant isolation is verified by three complementary layers:
 
@@ -1125,7 +1129,9 @@ Tenant isolation is verified by three complementary layers:
   table either extends `TenantScopedRepository`, takes a `TenantScope`
   directly, or uses one of a small number of named alternative mechanisms
   (`PostgresJobQueue`'s optional `tenantId` option, `WorkflowExecutor`'s
-  per-`ClaimedJob` tenant id, or the legacy auth-only `DrizzleApiKeyStore`). It
+  per-`ClaimedJob` tenant id, or the auth-only credential-resolution stores
+  `DrizzleApiKeyStore`, `DrizzleSessionStore` and `DrizzleAuthUserStore`, each
+  confined by name to its authenticator seam). It
   fails the build when a future repository or service bypasses the scope, and
   its named allow-list makes the rationale for each exception explicit.
 

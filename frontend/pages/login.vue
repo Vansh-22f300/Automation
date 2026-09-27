@@ -131,7 +131,10 @@ async function onSubmit(): Promise<void> {
 .auth-brand-copy { display: flex; flex-direction: column; line-height: 1.2; }
 .auth-brand-copy strong { font-size: 14px; letter-spacing: -0.01em; }
 .auth-brand-copy span { font-size: 11px; color: var(--landing-faint); }
-.auth-title { margin: 0; font-size: 20px; letter-spacing: -0.02em; }
+/* The global `h1 { color: var(--text) }` rule targets the element directly and
+   so beats the light color inherited from `.auth-shell`; without an explicit
+   color the heading renders dark-on-dark (near-invisible) on the auth surface. */
+.auth-title { margin: 0; font-size: 20px; letter-spacing: -0.02em; color: var(--landing-mist); }
 .auth-subtitle { margin: 6px 0 20px; font-size: 13px; color: var(--landing-dim); }
 .auth-form { display: grid; gap: 14px; }
 .auth-label { color: var(--landing-dim); }
