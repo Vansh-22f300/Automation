@@ -452,6 +452,7 @@ describe('tenant-isolation architecture', () => {
           'src/api/server.ts', // composition root
           THIS_TEST, // this guard (names it in string/regex literals)
           'src/test/integration/auth.test.ts', // exercises the assembled auth seam
+          'src/test/integration/session-data-plane.test.ts', // wires the composite for the data-plane seam
         ]),
       },
     ];
