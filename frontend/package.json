@@ -22,10 +22,12 @@
   "devDependencies": {
     "@nuxt/test-utils": "3.23.0",
     "@types/node": "^26.5.1",
+    "@vitejs/plugin-vue": "6.0.8",
     "@vue/test-utils": "^2.5.1",
     "happy-dom": "15.11.7",
     "typescript": "^5.7.3",
     "vitest": "3.2.7",
+    "vue": "3.5.42",
     "vue-tsc": "^2.2.0"
   }
 }

@@ -1,6 +1,15 @@
 <script setup lang="ts">
 definePageMeta({ layout: 'landing' });
 
+// Auth-aware entry CTA. The global route guard resolves the session before this
+// page renders, so `isAuthenticated` is accurate on first paint (no flash). A
+// new/logged-out visitor is pointed at `/signup`; a signed-in visitor keeps the
+// straight-to-workspace action and is never shown a "create account" CTA.
+const { isAuthenticated } = useAuth();
+const primaryCtaTo = computed(() => (isAuthenticated.value ? '/workflows' : '/signup'));
+const primaryCtaLabel = computed(() => (isAuthenticated.value ? 'Open Workspace' : 'Get started'));
+const finalCtaLabel = computed(() => (isAuthenticated.value ? 'Open Workspace' : 'Start building'));
+
 const isMenuOpen = ref(false);
 const isScrolled = ref(false);
 const progress = ref(0);
@@ -54,7 +63,7 @@ const year = new Date().getFullYear();
         </nav>
 
         <div class="landing-ctas">
-          <NuxtLink to="/workflows" class="button button-primary btn-shine" style="height:36px;border-radius:999px;background:var(--landing-mist);color:var(--landing-void);border-color:transparent">Open Workspace <span aria-hidden="true" style="margin-left:2px">↗</span><span class="shine-strip" aria-hidden="true" /></NuxtLink>
+          <NuxtLink :to="primaryCtaTo" class="button button-primary btn-shine" style="height:36px;border-radius:999px;background:var(--landing-mist);color:var(--landing-void);border-color:transparent">{{ primaryCtaLabel }} <span aria-hidden="true" style="margin-left:2px">↗</span><span class="shine-strip" aria-hidden="true" /></NuxtLink>
           <button class="landing-hamburger" type="button" :aria-expanded="isMenuOpen ? 'true' : 'false'" aria-label="Toggle menu" @click="toggleMenu">
             <span aria-hidden="true">{{ isMenuOpen ? '✕' : '☰' }}</span>
           </button>
@@ -84,7 +93,7 @@ const year = new Date().getFullYear();
               AI Workforce is a workflow automation platform for teams who ship. Define once, trigger via webhook, execute with AI where it helps — and inspect every run.
             </p>
             <div class="hero-actions">
-              <NuxtLink to="/workflows" class="button button-primary btn-shine" style="height:42px;border-radius:999px;padding:0 22px;background:var(--landing-mist);color:var(--landing-void);border:0;font-weight:600">Open Workspace <span aria-hidden="true">→</span><span class="shine-strip" aria-hidden="true" /></NuxtLink>
+              <NuxtLink :to="primaryCtaTo" class="button button-primary btn-shine" style="height:42px;border-radius:999px;padding:0 22px;background:var(--landing-mist);color:var(--landing-void);border:0;font-weight:600">{{ primaryCtaLabel }} <span aria-hidden="true">→</span><span class="shine-strip" aria-hidden="true" /></NuxtLink>
               <a href="#capabilities" class="button button-secondary" style="height:42px;border-radius:999px;background:rgba(255,255,255,0.06);border-color:var(--landing-border);color:var(--landing-mist);backdrop-filter:blur(8px)">Explore capabilities</a>
             </div>
             <p class="hero-note"><strong>Built for real operations.</strong> Webhooks · AI steps · encrypted connections · visible execution.</p>
@@ -414,7 +423,7 @@ const year = new Date().getFullYear();
             <p style="color:var(--landing-dim)">Explore the live workspace — workflows, runs and connections are real API-backed collections, not screenshots.</p>
           </div>
           <div class="cta-actions" style="justify-content:flex-end">
-            <NuxtLink to="/workflows" class="button button-primary btn-shine" style="background:var(--landing-mist);color:var(--landing-void);border-radius:999px">Start building <span class="shine-strip" aria-hidden="true" /></NuxtLink>
+            <NuxtLink :to="primaryCtaTo" class="button button-primary btn-shine" style="background:var(--landing-mist);color:var(--landing-void);border-radius:999px">{{ finalCtaLabel }} <span class="shine-strip" aria-hidden="true" /></NuxtLink>
             <a href="#capabilities" class="button button-secondary" style="border-radius:999px;background:transparent;color:var(--landing-mist);border-color:var(--landing-border)">Explore the platform</a>
           </div>
         </div>
