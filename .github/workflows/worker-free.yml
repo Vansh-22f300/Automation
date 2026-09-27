@@ -105,6 +105,11 @@ jobs:
       #   * NODE_ENV=production + HOST=0.0.0.0: the worker binds no port but runs
       #     the SAME production env validation as the API, which refuses a loopback
       #     HOST at boot — so HOST must be non-loopback here too.
+      #   * APP_ORIGIN: that same production validation also demands a public
+      #     https:// origin (never loopback), because the API builds verification
+      #     and password-reset links from it. The worker sends no email, but it
+      #     shares one env schema with the API, so the value must be present here
+      #     too — set to the public API origin on Render.
       #   * DATABASE_URL and CREDENTIAL_ENCRYPTION_KEY come from the worker-free
       #     environment secrets; they are never hard-coded and never echoed.
       #     CREDENTIAL_ENCRYPTION_KEY MUST match the value configured for the API
@@ -122,6 +127,7 @@ jobs:
         env:
           NODE_ENV: production
           HOST: 0.0.0.0
+          APP_ORIGIN: https://automation-7d1c.onrender.com
           LOG_LEVEL: info
           DATABASE_POOL_MAX: "5"
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
