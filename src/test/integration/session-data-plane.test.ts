@@ -36,6 +36,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildApp } from '@/api/app.js';
 import { AuthService } from '@/auth/auth-service.js';
+import { DrizzleAccountStore } from '@/auth/account-store.js';
 import { DrizzleAuthUserStore } from '@/auth/auth-user-store.js';
 import { DrizzleLoginThrottle } from '@/auth/login-throttle.js';
 import { argon2PasswordHasher } from '@/auth/password.js';
@@ -139,6 +140,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('session-authorized data plane'
         argon2PasswordHasher,
         sessionStore,
         new DrizzleLoginThrottle(handle.db),
+        new DrizzleAccountStore(handle.db),
       ),
       checkDatabase: async () => undefined,
       apiKeyServiceFor: (auth) => new ApiKeyRepository(new TenantScope(handle.db, auth.tenantId)),

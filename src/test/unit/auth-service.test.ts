@@ -20,6 +20,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { AuthService, SESSION_TTL_MS } from '@/auth/auth-service.js';
+import type { AccountStore, CreateOwnerAccountInput, CreatedAccount } from '@/auth/account-store.js';
+import { EmailAlreadyRegisteredError } from '@/auth/account-store.js';
 import type { AuthLoginRecord, AuthProfile, AuthUserStore } from '@/auth/auth-user-store.js';
 import type { LoginThrottle } from '@/auth/login-throttle.js';
 import type { PasswordHasher } from '@/auth/password.js';
@@ -105,12 +107,37 @@ class FakeThrottle implements LoginThrottle {
   }
 }
 
+/**
+ * Captures each account-creation input and lets a test choose the outcome:
+ * success (returns server-chosen ids, echoing back only the safe fields) or a
+ * duplicate email (throws {@link EmailAlreadyRegisteredError}), or an arbitrary
+ * fault via `failWith`. The fixed ids prove the caller never influences them.
+ */
+class FakeAccountStore implements AccountStore {
+  readonly created: CreateOwnerAccountInput[] = [];
+  emailTaken = false;
+  failWith: Error | null = null;
+  readonly userId = 'server-user-id';
+  readonly tenantId = 'server-tenant-id';
+
+  async createOwnerAccount(input: CreateOwnerAccountInput): Promise<CreatedAccount> {
+    if (this.failWith !== null) throw this.failWith;
+    if (this.emailTaken) throw new EmailAlreadyRegisteredError();
+    this.created.push(input);
+    return {
+      user: { id: this.userId, email: input.email, name: input.name },
+      tenant: { id: this.tenantId, name: input.workspaceName },
+    };
+  }
+}
+
 interface Harness {
   service: AuthService;
   users: FakeAuthUserStore;
   hasher: PasswordHasher & { calls: number };
   sessions: FakeSessionStore;
   throttle: FakeThrottle;
+  accounts: FakeAccountStore;
 }
 
 function makeService(): Harness {
@@ -118,7 +145,15 @@ function makeService(): Harness {
   const hasher = makeHasher();
   const sessions = new FakeSessionStore();
   const throttle = new FakeThrottle();
-  return { service: new AuthService(users, hasher, sessions, throttle), users, hasher, sessions, throttle };
+  const accounts = new FakeAccountStore();
+  return {
+    service: new AuthService(users, hasher, sessions, throttle, accounts),
+    users,
+    hasher,
+    sessions,
+    throttle,
+    accounts,
+  };
 }
 
 /** A default active user with one active membership and a known password. */
@@ -340,6 +375,122 @@ describe('AuthService.getCurrentSession', () => {
     const h = makeService();
     // No profile seeded: the membership/user is gone.
     expect(await h.service.getCurrentSession('user-1', 'tenant-1')).toBeNull();
+  });
+});
+
+describe('AuthService.signup', () => {
+  const INPUT = {
+    name: 'Alice',
+    email: 'alice@acme.test',
+    password: 'super secret pw',
+    workspaceName: 'Acme Inc',
+  } as const;
+
+  it('creates an owner account and returns a live session with the safe identity', async () => {
+    const h = makeService();
+
+    const before = Date.now();
+    const result = await h.service.signup({ ...INPUT });
+    const after = Date.now();
+
+    expect(result.kind).toBe('created');
+    if (result.kind !== 'created') throw new Error('unreachable');
+    // The ids come from the store (the server), never from the request.
+    expect(result.user).toEqual({ id: 'server-user-id', email: 'alice@acme.test', name: 'Alice' });
+    expect(result.tenant).toEqual({ id: 'server-tenant-id', name: 'Acme Inc' });
+    expect(typeof result.token).toBe('string');
+    expect(result.token.length).toBeGreaterThan(0);
+    // Same fixed 24h absolute lifetime a login mints — no configurable surface.
+    expect(result.expiresAt.getTime()).toBeGreaterThanOrEqual(before + SESSION_TTL_MS);
+    expect(result.expiresAt.getTime()).toBeLessThanOrEqual(after + SESSION_TTL_MS);
+  });
+  it('hands the store a password hash and a token hash — never the plaintext token or password', async () => {
+    const h = makeService();
+
+    const result = await h.service.signup({ ...INPUT });
+    if (result.kind !== 'created') throw new Error('unreachable');
+
+    expect(h.accounts.created).toHaveLength(1);
+    const stored = h.accounts.created[0]!;
+    // The hasher fake returns `hash:<pw>`, proving the password was run through the
+    // KDF rather than passed through verbatim.
+    expect(stored.passwordHash).toBe('hash:super secret pw');
+    expect(stored.passwordHash).not.toBe(INPUT.password);
+    // Only the token *hash* is persisted; the plaintext is the returned value.
+    expect(stored.tokenHash).toBe(hashSessionToken(result.token));
+    expect(stored.tokenHash).not.toBe(result.token);
+    expect(stored.expiresAt).toBe(result.expiresAt);
+  });
+
+  it('normalises the email and trims the name and workspace name before creating the account', async () => {
+    const h = makeService();
+
+    const result = await h.service.signup({
+      name: '  Alice  ',
+      email: '  Alice@ACME.test  ',
+      password: 'super secret pw',
+      workspaceName: '  Acme Inc  ',
+    });
+
+    expect(result.kind).toBe('created');
+    const stored = h.accounts.created[0]!;
+    expect(stored.email).toBe('alice@acme.test');
+    expect(stored.name).toBe('Alice');
+    expect(stored.workspaceName).toBe('Acme Inc');
+  });
+  it('stores a blank name as null rather than an empty string', async () => {
+    const h = makeService();
+
+    await h.service.signup({ ...INPUT, name: '   ' });
+
+    expect(h.accounts.created[0]!.name).toBeNull();
+  });
+
+  it('returns email_taken — with no token and nothing created — when the email is registered', async () => {
+    const h = makeService();
+    h.accounts.emailTaken = true;
+
+    const result = await h.service.signup({ ...INPUT });
+
+    // The single generic non-success result: no detail, no token to leak.
+    expect(result).toEqual({ kind: 'email_taken' });
+    expect(JSON.stringify(result)).not.toContain('token');
+    expect(h.accounts.created).toEqual([]);
+    expect(h.sessions.created).toEqual([]);
+  });
+
+  it('propagates an unexpected store fault rather than masking it as email_taken', async () => {
+    const h = makeService();
+    h.accounts.failWith = new Error('database is on fire');
+
+    await expect(h.service.signup({ ...INPUT })).rejects.toThrow('database is on fire');
+  });
+  it('does not consult the login throttle — signup is gated by the per-IP limiter, not the account throttle', async () => {
+    const h = makeService();
+
+    await h.service.signup({ ...INPUT });
+
+    expect(h.throttle.checked).toEqual([]);
+    expect(h.throttle.recorded).toEqual([]);
+    expect(h.throttle.cleared).toEqual([]);
+  });
+
+  it('lets nothing the caller supplies choose the ids or role — the store input carries no ownership fields', async () => {
+    const h = makeService();
+
+    const result = await h.service.signup({ ...INPUT });
+    if (result.kind !== 'created') throw new Error('unreachable');
+
+    // Server-chosen identity, not anything a caller could smuggle in.
+    expect(result.user.id).toBe('server-user-id');
+    expect(result.tenant.id).toBe('server-tenant-id');
+
+    // The service hands the store only account facts — no id, tenantId, or role
+    // for a caller to hijack (ownership is hard-coded inside the store itself).
+    const stored = h.accounts.created[0]!;
+    expect(Object.keys(stored).sort()).toEqual(
+      ['email', 'expiresAt', 'name', 'passwordHash', 'tokenHash', 'workspaceName'].sort(),
+    );
   });
 });
 

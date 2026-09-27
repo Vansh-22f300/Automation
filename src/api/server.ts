@@ -17,6 +17,7 @@ import { ApiKeyAuthenticator } from "@/auth/api-key-authenticator.js";
 import { DrizzleApiKeyStore } from "@/auth/api-key-store.js";
 import { CompositeAuthenticator } from "@/auth/composite-authenticator.js";
 import { AuthService } from "@/auth/auth-service.js";
+import { DrizzleAccountStore } from "@/auth/account-store.js";
 import { DrizzleAuthUserStore } from "@/auth/auth-user-store.js";
 import { DrizzleLoginThrottle } from "@/auth/login-throttle.js";
 import { argon2PasswordHasher } from "@/auth/password.js";
@@ -62,6 +63,9 @@ const authService = new AuthService(
   argon2PasswordHasher,
   sessionStore,
   new DrizzleLoginThrottle(database.db),
+  // Signup's transactional account creation (workspace + owner + credential +
+  // session in one transaction). Shares the same pool as the read-side stores.
+  new DrizzleAccountStore(database.db),
 );
 
 const app = await buildApp({

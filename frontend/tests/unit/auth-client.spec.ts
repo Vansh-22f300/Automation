@@ -116,6 +116,64 @@ describe("AuthClient.login", () => {
   });
 });
 
+describe("AuthClient.signup", () => {
+  it("POSTs { name, email, password, workspaceName } same-origin and returns metadata (no token)", async () => {
+    const mock = stubFetch(
+      jsonResponse(201, {
+        user: { id: "u1", email: "ada@acme.test", name: "Ada" },
+        tenant: { id: "t1", name: "Acme Inc" },
+        session: { expiresAt: "2099-01-01T00:00:00.000Z" },
+      }),
+    );
+    const result = await new AuthClient({ baseUrl: BASE }).signup(
+      "Ada",
+      "ada@acme.test",
+      "super secret pw",
+      "Acme Inc",
+    );
+    expect(result.user.email).toBe("ada@acme.test");
+    expect(result.tenant.name).toBe("Acme Inc");
+    expect(result.session.expiresAt).toBe("2099-01-01T00:00:00.000Z");
+    expect((result.session as { token?: string }).token).toBeUndefined();
+    const [url, init] = callArgs(mock);
+    expect(url).toBe("/backend/auth/signup");
+    expect(init.method).toBe("POST");
+    expect(init.credentials).toBe("same-origin");
+    expect(JSON.parse(init.body as string)).toEqual({
+      name: "Ada",
+      email: "ada@acme.test",
+      password: "super secret pw",
+      workspaceName: "Acme Inc",
+    });
+    expect(new Headers(init.headers).get("content-type")).toBe("application/json");
+  });
+
+  it("throws ApiClientError(409) for a duplicate email, preserving the generic status", async () => {
+    stubFetch(
+      jsonResponse(409, {
+        error: { code: "email_unavailable", message: "That email address cannot be used to create an account." },
+      }),
+    );
+    await expect(
+      new AuthClient({ baseUrl: BASE }).signup("A", "taken@b.test", "super secret pw", "WS"),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("throws ApiClientError(400) when the backend rejects the input", async () => {
+    stubFetch(jsonResponse(400, { error: { code: "bad_request", message: "Invalid." } }));
+    await expect(
+      new AuthClient({ baseUrl: BASE }).signup("A", "bad", "short", "WS"),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("maps a network failure to ApiClientError(0)", async () => {
+    stubFetch(new TypeError("network down"));
+    await expect(
+      new AuthClient({ baseUrl: BASE }).signup("A", "a@b.test", "super secret pw", "WS"),
+    ).rejects.toMatchObject({ status: 0 });
+  });
+});
+
 describe("AuthClient.logout", () => {
   it("POSTs same-origin and resolves on 204", async () => {
     const mock = stubFetch(jsonResponse(204));

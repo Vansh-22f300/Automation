@@ -4,16 +4,18 @@
  * The GET session probe is the single source of truth. Public routes render
  * without a session; every other route requires an authenticated one, and an
  * unauthenticated visitor is bounced to `/login` with the intended path
- * preserved. `/login` and `/` are always public, so there is no redirect loop.
+ * preserved. `/`, `/login`, and `/signup` are always public, so there is no
+ * redirect loop.
  */
-const PUBLIC_PATHS = new Set(["/", "/login"]);
+const PUBLIC_PATHS = new Set(["/", "/login", "/signup"]);
 
 export default defineNuxtRouteMiddleware(async (to) => {
   const { ensureLoaded } = useAuth();
   const status = await ensureLoaded();
 
-  // A signed-in user has no business on the login page — send them inward.
-  if (to.path === "/login" && status === "authenticated") {
+  // A signed-in user has no business on the login or signup page — send them
+  // inward instead of letting them re-authenticate or create a second account.
+  if ((to.path === "/login" || to.path === "/signup") && status === "authenticated") {
     return navigateTo("/workflows");
   }
 

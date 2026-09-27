@@ -79,6 +79,18 @@ export function useAuth() {
     status.value = "authenticated";
   }
 
+  async function signup(
+    name: string,
+    email: string,
+    password: string,
+    workspaceName: string,
+  ): Promise<void> {
+    const result = await client.signup(name, email, password, workspaceName);
+    user.value = result.user;
+    tenant.value = result.tenant;
+    status.value = "authenticated";
+  }
+
   async function logout(): Promise<void> {
     await client.logout();
     user.value = null;
@@ -94,6 +106,7 @@ export function useAuth() {
     refresh,
     ensureLoaded,
     login,
+    signup,
     logout,
   };
 }

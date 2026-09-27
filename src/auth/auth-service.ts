@@ -25,6 +25,8 @@
  *     the submitted email (see `@/auth/login-throttle`).
  */
 
+import type { AccountStore } from '@/auth/account-store.js';
+import { EmailAlreadyRegisteredError } from '@/auth/account-store.js';
 import type { PasswordHasher } from '@/auth/password.js';
 import { generateSessionToken, hashSessionToken } from '@/auth/session-token.js';
 import type { SessionStore } from '@/auth/session-store.js';
@@ -67,6 +69,30 @@ export type LoginResult =
   | { readonly kind: 'tenant_selection_required' }
   | { readonly kind: 'rate_limited' };
 
+/** What a caller supplies to create a brand-new account and its first workspace. */
+export interface SignupInput {
+  readonly name: string;
+  readonly email: string;
+  readonly password: string;
+  readonly workspaceName: string;
+}
+
+/**
+ * The result of a signup attempt — a closed set the route maps to HTTP.
+ *   - `created` mints the account and returns a live session, exactly like a
+ *     successful login (`token` is echoed once, for the BFF to bank as a cookie).
+ *   - `email_taken` is the *only* non-success case: the email is already
+ *     registered. It carries no detail about the existing account, so the route
+ *     can render a generic 409 that is not a clean enumeration oracle.
+ */
+export type SignupResult =
+  | ({
+      readonly kind: 'created';
+      readonly token: string;
+      readonly expiresAt: Date;
+    } & AuthenticatedIdentity)
+  | { readonly kind: 'email_taken' };
+
 /** Normalise an email to the form stored/compared: trimmed and lower-cased. */
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
@@ -78,6 +104,7 @@ export class AuthService {
     private readonly passwordHasher: PasswordHasher,
     private readonly sessions: SessionStore,
     private readonly throttle: LoginThrottle,
+    private readonly accounts: AccountStore,
   ) {}
 
   async login(email: string, password: string): Promise<LoginResult> {
@@ -142,6 +169,62 @@ export class AuthService {
       user: { id: account.userId, email: account.email, name: account.name },
       tenant: { id: membership.tenantId, name: membership.tenantName },
     };
+  }
+
+  /**
+   * Self-serve signup: create a brand-new account and its first workspace, and
+   * return a live session so the caller is authenticated immediately.
+   *
+   * The server owns every identity fact. The email is normalised here (never
+   * trusted from the client); the workspace, the global user, the credential,
+   * the `owner` membership, and the session are all created server-side. Nothing
+   * the caller could put in the body — a user id, a tenant id, a role — has any
+   * effect: the input type carries only `{ name, email, password, workspaceName }`
+   * and the store hard-codes ownership.
+   *
+   * The Argon2id hash and the CSPRNG token are computed *before* the transaction
+   * (the slow KDF must not hold a DB transaction open), then handed to the store,
+   * which commits all five rows atomically or not at all. A duplicate email
+   * surfaces as the single generic `email_taken` result — never a distinct,
+   * detail-carrying error — so a duplicate signup is not a clean user-enumeration
+   * oracle. The plaintext token is returned exactly once and never logged.
+   */
+  async signup(input: SignupInput): Promise<SignupResult> {
+    const email = normalizeEmail(input.email);
+    const name = input.name.trim();
+    const workspaceName = input.workspaceName.trim();
+
+    // Outside the transaction on purpose: the KDF is deliberately slow and the
+    // token is pure CSPRNG, so neither should hold a connection or row locks.
+    const passwordHash = await this.passwordHasher.hash(input.password);
+    const token = generateSessionToken();
+    const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+
+    try {
+      const created = await this.accounts.createOwnerAccount({
+        email,
+        name: name.length > 0 ? name : null,
+        passwordHash,
+        workspaceName,
+        tokenHash: hashSessionToken(token),
+        expiresAt,
+      });
+
+      return {
+        kind: 'created',
+        token,
+        expiresAt,
+        user: created.user,
+        tenant: created.tenant,
+      };
+    } catch (error) {
+      // The one expected, benign failure: the email is already registered.
+      // Collapse it to a detail-free result; anything else is a real fault.
+      if (error instanceof EmailAlreadyRegisteredError) {
+        return { kind: 'email_taken' };
+      }
+      throw error;
+    }
   }
 
   /**
