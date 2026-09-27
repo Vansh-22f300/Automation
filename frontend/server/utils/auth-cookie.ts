@@ -9,6 +9,16 @@ import { deleteCookie, getCookie, getRequestURL, setCookie, type H3Event } from 
 /** The single browser-visible credential. HttpOnly; never readable by JS. */
 export const SESSION_COOKIE_NAME = 'aw_session';
 
+/**
+ * Short-lived HttpOnly carrier for the raw password-reset token, set by the
+ * email-link GET handoff and read by the reset POST. It exists so the one-time
+ * token travels server-side → cookie → server-side and NEVER appears in a URL
+ * the SPA can see, in browser-readable state, or in a log. Capped to the
+ * backend's 1h reset-token lifetime; consumed (cleared) on a completed reset.
+ */
+export const PASSWORD_RESET_COOKIE_NAME = 'aw_pwreset';
+const PASSWORD_RESET_COOKIE_MAX_AGE_SECONDS = 60 * 60;
+
 /** Hard cap matching the backend's 24h absolute session lifetime. */
 const MAX_COOKIE_AGE_SECONDS = 24 * 60 * 60;
 
@@ -42,6 +52,30 @@ export function setSessionCookie(event: H3Event, token: string, expiresAtIso: st
 
 export function clearSessionCookie(event: H3Event): void {
   deleteCookie(event, SESSION_COOKIE_NAME, {
+    httpOnly: true,
+    secure: isSecureRequest(event),
+    sameSite: 'lax',
+    path: '/',
+  });
+}
+
+/** Stash the raw reset token as an HttpOnly cookie during the GET handoff. */
+export function setPasswordResetCookie(event: H3Event, token: string): void {
+  setCookie(event, PASSWORD_RESET_COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: isSecureRequest(event),
+    sameSite: 'lax',
+    path: '/',
+    maxAge: PASSWORD_RESET_COOKIE_MAX_AGE_SECONDS,
+  });
+}
+
+export function readPasswordResetCookie(event: H3Event): string | undefined {
+  return getCookie(event, PASSWORD_RESET_COOKIE_NAME);
+}
+
+export function clearPasswordResetCookie(event: H3Event): void {
+  deleteCookie(event, PASSWORD_RESET_COOKIE_NAME, {
     httpOnly: true,
     secure: isSecureRequest(event),
     sameSite: 'lax',

@@ -35,6 +35,8 @@ describe('parseEnv', () => {
       WORKER_SHUTDOWN_TIMEOUT_MS: 10_000,
       ANTHROPIC_MODEL: 'claude-opus-5',
       TRUST_PROXY: false,
+      APP_ORIGIN: 'http://localhost:3001',
+      EMAIL_TRANSPORT: 'log',
     });
   });
 
@@ -381,9 +383,15 @@ describe('parseEnv / production DATABASE_URL', () => {
   });
 
   it('allows a hosted non-test database in production', () => {
-    expect(parseEnv({ ...base, NODE_ENV: 'production', DATABASE_URL: hosted, HOST: '0.0.0.0' }).DATABASE_URL).toBe(
-      hosted,
-    );
+    expect(
+      parseEnv({
+        ...base,
+        NODE_ENV: 'production',
+        DATABASE_URL: hosted,
+        HOST: '0.0.0.0',
+        APP_ORIGIN: 'https://app.example.com',
+      }).DATABASE_URL,
+    ).toBe(hosted);
   });
 
   it('never echoes the connection string when rejecting production DATABASE_URL', () => {
@@ -543,6 +551,7 @@ describe('parseEnv / ANTHROPIC_BASE_URL coherence', () => {
         NODE_ENV: 'production',
         HOST: '0.0.0.0',
         DATABASE_URL: 'postgresql://app:secret@db.example.com:5432/ai_workforce',
+        APP_ORIGIN: 'https://app.example.com',
         ANTHROPIC_AUTH_TOKEN: 'gw-token',
         ANTHROPIC_BASE_URL: 'https://gateway.example.com',
       }).ANTHROPIC_BASE_URL,
@@ -569,14 +578,26 @@ describe('parseEnv / production HOST', () => {
   });
 
   it('accepts 0.0.0.0 in production', () => {
-    expect(parseEnv({ ...base, NODE_ENV: 'production', HOST: '0.0.0.0', DATABASE_URL: hostedDb }).HOST).toBe(
-      '0.0.0.0',
-    );
+    expect(
+      parseEnv({
+        ...base,
+        NODE_ENV: 'production',
+        HOST: '0.0.0.0',
+        DATABASE_URL: hostedDb,
+        APP_ORIGIN: 'https://app.example.com',
+      }).HOST,
+    ).toBe('0.0.0.0');
   });
 
   it('accepts a non-loopback custom host in production', () => {
-    expect(parseEnv({ ...base, NODE_ENV: 'production', HOST: '10.0.0.5', DATABASE_URL: hostedDb }).HOST).toBe(
-      '10.0.0.5',
-    );
+    expect(
+      parseEnv({
+        ...base,
+        NODE_ENV: 'production',
+        HOST: '10.0.0.5',
+        DATABASE_URL: hostedDb,
+        APP_ORIGIN: 'https://app.example.com',
+      }).HOST,
+    ).toBe('10.0.0.5');
   });
 });

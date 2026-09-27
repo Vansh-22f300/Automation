@@ -5,9 +5,19 @@
  * without a session; every other route requires an authenticated one, and an
  * unauthenticated visitor is bounced to `/login` with the intended path
  * preserved. `/`, `/login`, and `/signup` are always public, so there is no
- * redirect loop.
+ * redirect loop. The email-recovery pages (`/verify-email`, `/forgot-password`,
+ * `/reset-password`) are public too: their links are opened straight from an
+ * email, often while logged out, and the token itself — never a live session —
+ * is the authority the backend checks.
  */
-const PUBLIC_PATHS = new Set(["/", "/login", "/signup"]);
+const PUBLIC_PATHS = new Set([
+  "/",
+  "/login",
+  "/signup",
+  "/verify-email",
+  "/forgot-password",
+  "/reset-password",
+]);
 
 export default defineNuxtRouteMiddleware(async (to) => {
   const { ensureLoaded } = useAuth();

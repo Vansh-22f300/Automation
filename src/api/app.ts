@@ -40,6 +40,7 @@ import type { WebhookSignatureResolverFactory } from "@/api/routes/webhooks.js";
 import type { ApiServer } from "@/api/types.js";
 import type { Authenticator } from "@/auth/context.js";
 import type { AuthService } from "@/auth/auth-service.js";
+import type { AccountRecoveryService } from "@/auth/account-recovery-service.js";
 import { RateLimitedError } from "@/api/errors.js";
 import { newId } from "@/domain/ids.js";
 
@@ -62,6 +63,13 @@ export interface AppDependencies {
   readonly sessionAuthenticator: Authenticator;
   /** Human login/logout/current-session use-cases behind `/auth/*`. */
   readonly authService: AuthService;
+  /**
+   * Email-verification + password-recovery use-cases behind the public
+   * `/auth/forgot-password`, `/auth/reset-password`, `/auth/verify-email` and the
+   * authenticated `/auth/email-verification/resend` (Phase 6). Framework-free, so
+   * every token/enumeration decision stays unit-testable off the wire.
+   */
+  readonly accountRecoveryService: AccountRecoveryService;
   /** Probes database reachability for `/readyz`. */
   readonly checkDatabase: DatabaseHealthCheck;
   /** Builds a tenant-scoped API-key service for an authenticated request. */
@@ -229,6 +237,7 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
   // Kept entirely separate from the API-key `/v1/*` surface below.
   await registerAuthRoutes(app, {
     authService: deps.authService,
+    accountRecoveryService: deps.accountRecoveryService,
     sessionAuthenticator: deps.sessionAuthenticator,
   });
 

@@ -45,6 +45,8 @@ class FakeSessionStore implements SessionStore {
   async revoke(_tokenHash: string): Promise<void> {}
 
   async revokeAllForUser(_tenantId: string, _userId: string): Promise<void> {}
+
+  async revokeAllForUserAcrossTenants(_userId: string): Promise<void> {}
 }
 
 /** Seed a live session and return its plaintext token. */

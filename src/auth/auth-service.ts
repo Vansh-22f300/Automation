@@ -29,6 +29,8 @@ import type { AccountStore } from '@/auth/account-store.js';
 import { EmailAlreadyRegisteredError } from '@/auth/account-store.js';
 import type { PasswordHasher } from '@/auth/password.js';
 import { generateSessionToken, hashSessionToken } from '@/auth/session-token.js';
+import { generateAuthToken, hashAuthToken } from '@/auth/auth-token.js';
+import { VERIFICATION_TTL_MS } from '@/auth/email/auth-email-notifier.js';
 import type { SessionStore } from '@/auth/session-store.js';
 import type { AuthProfile, AuthUserStore } from '@/auth/auth-user-store.js';
 import type { LoginThrottle } from '@/auth/login-throttle.js';
@@ -98,6 +100,20 @@ function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
+/**
+ * The one notifier capability signup needs: fire a verification email after the
+ * account exists. Optional and fire-and-forget — a real notifier swallows its
+ * own transport errors, so a failed send never fails signup. Structurally a
+ * subset of the recovery notifier, so one `AuthEmailNotifier` satisfies both.
+ */
+export interface SignupNotifier {
+  sendVerification(input: {
+    readonly to: string;
+    readonly name: string | null;
+    readonly rawToken: string;
+  }): Promise<void>;
+}
+
 export class AuthService {
   constructor(
     private readonly users: AuthUserStore,
@@ -105,6 +121,7 @@ export class AuthService {
     private readonly sessions: SessionStore,
     private readonly throttle: LoginThrottle,
     private readonly accounts: AccountStore,
+    private readonly signupNotifier?: SignupNotifier,
   ) {}
 
   async login(email: string, password: string): Promise<LoginResult> {
@@ -200,6 +217,13 @@ export class AuthService {
     const token = generateSessionToken();
     const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
 
+    // The email-verification token is minted here too (CSPRNG, outside the tx)
+    // and only its hash is handed to the store, so the account and its first
+    // verification token are created atomically. The plaintext exists only to
+    // build the emailed link below.
+    const verificationToken = generateAuthToken();
+    const verificationExpiresAt = new Date(Date.now() + VERIFICATION_TTL_MS);
+
     try {
       const created = await this.accounts.createOwnerAccount({
         email,
@@ -208,6 +232,17 @@ export class AuthService {
         workspaceName,
         tokenHash: hashSessionToken(token),
         expiresAt,
+        verificationTokenHash: hashAuthToken(verificationToken),
+        verificationExpiresAt,
+      });
+
+      // Best-effort: the account has already committed, so a mail-transport
+      // failure must not fail signup. The notifier swallows its own errors; the
+      // raw token leaves only inside the link it builds, never logged or returned.
+      await this.signupNotifier?.sendVerification({
+        to: created.user.email,
+        name: created.user.name,
+        rawToken: verificationToken,
       });
 
       return {

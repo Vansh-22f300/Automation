@@ -114,6 +114,18 @@ export const membershipRole = pgEnum('membership_role', ['owner', 'member']);
  */
 export const membershipStatus = pgEnum('membership_status', ['active', 'disabled']);
 
+/**
+ * Why an auth token exists. A single typed table backs both the
+ * email-verification and password-reset flows rather than two near-identical
+ * tables: they share the same security shape (opaque, hashed, single-use,
+ * expiring) and differ only in intent. `purpose` discriminates them, so a
+ * verification token can never be spent as a password reset, or vice versa.
+ */
+export const authTokenPurpose = pgEnum('auth_token_purpose', [
+  'email_verification',
+  'password_reset',
+]);
+
 export const workflowStatus = pgEnum('workflow_status', ['draft', 'active', 'disabled']);
 
 /**
@@ -260,6 +272,15 @@ export const users = pgTable(
     /** Display name. Optional — an invited user may have no name yet. */
     name: text('name'),
     status: userStatus('status').notNull().default('active'),
+    /**
+     * When this person confirmed ownership of their email address, or null if
+     * they have not yet. A nullable timestamp, deliberately **not** a new
+     * `user_status` variant: verification is orthogonal to active/disabled, and
+     * an unverified user still reaches their workspace (verification gates
+     * nothing on its own — it only records the fact). Set exactly once, the
+     * moment a valid email-verification token is consumed.
+     */
+    emailVerifiedAt: timestamp('email_verified_at', { withTimezone: true, mode: 'date' }),
     ...timestamps(),
   },
   (t) => [
@@ -430,6 +451,55 @@ export const loginAttempts = pgTable(
      * per-account count an index range scan.
      */
     index('login_attempts_identifier_created_at_idx').on(t.identifier, t.createdAt),
+  ],
+);
+
+/**
+ * A single-use, expiring, hashed auth token — the persistence behind email
+ * verification and password reset. One table, two purposes (`purpose`), because
+ * both need exactly the same security shape and differ only in intent.
+ *
+ * Discipline, mirroring `sessions.token_hash` and `api_keys.key_hash`:
+ *   - **`token_hash` stores only a SHA-256 of the opaque token**, never the
+ *     token. The high-entropy plaintext is emailed once and never persisted, so
+ *     a database dump cannot be reconstituted into a working verification/reset
+ *     link.
+ *   - **Single-use**: `consumed_at` stays null until the token is spent, then is
+ *     set atomically (`UPDATE … SET consumed_at = now() WHERE token_hash = ?
+ *     AND consumed_at IS NULL AND expires_at > now()`), so the same token cannot
+ *     be redeemed twice even under a race.
+ *   - **Expiring**: `expires_at` is mandatory; a past value is dead on arrival.
+ *
+ * Deliberately **no `tenant_id`**: these tokens act on a *global* user (confirm
+ * an email, reset a password) before any tenant is chosen, exactly like
+ * `password_credentials`, `sessions`' identity, and `login_attempts`. Deleting
+ * the user cascades their tokens away.
+ */
+export const authTokens = pgTable(
+  'auth_tokens',
+  {
+    id: primaryId(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    purpose: authTokenPurpose('purpose').notNull(),
+    /** A SHA-256 hash of the opaque token, never the token itself. */
+    tokenHash: text('token_hash').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+    /** Set the instant the token is spent; null while it is still redeemable. */
+    consumedAt: timestamp('consumed_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    /** Every consume/lookup resolves a token by its hash. */
+    uniqueIndex('auth_tokens_token_hash_key').on(t.tokenHash),
+    /**
+     * Backs "invalidate this user's other live tokens of this purpose" (a resend
+     * supersedes prior verification tokens) and the user FK's cascade.
+     */
+    index('auth_tokens_user_id_purpose_idx').on(t.userId, t.purpose),
   ],
 );
 
@@ -1287,6 +1357,7 @@ export const usersRelations = relations(users, ({ one, many }) => ({
   memberships: many(memberships),
   passwordCredential: one(passwordCredentials),
   sessions: many(sessions),
+  authTokens: many(authTokens),
 }));
 
 export const membershipsRelations = relations(memberships, ({ one }) => ({
@@ -1300,6 +1371,10 @@ export const passwordCredentialsRelations = relations(passwordCredentials, ({ on
 
 export const sessionsRelations = relations(sessions, ({ one }) => ({
   user: one(users, { fields: [sessions.userId], references: [users.id] }),
+}));
+
+export const authTokensRelations = relations(authTokens, ({ one }) => ({
+  user: one(users, { fields: [authTokens.userId], references: [users.id] }),
 }));
 
 export const apiKeysRelations = relations(apiKeys, ({ one }) => ({
@@ -1400,6 +1475,9 @@ export type NewSession = typeof sessions.$inferInsert;
 
 export type LoginAttempt = typeof loginAttempts.$inferSelect;
 export type NewLoginAttempt = typeof loginAttempts.$inferInsert;
+
+export type AuthToken = typeof authTokens.$inferSelect;
+export type NewAuthToken = typeof authTokens.$inferInsert;
 
 export type Workflow = typeof workflows.$inferSelect;
 export type NewWorkflow = typeof workflows.$inferInsert;

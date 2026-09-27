@@ -23,6 +23,11 @@ import { DrizzleLoginThrottle } from "@/auth/login-throttle.js";
 import { argon2PasswordHasher } from "@/auth/password.js";
 import { SessionAuthenticator } from "@/auth/session-authenticator.js";
 import { DrizzleSessionStore } from "@/auth/session-store.js";
+import { AccountRecoveryService } from "@/auth/account-recovery-service.js";
+import { DrizzleAuthTokenStore } from "@/auth/auth-token-store.js";
+import { DrizzlePasswordCredentialStore } from "@/auth/password-credential-store.js";
+import { createEmailSender } from "@/auth/email/email-sender.js";
+import { AuthEmailNotifier } from "@/auth/email/auth-email-notifier.js";
 import { ApiKeyRepository } from "@/repositories/api-key-repository.js";
 import { ConnectionRepository } from "@/repositories/connection-repository.js";
 import { PostgresJobQueue } from "@/repositories/job-queue.js";
@@ -58,15 +63,53 @@ const queue = new PostgresJobQueue(database.db);
 // arm of the composite that guards `/v1/*`.
 const sessionStore = new DrizzleSessionStore(database.db);
 const sessionAuthenticator = new SessionAuthenticator(sessionStore);
+
+// Email transport + link policy for verification/recovery. `createEmailSender`
+// selects the transport from `EMAIL_TRANSPORT` (metadata-only `log` by default;
+// `console` is dev-only and rejected in production by env validation). The
+// notifier builds every link from the trusted `APP_ORIGIN` — never a request
+// header — and delivers best-effort, so a mail failure never fails the auth flow
+// that triggered it.
+const authNotifier = new AuthEmailNotifier(
+  createEmailSender(env, logger),
+  env.APP_ORIGIN,
+  logger,
+);
+
+// Shared by the login and recovery paths: one read-side user store and one login
+// throttle instance. Recovery reuses that same throttle under namespaced keys
+// (`resend:<userId>`, `pwreset:<email>`) instead of standing up a second
+// rate-limiting mechanism, and the same Argon2id hasher — no second KDF.
+const authUserStore = new DrizzleAuthUserStore(database.db);
+const loginThrottle = new DrizzleLoginThrottle(database.db);
+
 const authService = new AuthService(
-  new DrizzleAuthUserStore(database.db),
+  authUserStore,
   argon2PasswordHasher,
   sessionStore,
-  new DrizzleLoginThrottle(database.db),
+  loginThrottle,
   // Signup's transactional account creation (workspace + owner + credential +
-  // session in one transaction). Shares the same pool as the read-side stores.
+  // session + first email-verification token in one transaction). Shares the pool.
   new DrizzleAccountStore(database.db),
+  // Best-effort verification email on successful signup; a transport failure is
+  // swallowed and logged metadata-only, never failing account creation.
+  authNotifier,
 );
+
+// Email verification + password recovery use-cases. Framework-free; each
+// dependency is a narrow store seam so every token/session/enumeration decision
+// stays unit-testable off the wire. The hasher and throttle are the very
+// instances the login path uses.
+const accountRecoveryService = new AccountRecoveryService({
+  db: database.db,
+  tokens: new DrizzleAuthTokenStore(database.db),
+  users: authUserStore,
+  sessions: sessionStore,
+  credentials: new DrizzlePasswordCredentialStore(database.db),
+  passwordHasher: argon2PasswordHasher,
+  throttle: loginThrottle,
+  notifier: authNotifier,
+});
 
 const app = await buildApp({
   logger,
@@ -88,6 +131,7 @@ const app = await buildApp({
   // satisfy a session route). Same instance as the composite's session arm.
   sessionAuthenticator,
   authService,
+  accountRecoveryService,
   checkDatabase: () => database.ping(),
   // One tenant-scoped service per authenticated request — the repository is
   // pinned to that tenant and cannot reach across tenants.

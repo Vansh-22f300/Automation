@@ -85,6 +85,70 @@ export class AuthClient {
     await this.send("/auth/logout", "POST").catch(() => undefined);
   }
 
+  /**
+   * POST /auth/email-verification/resend — ask the BFF to re-send the current
+   * user's verification email. Identity comes solely from the HttpOnly session
+   * cookie server-side; the browser supplies no user id or email. Returns only
+   * the safe confirmation message. Throws `ApiClientError` (carrying the
+   * upstream status, e.g. 401 logged-out or 429 throttled) on any non-2xx.
+   */
+  async resendVerification(): Promise<{ message: string }> {
+    const response = await this.send("/auth/email-verification/resend", "POST");
+    if (!response.ok) throw await this.toError(response);
+    return { message: await this.messageOf(response, "Verification email sent.") };
+  }
+
+  /**
+   * POST /auth/forgot-password — request a password-reset email. The BFF always
+   * answers 202 with a fixed generic message regardless of whether the account
+   * exists, so this can never become a user-enumeration oracle. Only a network
+   * failure (status 0) or a validation 400 surfaces as a thrown error.
+   */
+  async forgotPassword(email: string): Promise<{ message: string }> {
+    const response = await this.send(
+      "/auth/forgot-password",
+      "POST",
+      JSON.stringify({ email }),
+    );
+    if (!response.ok) throw await this.toError(response);
+    return {
+      message: await this.messageOf(
+        response,
+        "If an account exists, password reset instructions will be sent.",
+      ),
+    };
+  }
+
+  /**
+   * POST /auth/reset-password — complete a password reset. The one-time token
+   * is held server-side in the HttpOnly `aw_pwreset` cookie set by the
+   * email-link handoff; the browser therefore submits ONLY the new password and
+   * never sees, stores, or supplies the token. Throws `ApiClientError` on any
+   * non-2xx (an invalid/expired/spent token comes back as a generic 400).
+   */
+  async resetPassword(password: string): Promise<{ message: string }> {
+    const response = await this.send(
+      "/auth/reset-password",
+      "POST",
+      JSON.stringify({ password }),
+    );
+    if (!response.ok) throw await this.toError(response);
+    return {
+      message: await this.messageOf(
+        response,
+        "Your password has been reset. Please sign in with your new password.",
+      ),
+    };
+  }
+
+  /** Extract a safe string `message` from a JSON body, falling back to `fallback`. */
+  private async messageOf(response: Response, fallback: string): Promise<string> {
+    const data = (await response.json().catch(() => null)) as {
+      message?: unknown;
+    } | null;
+    return typeof data?.message === "string" ? data.message : fallback;
+  }
+
   private async send(
     path: string,
     method: "GET" | "POST",

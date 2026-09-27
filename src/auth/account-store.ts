@@ -5,11 +5,12 @@
  * Signup is the one operation that must bring a whole ownership chain into
  * existence at once: a brand-new workspace (`tenants`), a global person
  * (`users`), their password (`password_credentials`), their `owner` membership
- * (`memberships`), and their first live session (`sessions`). Either *all* of
+ * (`memberships`), their first live session (`sessions`), and a first
+ * email-verification token (`auth_tokens`). Either *all* of
  * that commits or *none* of it does — a half-made account (a user with no
  * membership, a workspace with no owner) would be a security and support
  * hazard. So unlike the other auth stores, which each touch a single table on
- * `this.db`, this seam owns one `db.transaction(...)` spanning all five inserts.
+ * `this.db`, this seam owns one `db.transaction(...)` spanning all six inserts.
  *
  * The expensive, non-transactional work — the Argon2id password hash and the
  * CSPRNG session token — is done by the caller (`AuthService.signup`) *before*
@@ -26,7 +27,7 @@
  * unchanged rather than masked as an email conflict.
  */
 
-import { memberships, passwordCredentials, sessions, tenants, users } from '@/db/schema.js';
+import { authTokens, memberships, passwordCredentials, sessions, tenants, users } from '@/db/schema.js';
 import type { AppDatabase } from '@/db/client.js';
 
 /** All server-derived; the caller normalises the email and hashes the secrets. */
@@ -43,6 +44,10 @@ export interface CreateOwnerAccountInput {
   readonly tokenHash: string;
   /** Absolute session expiry, computed by the caller. */
   readonly expiresAt: Date;
+  /** SHA-256 digest of the opaque email-verification token; plaintext never stored. */
+  readonly verificationTokenHash: string;
+  /** Absolute expiry of the verification token, computed by the caller. */
+  readonly verificationExpiresAt: Date;
 }
 
 /** The safe identity of the account just created — no secret material. */
@@ -101,10 +106,10 @@ function isEmailUniqueViolation(error: unknown): boolean {
 }
 
 /**
- * Postgres-backed account creation. One transaction, five inserts, in foreign-key
+ * Postgres-backed account creation. One transaction, six inserts, in foreign-key
  * order so every row's references already exist when it is written:
  *
- *   tenants → users → password_credentials → memberships → sessions
+ *   tenants → users → password_credentials → memberships → sessions → auth_tokens
  *
  * The `owner` membership must precede the session, because the composite FK
  * `sessions(tenant_id, user_id) → memberships(tenant_id, user_id)` makes a
@@ -154,6 +159,17 @@ export class DrizzleAccountStore implements AccountStore {
           userId: createdUser.id,
           tokenHash: input.tokenHash,
           expiresAt: input.expiresAt,
+        });
+
+        // The email-verification token, minted in the same transaction so a new
+        // account always has exactly one live verification token from the moment
+        // it exists. Only the hash is stored; the plaintext rides out only in the
+        // emailed link (built by the notifier), never persisted or returned here.
+        await tx.insert(authTokens).values({
+          userId: createdUser.id,
+          purpose: 'email_verification',
+          tokenHash: input.verificationTokenHash,
+          expiresAt: input.verificationExpiresAt,
         });
 
         return {

@@ -117,6 +117,47 @@ const anthropicBaseUrl = z
   });
 
 /**
+ * The canonical public origin the application is served from (`APP_ORIGIN`).
+ *
+ * This is the *trusted* base for every security-sensitive link we email — email
+ * verification and password-reset URLs (Phase 6 §11). It is read from
+ * configuration, never from a browser-supplied `Host`/`Origin` header, so a link
+ * can never be pointed at an attacker's domain by a forged request.
+ *
+ * It must be a bare origin — scheme + host + optional port, with no path, query,
+ * or fragment — because the notifier appends the route path itself. Defaults to
+ * the local frontend dev origin so development needs no extra config; the
+ * production superRefine below additionally requires https and a non-loopback
+ * host, since a localhost or plaintext link is useless (and unsafe) in a
+ * deployment.
+ */
+const appOrigin = z
+  .string()
+  .min(1, 'must not be empty when set')
+  .superRefine((value, ctx) => {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'must be a valid absolute URL, for example https://app.example.com',
+      });
+      return;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      ctx.addIssue({ code: 'custom', message: `must use http:// or https:// (found ${url.protocol}//)` });
+    }
+    if ((url.pathname !== '' && url.pathname !== '/') || url.search !== '' || url.hash !== '') {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          'must be a bare origin with no path, query, or fragment (for example https://app.example.com)',
+      });
+    }
+  });
+
+/**
  * The credential-encryption master key (`CREDENTIAL_ENCRYPTION_KEY`).
  *
  * Optional: the application must boot without it. Only connection encrypt/decrypt
@@ -403,6 +444,22 @@ const envSchema = z
    * Defaults to `false` so local/dev is safe without any extra config.
    */
   TRUST_PROXY: trustProxySchema,
+
+  /**
+   * The canonical public origin used to build emailed verification/reset links.
+   * See `appOrigin` above. Defaults to the local frontend dev origin; production
+   * additionally requires https and a non-loopback host (superRefine below).
+   */
+  APP_ORIGIN: appOrigin.default('http://localhost:3001'),
+
+  /**
+   * How auth emails are "delivered". `log` (default) records metadata only and
+   * never emits the link or token — the safe production default while no real
+   * ESP is wired. `console` is an opt-in dev-only smoke transport that prints the
+   * link to stdout; it is rejected in production (superRefine below) so a
+   * one-time credential can never reach a shipped log sink.
+   */
+  EMAIL_TRANSPORT: z.enum(['log', 'console']).default('log'),
   })
   .superRefine((env, ctx) => {
     // Reject ambiguous credentials rather than silently picking one. An API key
@@ -514,6 +571,43 @@ const envSchema = z
         path: ['HOST'],
         message:
           'must not be 127.0.0.1 in production — set HOST=0.0.0.0 for containers/PaaS (or another non-loopback address)',
+      });
+    }
+
+    // Invariant 5: emailed links must be reachable and TLS-protected in
+    // production. A localhost or http:// APP_ORIGIN produces verification/reset
+    // links that either do not resolve for the recipient or travel in the clear.
+    if (env.NODE_ENV === 'production') {
+      try {
+        const url = new URL(env.APP_ORIGIN);
+        if (url.protocol !== 'https:') {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['APP_ORIGIN'],
+            message: 'must use https:// in production — verification and reset links must be served over TLS',
+          });
+        }
+        if (isLoopbackHost(url.hostname)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['APP_ORIGIN'],
+            message: 'must not point to localhost in production — set the canonical public origin',
+          });
+        }
+      } catch {
+        // The base schema already reported the URL shape problem; nothing to add.
+      }
+    }
+
+    // Invariant 6: the console email transport prints one-time links to stdout,
+    // so it must never be selected in production, where stdout is shipped to a
+    // log sink. Left unset it falls back to the metadata-only `log` transport.
+    if (env.NODE_ENV === 'production' && env.EMAIL_TRANSPORT === 'console') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['EMAIL_TRANSPORT'],
+        message:
+          "must not be 'console' in production — it prints one-time verification/reset links to stdout; leave it unset (log)",
       });
     }
   });

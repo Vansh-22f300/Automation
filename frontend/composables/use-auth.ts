@@ -72,6 +72,31 @@ export function useAuth() {
     return inflight;
   }
 
+  /**
+   * Best-effort re-probe of the session used purely to refresh identity fields
+   * (notably `emailVerifiedAt`) — after a resend, after verifying, or right
+   * after login/signup, whose responses do not carry verification state. Unlike
+   * `refresh`, it neither flips to a `loading` flash nor downgrades an
+   * established session to `unavailable` on a transient error; a clean 401,
+   * however, is still honoured as logged-out.
+   */
+  async function syncIdentity(): Promise<void> {
+    try {
+      const session = await client.getSession();
+      if (session === null) {
+        user.value = null;
+        tenant.value = null;
+        status.value = "unauthenticated";
+      } else {
+        user.value = session.user;
+        tenant.value = session.tenant;
+        status.value = "authenticated";
+      }
+    } catch {
+      // Transient backend failure — keep whatever state we already hold.
+    }
+  }
+
   async function login(email: string, password: string): Promise<void> {
     const result = await client.login(email, password);
     user.value = result.user;
@@ -98,15 +123,63 @@ export function useAuth() {
     status.value = "unauthenticated";
   }
 
+  /**
+   * Re-send the current user's verification email, then sync identity so any
+   * change in verification state is reflected. Returns the safe confirmation
+   * message; rejects (with the client's `ApiClientError`) on 401/429/etc so the
+   * caller can render a generic, status-appropriate message.
+   */
+  async function resendVerification(): Promise<string> {
+    const { message } = await client.resendVerification();
+    await syncIdentity();
+    return message;
+  }
+
+  /**
+   * Request a password-reset email. The response is a fixed generic message for
+   * every account state, so nothing here reveals whether the address exists.
+   */
+  async function forgotPassword(email: string): Promise<string> {
+    const { message } = await client.forgotPassword(email);
+    return message;
+  }
+
+  /**
+   * Complete a password reset. The backend has revoked EVERY session for the
+   * user and the BFF has cleared our cookies, so we drop to the logged-out state
+   * locally too — the user must sign in afresh with the new password.
+   */
+  async function resetPassword(password: string): Promise<string> {
+    const { message } = await client.resetPassword(password);
+    user.value = null;
+    tenant.value = null;
+    status.value = "unauthenticated";
+    return message;
+  }
+
   return {
     user: readonly(user),
     tenant: readonly(tenant),
     status: readonly(status),
     isAuthenticated: computed(() => status.value === "authenticated"),
+    // True ONLY when we positively know the address is unverified (a definitive
+    // `null`). `undefined` (verification state not yet probed, e.g. immediately
+    // after login) reads as "unknown" and does NOT trip the prompt, so a
+    // verified user never sees a spurious "verify your email" flash.
+    needsVerification: computed(
+      () =>
+        status.value === "authenticated" &&
+        user.value !== null &&
+        user.value.emailVerifiedAt === null,
+    ),
     refresh,
     ensureLoaded,
+    syncIdentity,
     login,
     signup,
     logout,
+    resendVerification,
+    forgotPassword,
+    resetPassword,
   };
 }
