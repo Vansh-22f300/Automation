@@ -423,6 +423,7 @@ describe('tenant-isolation architecture', () => {
           'src/test/integration/api-keys.test.ts',
           'src/test/integration/tenant-isolation.test.ts',
           'src/test/integration/auth.test.ts', // exercises the assembled auth seam
+          'src/test/integration/session-data-plane.test.ts', // wires the composite for the data-plane seam
         ]),
       },
       {
@@ -434,6 +435,7 @@ describe('tenant-isolation architecture', () => {
           THIS_TEST, // this guard (names it in string/regex literals)
           'src/test/integration/sessions.test.ts',
           'src/test/integration/auth.test.ts', // exercises the assembled auth seam
+          'src/test/integration/session-data-plane.test.ts', // wires the composite for the data-plane seam
         ]),
       },
     ];

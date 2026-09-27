@@ -44,13 +44,20 @@ import { RateLimitedError } from "@/api/errors.js";
 import { newId } from "@/domain/ids.js";
 
 export interface AppDependencies {
-  /** Resolves API-key credentials to a tenant (guards `/v1/*`). */
+  /**
+   * Resolves the bearer credential that guards `/v1/*`. In production this is a
+   * composite that accepts *either* a machine API key or an opaque human session
+   * token, routed by credential structure to the matching authenticator; each
+   * resolves the tenant from its own store. `buildApp` treats it as a single
+   * `Authenticator` — the routing is an implementation detail of the wiring.
+   */
   readonly authenticator: Authenticator;
   /**
-   * Resolves opaque human *session* tokens (guards the authenticated `/auth/*`
-   * routes). Separate from `authenticator` so the two credential kinds stay on
-   * structurally distinct paths — an API key cannot satisfy a session route and
-   * vice versa. Additive: it does not alter the existing API-key authentication.
+   * Resolves opaque human *session* tokens for the authenticated `/auth/*`
+   * routes (current-session probe, logout). `/auth/*` is session-only: an API
+   * key can never satisfy it. The two credential kinds stay structurally
+   * distinct, so this is separate from `authenticator` even though a session
+   * token is also accepted on `/v1/*` via the composite above.
    */
   readonly sessionAuthenticator: Authenticator;
   /** Human login/logout/current-session use-cases behind `/auth/*`. */

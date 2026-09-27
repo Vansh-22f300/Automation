@@ -14,7 +14,15 @@ export type BffBody =
 export interface BffForwardOptions {
   readonly method: 'GET' | 'HEAD';
   readonly backendUrl: string;
-  readonly apiKey: string;
+  /**
+   * The bearer credential to forward upstream, or `undefined` to send no
+   * `Authorization` header at all. On the data plane this is the human's opaque
+   * session token, read server-side from the HttpOnly `aw_session` cookie —
+   * never a machine API key, and never anything the browser could choose. When
+   * absent (no session cookie) the request is forwarded unauthenticated and
+   * Fastify decides: public routes answer, `/v1/*` returns 401.
+   */
+  readonly bearerToken?: string;
   readonly pathSegments: string;
   readonly query: Record<string, string | string[] | undefined>;
   readonly requestHeaders: Record<string, string | string[] | undefined>;
@@ -33,7 +41,9 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 /**
  * Request headers we forward verbatim from the browser to Fastify. Everything
  * else is dropped, including any `authorization` or `cookie` the browser may
- * have set. The handler then injects a server-only Authorization header below.
+ * have set. When the handler holds a session token it injects a single
+ * server-derived `Authorization` header below, so a browser-supplied one can
+ * never survive to become the upstream credential.
  */
 const FORWARDABLE_REQUEST_HEADERS = new Set([
   'accept',
@@ -91,7 +101,7 @@ function appendSearchParams(
 
 function buildOutboundHeaders(
   incoming: Record<string, string | string[] | undefined>,
-  apiKey: string,
+  bearerToken: string | undefined,
 ): Headers {
   const outbound = new Headers();
   for (const [name, value] of Object.entries(incoming)) {
@@ -103,7 +113,15 @@ function buildOutboundHeaders(
       outbound.set(name, String(value));
     }
   }
-  outbound.set('authorization', `Bearer ${apiKey}`);
+  // Any browser-supplied `authorization` was already dropped by the allowlist
+  // above. Set exactly one server-derived Authorization header, and only when
+  // we actually hold a session token; with no token we forward nothing and let
+  // Fastify reject protected routes itself (public routes still answer).
+  // `Headers.set` replaces, so a single value reaches Fastify regardless of
+  // what the browser sent.
+  if (bearerToken !== undefined && bearerToken !== '') {
+    outbound.set('authorization', `Bearer ${bearerToken}`);
+  }
   return outbound;
 }
 
@@ -150,7 +168,7 @@ export async function forwardBff(options: BffForwardOptions): Promise<BffForward
   const targetUrl = joinPath(options.backendUrl, options.pathSegments);
   appendSearchParams(targetUrl, options.query);
 
-  const outboundHeaders = buildOutboundHeaders(options.requestHeaders, options.apiKey);
+  const outboundHeaders = buildOutboundHeaders(options.requestHeaders, options.bearerToken);
 
   const controller = new AbortController();
   const timeoutMs = readTimeoutMs(options.timeoutMs);
