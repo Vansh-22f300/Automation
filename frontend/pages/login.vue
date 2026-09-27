@@ -117,6 +117,10 @@ async function onSubmit(): Promise<void> {
       </button>
     </form>
 
+    <p class="auth-alt">
+      Don't have an account?
+      <NuxtLink to="/signup">Create your workspace.</NuxtLink>
+    </p>
     <NuxtLink to="/" class="auth-back">&larr; Back to overview</NuxtLink>
   </section>
 </template>
@@ -145,8 +149,10 @@ async function onSubmit(): Promise<void> {
   background: rgba(255,107,107,0.10); border: 1px solid rgba(255,107,107,0.22);
 }
 .auth-submit { width: 100%; margin-top: 2px; }
+.auth-alt { margin: 18px 0 0; font-size: 12px; color: var(--landing-dim); }
+.auth-alt a { color: var(--landing-mist); }
 .auth-back {
-  display: inline-block; margin-top: 18px; font-size: 12px; color: var(--landing-faint);
+  display: inline-block; margin-top: 10px; font-size: 12px; color: var(--landing-faint);
 }
 .auth-back:hover { color: var(--landing-mist); }
 </style>
