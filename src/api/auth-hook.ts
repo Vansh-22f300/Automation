@@ -116,11 +116,14 @@ export function registerApiKeyAuth(scope: ApiServer, authenticator: Authenticato
  *
  * Deliberately a separate entry point from {@link registerApiKeyAuth}, guarded by
  * a distinct authenticator (the session authenticator, resolving opaque session
- * tokens against the `sessions` table). This keeps the two credential kinds on
- * structurally separate paths: a session token presented to the `/v1` API-key
- * scope has no key prefix and is rejected there, and an API key presented here
- * hashes to a value that is not a live session and is rejected here. Neither
- * authenticator is weakened to accept the other's credential.
+ * tokens against the `sessions` table). `/auth/*` is session-only: an API key
+ * presented here hashes to a value that is not a live session and is rejected.
+ *
+ * The reverse is NOT symmetric: the `/v1/*` scope is guarded by a *composite*
+ * authenticator that accepts either an API key or a session token, routed by
+ * structure, so a browser session forwarded by the BFF authenticates there as
+ * its own tenant. Neither underlying authenticator is weakened — the composite
+ * only dispatches by credential shape; each arm applies its unchanged rules.
  */
 export function registerSessionAuth(scope: ApiServer, authenticator: Authenticator): void {
   registerBearerAuth(scope, authenticator);

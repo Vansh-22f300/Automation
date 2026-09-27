@@ -32,6 +32,7 @@ import { DrizzleSessionStore } from '@/auth/session-store.js';
 import { hashSessionToken } from '@/auth/session-token.js';
 import { ApiKeyAuthenticator } from '@/auth/api-key-authenticator.js';
 import { DrizzleApiKeyStore } from '@/auth/api-key-store.js';
+import { CompositeAuthenticator } from '@/auth/composite-authenticator.js';
 import type { ApiServer } from '@/api/types.js';
 import type { DatabaseHandle } from '@/db/client.js';
 import { loginAttempts, memberships, passwordCredentials, sessions, tenants, users } from '@/db/schema.js';
@@ -123,11 +124,17 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('auth API integration', () => {
     await seedUser('throttle', passwordHash, [{ tenantId: tenantOneId }]);
 
     const sessionStore = new DrizzleSessionStore(handle.db);
+    const sessionAuthenticator = new SessionAuthenticator(sessionStore);
     app = await buildApp({
       logger: pino({ level: 'silent' }),
-      // Real API-key path (regression) and real session path (human auth).
-      authenticator: new ApiKeyAuthenticator(new DrizzleApiKeyStore(handle.db)),
-      sessionAuthenticator: new SessionAuthenticator(sessionStore),
+      // `/v1/*` is guarded by the same composite the production wiring uses: an
+      // `awk_`-shaped credential routes to the real API-key authenticator, an
+      // opaque token to the session authenticator. `/auth/*` stays session-only.
+      authenticator: new CompositeAuthenticator(
+        new ApiKeyAuthenticator(new DrizzleApiKeyStore(handle.db)),
+        sessionAuthenticator,
+      ),
+      sessionAuthenticator,
       authService: new AuthService(
         new DrizzleAuthUserStore(handle.db),
         argon2PasswordHasher,
@@ -299,19 +306,21 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('auth API integration', () => {
     });
   });
 
-  describe('the API-key surface is untouched by human auth', () => {
-    it('still authenticates a real API key on /v1/*, and keeps the two credentials apart', async () => {
+  describe('the API-key surface still works and /v1 also accepts a human session', () => {
+    it('authenticates a real API key on /v1/*, and a session authenticates there as its own tenant', async () => {
       // A genuine key minted the normal way still works on the API-key surface.
       const created = await new ApiKeyRepository(new TenantScope(handle.db, tenantOneId)).create('auth-it regression');
       const okV1 = await app.inject({ method: 'GET', url: '/v1/api-keys', headers: bearer(created.plaintext) });
       expect(okV1.statusCode).toBe(200);
 
-      // A human session token is not a key: it cannot reach the /v1 surface.
+      // Under the composite, a human session token is ALSO accepted on /v1 — it
+      // authenticates as its OWN tenant (the one login selected). The caller
+      // never chooses the tenant; it is read from the session row.
       const token = (await login({ email: email('solo'), password: PASSWORD })).json().session.token as string;
       const sessionOnV1 = await app.inject({ method: 'GET', url: '/v1/api-keys', headers: bearer(token) });
-      expect(sessionOnV1.statusCode).toBe(401);
+      expect(sessionOnV1.statusCode).toBe(200);
 
-      // ...and an API key cannot satisfy a human /auth/* route.
+      // ...and an API key still cannot satisfy a human /auth/* route (session-only).
       const keyOnAuth = await app.inject({ method: 'GET', url: '/auth/session', headers: bearer(created.plaintext) });
       expect(keyOnAuth.statusCode).toBe(401);
     });
