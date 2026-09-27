@@ -114,6 +114,29 @@ export class TenantSelectionRequiredError extends ApiError {
   }
 }
 
+/**
+ * 409 — the email supplied to signup cannot be used to create an account
+ * (in practice: it is already registered).
+ *
+ * The message is deliberately generic and fixed — it never states that the
+ * address exists, nor anything about the existing account (name, workspaces,
+ * role). Without email verification some existence signal on signup is
+ * unavoidable, but "generic" is honoured by a uniform 409 that does not vary
+ * with the account's details, so a duplicate signup is not a clean enumeration
+ * oracle beyond the bare "this address is unavailable" fact.
+ */
+export class EmailUnavailableError extends ApiError {
+  override readonly statusCode = 409;
+  override readonly code = 'email_unavailable';
+
+  constructor(
+    message = 'That email address cannot be used to create an account',
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+  }
+}
+
 /** Type guard for `ApiError` subclasses (including `RateLimitedError`). */
 export function isApiError(error: unknown): error is ApiError {
   return error instanceof ApiError;

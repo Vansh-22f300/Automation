@@ -27,6 +27,7 @@ import { z } from 'zod';
 import { readBearerToken, registerSessionAuth, requireHumanSession } from '@/api/auth-hook.js';
 import {
   BadRequestError,
+  EmailUnavailableError,
   RateLimitedError,
   TenantSelectionRequiredError,
   UnauthorizedError,
@@ -57,6 +58,35 @@ const loginBody = z.object({
   password: z.string().min(1, 'password is required').max(1024, 'password is too long'),
 });
 
+/**
+ * Signup accepts only the four fields the person supplies. Unknown keys are
+ * stripped by Zod's default object parsing, so a client cannot smuggle a
+ * `userId`, `tenantId`, or `role` into account creation — the server derives
+ * every identity fact itself. `name`/`email`/`workspaceName` are trimmed;
+ * `password` is not (leading/trailing spaces can be meaningful in a secret).
+ */
+const signupBody = z.object({
+  name: z.string().trim().min(1, 'name is required').max(200, 'name is too long'),
+  email: z
+    .string()
+    .trim()
+    .min(1, 'email is required')
+    .max(320, 'email is too long')
+    .regex(EMAIL_RE, 'a valid email is required'),
+  // A deliberately modest, explicit policy: present and long enough to not be
+  // trivially guessable, capped to bound the KDF's input. Not an enterprise
+  // complexity regime — that is out of scope.
+  password: z
+    .string()
+    .min(8, 'password must be at least 8 characters')
+    .max(1024, 'password is too long'),
+  workspaceName: z
+    .string()
+    .trim()
+    .min(1, 'workspace name is required')
+    .max(200, 'workspace name is too long'),
+});
+
 export async function registerAuthRoutes(app: ApiServer, deps: AuthRouteDependencies): Promise<void> {
   // --- Public: login -------------------------------------------------------
   app.post('/auth/login', async (request, reply) => {
@@ -83,6 +113,35 @@ export async function registerAuthRoutes(app: ApiServer, deps: AuthRouteDependen
         // One generic message for every credential failure — reveals nothing
         // about whether the email exists or the password was the wrong part.
         throw new UnauthorizedError('Invalid email or password');
+    }
+  });
+
+  // --- Public: signup ------------------------------------------------------
+  // Creates a brand-new account and its first workspace, then returns a live
+  // session exactly like login — the BFF banks the token as an HttpOnly cookie
+  // and strips it from the browser response. Public, so subject to the same
+  // global per-IP limiter as login; account creation is transactional in
+  // `AuthService.signup`, so a failure leaves nothing behind.
+  app.post('/auth/signup', async (request, reply) => {
+    const parsed = signupBody.safeParse(request.body);
+    if (!parsed.success) {
+      throw new BadRequestError(parsed.error.issues[0]?.message ?? 'Invalid request body');
+    }
+
+    const result = await deps.authService.signup(parsed.data);
+
+    switch (result.kind) {
+      case 'created':
+        // 201: a new account + workspace now exist. The plaintext session token
+        // is echoed exactly once here, for the BFF to consume.
+        return reply.code(201).send({
+          user: result.user,
+          tenant: result.tenant,
+          session: { token: result.token, expiresAt: result.expiresAt.toISOString() },
+        });
+      case 'email_taken':
+        // A single generic 409 that never varies with the account's details.
+        throw new EmailUnavailableError();
     }
   });
 

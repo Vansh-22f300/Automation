@@ -55,6 +55,28 @@ export class AuthClient {
   }
 
   /**
+   * POST /auth/signup — creates a new account + workspace and, exactly like a
+   * login, hands the BFF the brand-new session so it can set the HttpOnly cookie
+   * server-side. Returns only safe metadata (never the token). Throws
+   * `ApiClientError` (carrying the upstream status) on any non-2xx response so
+   * the signup page can render a generic, status-appropriate message.
+   */
+  async signup(
+    name: string,
+    email: string,
+    password: string,
+    workspaceName: string,
+  ): Promise<LoginResponse> {
+    const response = await this.send(
+      "/auth/signup",
+      "POST",
+      JSON.stringify({ name, email, password, workspaceName }),
+    );
+    if (!response.ok) throw await this.toError(response);
+    return (await response.json()) as LoginResponse;
+  }
+
+  /**
    * POST /auth/logout — best-effort teardown. The BFF always clears the cookie
    * and always answers 204, so from the browser's point of view logout is
    * deterministic: this never rejects, even if the request fails.
