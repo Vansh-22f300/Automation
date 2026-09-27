@@ -52,7 +52,7 @@ import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
 
-import { TEST_DATABASE_URL, createTestDatabaseHandle } from './support.js';
+import { TEST_DATABASE_URL, createTestDatabaseHandle, inertAccountRecovery } from './support.js';
 
 const PASSWORD = 'correct-horse-battery-staple';
 const RUN = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -143,6 +143,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('session-authorized data plane'
         new DrizzleAccountStore(handle.db),
       ),
       checkDatabase: async () => undefined,
+      accountRecoveryService: inertAccountRecovery(),
       apiKeyServiceFor: (auth) => new ApiKeyRepository(new TenantScope(handle.db, auth.tenantId)),
       // The REAL tenant-scoped workflow repository — the tenant comes from the
       // resolved AuthContext, never from the request.

@@ -25,6 +25,7 @@ import { buildApp } from "@/api/app.js";
 import { UnauthorizedError } from "@/api/errors.js";
 import type { ApiServer } from "@/api/types.js";
 import type { AuthService } from "@/auth/auth-service.js";
+import type { AccountRecoveryService } from "@/auth/account-recovery-service.js";
 import type { AuthContext, Authenticator } from "@/auth/context.js";
 import { generateApiKey } from "@/auth/api-key.js";
 import { newId } from "@/domain/ids.js";
@@ -166,6 +167,20 @@ async function makeApp(): Promise<Harness> {
         throw new Error("not used");
       },
     } as unknown as AuthService,
+    accountRecoveryService: {
+      requestPasswordReset: async () => {
+        throw new Error("not used");
+      },
+      resetPassword: async () => {
+        throw new Error("not used");
+      },
+      verifyEmail: async () => {
+        throw new Error("not used");
+      },
+      resendVerification: async () => {
+        throw new Error("not used");
+      },
+    } as unknown as AccountRecoveryService,
     checkDatabase: async () => {
       if (!dbHealthy.value)
         throw new Error("connection refused to 10.0.0.9:5432");

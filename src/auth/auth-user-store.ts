@@ -15,9 +15,9 @@
  * to anything but the in-process hasher via {@link AuthLoginRecord}.
  */
 
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 
-import type { AppDatabase } from '@/db/client.js';
+import type { AppDatabase, Executor } from '@/db/client.js';
 import { memberships, passwordCredentials, tenants, users } from '@/db/schema.js';
 
 /** One tenant a user is an *active* member of, with the role for that tenant. */
@@ -48,7 +48,13 @@ export interface AuthLoginRecord {
 
 /** The public identity of a user and one tenant — the safe fields a session exposes. */
 export interface AuthProfile {
-  readonly user: { readonly id: string; readonly email: string; readonly name: string | null };
+  readonly user: {
+    readonly id: string;
+    readonly email: string;
+    readonly name: string | null;
+    /** When this email was confirmed, or null if it has not been yet (§4). */
+    readonly emailVerifiedAt: Date | null;
+  };
   readonly tenant: { readonly id: string; readonly name: string };
 }
 
@@ -66,6 +72,14 @@ export interface AuthUserStore {
    * session, never from request input.
    */
   findProfile(userId: string, tenantId: string): Promise<AuthProfile | null>;
+  /**
+   * Mark a user's email confirmed, idempotently: sets `email_verified_at` to now
+   * only while it is still null, so a second verification never moves the
+   * timestamp. The `userId` comes from a just-consumed verification token, never
+   * from request input. {@link Executor}-aware so it can share the verify
+   * transaction that consumed that token.
+   */
+  markEmailVerified(userId: string, executor?: Executor): Promise<void>;
 }
 
 /** Postgres-backed store. All lookups are by indexed key; none is tenant-scoped by design. */
@@ -130,6 +144,7 @@ export class DrizzleAuthUserStore implements AuthUserStore {
         userId: users.id,
         email: users.email,
         name: users.name,
+        emailVerifiedAt: users.emailVerifiedAt,
         tenantId: tenants.id,
         tenantName: tenants.name,
       })
@@ -143,8 +158,22 @@ export class DrizzleAuthUserStore implements AuthUserStore {
     if (row === undefined) return null;
 
     return {
-      user: { id: row.userId, email: row.email, name: row.name },
+      user: {
+        id: row.userId,
+        email: row.email,
+        name: row.name,
+        emailVerifiedAt: row.emailVerifiedAt,
+      },
       tenant: { id: row.tenantId, name: row.tenantName },
     };
+  }
+
+  async markEmailVerified(userId: string, executor: Executor = this.db): Promise<void> {
+    // Idempotent: the `email_verified_at IS NULL` guard means re-verifying an
+    // already-verified account is a no-op rather than resetting the timestamp.
+    await executor
+      .update(users)
+      .set({ emailVerifiedAt: sql`now()` })
+      .where(and(eq(users.id, userId), isNull(users.emailVerifiedAt)));
   }
 }

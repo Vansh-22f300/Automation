@@ -17,11 +17,13 @@
 
 import { UnauthorizedError } from '@/api/errors.js';
 import type { AuthService } from '@/auth/auth-service.js';
+import type { AccountRecoveryService } from '@/auth/account-recovery-service.js';
 import type { AuthContext, Authenticator } from '@/auth/context.js';
 
 export function inertHumanAuth(): {
   sessionAuthenticator: Authenticator;
   authService: AuthService;
+  accountRecoveryService: AccountRecoveryService;
 } {
   return {
     sessionAuthenticator: {
@@ -40,5 +42,19 @@ export function inertHumanAuth(): {
         throw new Error('not used');
       },
     } as unknown as AuthService,
+    accountRecoveryService: {
+      requestPasswordReset: async () => {
+        throw new Error('not used');
+      },
+      resetPassword: async () => {
+        throw new Error('not used');
+      },
+      verifyEmail: async () => {
+        throw new Error('not used');
+      },
+      resendVerification: async () => {
+        throw new Error('not used');
+      },
+    } as unknown as AccountRecoveryService,
   };
 }

@@ -183,6 +183,14 @@ export interface AuthUser {
   readonly id: string;
   readonly email: string;
   readonly name: string;
+  /**
+   * ISO-8601 instant the address was verified, or `null` when it is not yet
+   * verified. Optional because only the `/auth/session` probe carries it — the
+   * login and signup responses omit it — so `undefined` means "not yet known"
+   * (a fresh session sync resolves it to a string or `null`), distinct from a
+   * definitive `null` ("known unverified"). Never a token or sensitive field.
+   */
+  readonly emailVerifiedAt?: string | null;
 }
 
 export interface AuthTenant {

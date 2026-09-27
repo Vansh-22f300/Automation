@@ -33,6 +33,7 @@ function close() {
     <div v-if="isOpen" class="sidebar-overlay is-open" aria-hidden="true" @click="close" />
 
     <main id="main" class="app-main" tabindex="-1">
+      <VerificationBanner />
       <slot />
     </main>
   </div>

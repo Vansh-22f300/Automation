@@ -22,7 +22,7 @@
 
 import { and, eq, isNull, sql } from 'drizzle-orm';
 
-import type { AppDatabase } from '@/db/client.js';
+import type { AppDatabase, Executor } from '@/db/client.js';
 import { memberships, sessions } from '@/db/schema.js';
 
 /**
@@ -66,6 +66,14 @@ export interface SessionStore {
   revoke(tokenHash: string): Promise<void>;
   /** Revoke every live session for one member of one tenant. */
   revokeAllForUser(tenantId: string, userId: string): Promise<void>;
+  /**
+   * Revoke every live session a user holds, across *all* tenants — the
+   * password-reset hammer. Unlike {@link SessionStore.revokeAllForUser} this is
+   * keyed on the user alone (a reset invalidates the person everywhere, not in a
+   * single workspace). {@link Executor}-aware so it can run inside the reset
+   * transaction that also consumes the token and replaces the credential.
+   */
+  revokeAllForUserAcrossTenants(userId: string, executor?: Executor): Promise<void>;
 }
 
 /** Postgres-backed store. The token-hash lookup hits the unique `sessions_token_hash_key` index. */
@@ -150,5 +158,20 @@ export class DrizzleSessionStore implements SessionStore {
           isNull(sessions.revokedAt),
         ),
       );
+  }
+
+  async revokeAllForUserAcrossTenants(
+    userId: string,
+    executor: Executor = this.db,
+  ): Promise<void> {
+    // Keyed on the user alone — no tenant predicate — so a password reset ends
+    // every live session the person holds in any workspace at once. Guarded on
+    // `revoked_at IS NULL` so already-revoked rows keep their original time.
+    // Runs on the passed executor so it commits atomically with the token
+    // consumption and credential replacement in the reset transaction.
+    await executor
+      .update(sessions)
+      .set({ revokedAt: sql`now()` })
+      .where(and(eq(sessions.userId, userId), isNull(sessions.revokedAt)));
   }
 }

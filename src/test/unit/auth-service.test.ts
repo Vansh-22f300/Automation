@@ -19,7 +19,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { AuthService, SESSION_TTL_MS } from '@/auth/auth-service.js';
+import { AuthService, SESSION_TTL_MS, type SignupNotifier } from '@/auth/auth-service.js';
 import type { AccountStore, CreateOwnerAccountInput, CreatedAccount } from '@/auth/account-store.js';
 import { EmailAlreadyRegisteredError } from '@/auth/account-store.js';
 import type { AuthLoginRecord, AuthProfile, AuthUserStore } from '@/auth/auth-user-store.js';
@@ -27,6 +27,7 @@ import type { LoginThrottle } from '@/auth/login-throttle.js';
 import type { PasswordHasher } from '@/auth/password.js';
 import type { AuthSessionRecord, NewSessionInput, SessionStore } from '@/auth/session-store.js';
 import { hashSessionToken } from '@/auth/session-token.js';
+import { hashAuthToken } from '@/auth/auth-token.js';
 
 /**
  * A hasher whose stored hash for password `p` is the sentinel `hash:${p}`, so
@@ -53,6 +54,7 @@ class FakeAuthUserStore implements AuthUserStore {
   private readonly logins = new Map<string, AuthLoginRecord>();
   private readonly profiles = new Map<string, AuthProfile>();
   readonly lookedUp: string[] = [];
+  readonly verified: string[] = [];
 
   setLogin(normalizedEmail: string, record: AuthLoginRecord): void {
     this.logins.set(normalizedEmail, record);
@@ -68,12 +70,16 @@ class FakeAuthUserStore implements AuthUserStore {
   async findProfile(userId: string, tenantId: string): Promise<AuthProfile | null> {
     return this.profiles.get(`${userId}:${tenantId}`) ?? null;
   }
+  async markEmailVerified(userId: string): Promise<void> {
+    this.verified.push(userId);
+  }
 }
 
 /** Captures each `create` and `revoke`; the authenticator lookup is unused here. */
 class FakeSessionStore implements SessionStore {
   readonly created: NewSessionInput[] = [];
   readonly revoked: string[] = [];
+  readonly revokedAllAcross: string[] = [];
 
   async create(input: NewSessionInput): Promise<{ id: string }> {
     this.created.push(input);
@@ -86,6 +92,9 @@ class FakeSessionStore implements SessionStore {
     this.revoked.push(tokenHash);
   }
   async revokeAllForUser(_tenantId: string, _userId: string): Promise<void> {}
+  async revokeAllForUserAcrossTenants(userId: string): Promise<void> {
+    this.revokedAllAcross.push(userId);
+  }
 }
 
 /** Records the order and identifier of every throttle interaction. */
@@ -131,6 +140,18 @@ class FakeAccountStore implements AccountStore {
   }
 }
 
+/** Captures each verification email signup asks the notifier to send. */
+class FakeSignupNotifier implements SignupNotifier {
+  readonly sent: { to: string; name: string | null; rawToken: string }[] = [];
+  async sendVerification(input: {
+    to: string;
+    name: string | null;
+    rawToken: string;
+  }): Promise<void> {
+    this.sent.push(input);
+  }
+}
+
 interface Harness {
   service: AuthService;
   users: FakeAuthUserStore;
@@ -138,6 +159,7 @@ interface Harness {
   sessions: FakeSessionStore;
   throttle: FakeThrottle;
   accounts: FakeAccountStore;
+  notifier: FakeSignupNotifier;
 }
 
 function makeService(): Harness {
@@ -146,13 +168,15 @@ function makeService(): Harness {
   const sessions = new FakeSessionStore();
   const throttle = new FakeThrottle();
   const accounts = new FakeAccountStore();
+  const notifier = new FakeSignupNotifier();
   return {
-    service: new AuthService(users, hasher, sessions, throttle, accounts),
+    service: new AuthService(users, hasher, sessions, throttle, accounts, notifier),
     users,
     hasher,
     sessions,
     throttle,
     accounts,
+    notifier,
   };
 }
 
@@ -359,14 +383,14 @@ describe('AuthService.getCurrentSession', () => {
   it('resolves the safe public identity for a live (user, tenant) pair', async () => {
     const h = makeService();
     h.users.setProfile('user-1', 'tenant-1', {
-      user: { id: 'user-1', email: 'bob@acme.test', name: 'Bob' },
+      user: { id: 'user-1', email: 'bob@acme.test', name: 'Bob', emailVerifiedAt: null },
       tenant: { id: 'tenant-1', name: 'Acme' },
     });
 
     const profile = await h.service.getCurrentSession('user-1', 'tenant-1');
 
     expect(profile).toEqual({
-      user: { id: 'user-1', email: 'bob@acme.test', name: 'Bob' },
+      user: { id: 'user-1', email: 'bob@acme.test', name: 'Bob', emailVerifiedAt: null },
       tenant: { id: 'tenant-1', name: 'Acme' },
     });
   });
@@ -420,6 +444,27 @@ describe('AuthService.signup', () => {
     expect(stored.tokenHash).toBe(hashSessionToken(result.token));
     expect(stored.tokenHash).not.toBe(result.token);
     expect(stored.expiresAt).toBe(result.expiresAt);
+  });
+
+  it('mints a verification token: stores only its hash, emails the raw token, never returns it', async () => {
+    const h = makeService();
+
+    const result = await h.service.signup({ ...INPUT });
+    if (result.kind !== 'created') throw new Error('unreachable');
+
+    // Exactly one verification email, addressed to the new account.
+    expect(h.notifier.sent).toHaveLength(1);
+    const sent = h.notifier.sent[0]!;
+    expect(sent.to).toBe('alice@acme.test');
+
+    // The store received only the *hash* of the emailed token — never the raw one.
+    const stored = h.accounts.created[0]!;
+    expect(stored.verificationTokenHash).toBe(hashAuthToken(sent.rawToken));
+    expect(stored.verificationTokenHash).not.toBe(sent.rawToken);
+    expect(stored.verificationExpiresAt.getTime()).toBeGreaterThan(Date.now());
+
+    // The raw verification token never appears in the API-facing result (§3).
+    expect(JSON.stringify(result)).not.toContain(sent.rawToken);
   });
 
   it('normalises the email and trims the name and workspace name before creating the account', async () => {
@@ -489,7 +534,16 @@ describe('AuthService.signup', () => {
     // for a caller to hijack (ownership is hard-coded inside the store itself).
     const stored = h.accounts.created[0]!;
     expect(Object.keys(stored).sort()).toEqual(
-      ['email', 'expiresAt', 'name', 'passwordHash', 'tokenHash', 'workspaceName'].sort(),
+      [
+        'email',
+        'expiresAt',
+        'name',
+        'passwordHash',
+        'tokenHash',
+        'verificationExpiresAt',
+        'verificationTokenHash',
+        'workspaceName',
+      ].sort(),
     );
   });
 });

@@ -189,3 +189,78 @@ describe("AuthClient.logout", () => {
     await expect(new AuthClient({ baseUrl: BASE }).logout()).resolves.toBeUndefined();
   });
 });
+
+describe("AuthClient.resendVerification", () => {
+  it("POSTs the resend route same-origin with no body and returns the message", async () => {
+    const mock = stubFetch(jsonResponse(200, { message: "Verification email sent." }));
+    const result = await new AuthClient({ baseUrl: BASE }).resendVerification();
+    expect(result.message).toBe("Verification email sent.");
+    const [url, init] = callArgs(mock);
+    expect(url).toBe("/backend/auth/email-verification/resend");
+    expect(init.method).toBe("POST");
+    expect(init.credentials).toBe("same-origin");
+    expect(init.body).toBeUndefined(); // identity comes from the cookie, not a body
+  });
+
+  it("preserves a 429 status so the caller can render a throttled message", async () => {
+    stubFetch(jsonResponse(429, { error: { code: "rate_limited", message: "slow down" } }));
+    await expect(new AuthClient({ baseUrl: BASE }).resendVerification()).rejects.toMatchObject({
+      status: 429,
+    });
+  });
+
+  it("preserves a 401 status when the browser is logged out", async () => {
+    stubFetch(jsonResponse(401, { error: { code: "unauthorized", message: "no" } }));
+    await expect(new AuthClient({ baseUrl: BASE }).resendVerification()).rejects.toMatchObject({
+      status: 401,
+    });
+  });
+});
+
+describe("AuthClient.forgotPassword", () => {
+  it("POSTs { email } same-origin and returns the generic message", async () => {
+    const mock = stubFetch(
+      jsonResponse(202, { message: "If an account exists, password reset instructions will be sent." }),
+    );
+    const result = await new AuthClient({ baseUrl: BASE }).forgotPassword("a@b.test");
+    expect(result.message).toContain("If an account exists");
+    const [url, init] = callArgs(mock);
+    expect(url).toBe("/backend/auth/forgot-password");
+    expect(init.method).toBe("POST");
+    expect(init.credentials).toBe("same-origin");
+    expect(JSON.parse(init.body as string)).toEqual({ email: "a@b.test" });
+  });
+
+  it("maps a network failure to ApiClientError(0)", async () => {
+    stubFetch(new TypeError("network down"));
+    await expect(
+      new AuthClient({ baseUrl: BASE }).forgotPassword("a@b.test"),
+    ).rejects.toMatchObject({ status: 0 });
+  });
+});
+
+describe("AuthClient.resetPassword", () => {
+  it("POSTs ONLY { password } — never a token — and returns the message", async () => {
+    const mock = stubFetch(
+      jsonResponse(200, { message: "Your password has been reset. Please sign in with your new password." }),
+    );
+    const result = await new AuthClient({ baseUrl: BASE }).resetPassword("brand-new-pw");
+    expect(result.message).toContain("has been reset");
+    const [url, init] = callArgs(mock);
+    expect(url).toBe("/backend/auth/reset-password");
+    expect(init.method).toBe("POST");
+    expect(init.credentials).toBe("same-origin");
+    const parsed = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(parsed).toEqual({ password: "brand-new-pw" });
+    expect("token" in parsed).toBe(false); // the one-time token stays server-side
+  });
+
+  it("throws ApiClientError(400) for an invalid/expired token (generic)", async () => {
+    stubFetch(
+      jsonResponse(400, { error: { code: "bad_request", message: "This password reset link is invalid or has expired." } }),
+    );
+    await expect(
+      new AuthClient({ baseUrl: BASE }).resetPassword("brand-new-pw"),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+});

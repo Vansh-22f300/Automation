@@ -16,6 +16,7 @@ import { parseEnv } from '@/config/env.js';
 import { createDatabase, describeDatabaseUrl } from '@/db/client.js';
 import type { DatabaseHandle } from '@/db/client.js';
 import { createLogger } from '@/observability/logger.js';
+import type { AccountRecoveryService } from '@/auth/account-recovery-service.js';
 
 /** The gate every integration `describe.skipIf(...)` reads. */
 export const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -67,4 +68,28 @@ export function sqlStateOf(error: unknown): string | undefined {
     current = (current as { readonly cause?: unknown }).cause;
   }
   return undefined;
+}
+
+/**
+ * A fail-closed `AccountRecoveryService` stand-in for suites that assemble the
+ * full app but never drive the recovery routes (login/logout, signup, the
+ * data-plane). Every use-case throws if reached, so it can only satisfy
+ * `buildApp`'s dependency set — never quietly service a request. Suites that
+ * actually exercise verification/recovery construct the real service instead.
+ */
+export function inertAccountRecovery(): AccountRecoveryService {
+  return {
+    requestPasswordReset: async () => {
+      throw new Error('not used');
+    },
+    resetPassword: async () => {
+      throw new Error('not used');
+    },
+    verifyEmail: async () => {
+      throw new Error('not used');
+    },
+    resendVerification: async () => {
+      throw new Error('not used');
+    },
+  } as unknown as AccountRecoveryService;
 }
