@@ -601,3 +601,82 @@ describe('parseEnv / production HOST', () => {
     ).toBe('10.0.0.5');
   });
 });
+
+describe("parseEnv / EMAIL_TRANSPORT='resend' (Invariant 7)", () => {
+  const hostedDb = 'postgresql://app:secret@db.example.com:5432/ai_workforce';
+  const RESEND_KEY = 're_test_key_not_a_real_secret';
+  const RESEND_FROM = 'AI Workforce <noreply@mail.example.com>';
+
+  it('requires both RESEND_API_KEY and EMAIL_FROM', () => {
+    const offenders = offendingVariables(() => parseEnv({ ...base, EMAIL_TRANSPORT: 'resend' }));
+    expect(offenders).toContain('RESEND_API_KEY');
+    expect(offenders).toContain('EMAIL_FROM');
+  });
+
+  it('names only RESEND_API_KEY when just EMAIL_FROM is set', () => {
+    const offenders = offendingVariables(() =>
+      parseEnv({ ...base, EMAIL_TRANSPORT: 'resend', EMAIL_FROM: RESEND_FROM }),
+    );
+    expect(offenders).toContain('RESEND_API_KEY');
+    expect(offenders).not.toContain('EMAIL_FROM');
+  });
+
+  it('names only EMAIL_FROM when just RESEND_API_KEY is set', () => {
+    const offenders = offendingVariables(() =>
+      parseEnv({ ...base, EMAIL_TRANSPORT: 'resend', RESEND_API_KEY: RESEND_KEY }),
+    );
+    expect(offenders).toContain('EMAIL_FROM');
+    expect(offenders).not.toContain('RESEND_API_KEY');
+  });
+
+  it('accepts resend when both are set (development)', () => {
+    const env = parseEnv({
+      ...base,
+      EMAIL_TRANSPORT: 'resend',
+      RESEND_API_KEY: RESEND_KEY,
+      EMAIL_FROM: RESEND_FROM,
+    });
+    expect(env.EMAIL_TRANSPORT).toBe('resend');
+    expect(env.RESEND_API_KEY).toBe(RESEND_KEY);
+    expect(env.EMAIL_FROM).toBe(RESEND_FROM);
+  });
+  it('accepts a display-name sender address (not a bare email)', () => {
+    // Deliberately not z.string().email(): the `Name <addr>` form must pass.
+    const env = parseEnv({
+      ...base,
+      EMAIL_TRANSPORT: 'resend',
+      RESEND_API_KEY: RESEND_KEY,
+      EMAIL_FROM: 'AI Workforce <noreply@mail.example.com>',
+    });
+    expect(env.EMAIL_FROM).toBe('AI Workforce <noreply@mail.example.com>');
+  });
+
+  it('rejects an explicitly empty RESEND_API_KEY or EMAIL_FROM', () => {
+    const offenders = offendingVariables(() =>
+      parseEnv({ ...base, EMAIL_TRANSPORT: 'resend', RESEND_API_KEY: '', EMAIL_FROM: '' }),
+    );
+    expect(offenders).toContain('RESEND_API_KEY');
+    expect(offenders).toContain('EMAIL_FROM');
+  });
+
+  it('still enforces the APP_ORIGIN https rule in production alongside Invariant 7', () => {
+    const offenders = offendingVariables(() =>
+      parseEnv({
+        ...base,
+        NODE_ENV: 'production',
+        HOST: '0.0.0.0',
+        DATABASE_URL: hostedDb,
+        APP_ORIGIN: 'http://localhost:3001',
+        EMAIL_TRANSPORT: 'resend',
+      }),
+    );
+    expect(offenders).toContain('APP_ORIGIN');
+    expect(offenders).toContain('RESEND_API_KEY');
+    expect(offenders).toContain('EMAIL_FROM');
+  });
+
+  it('leaves the log and console transports unaffected', () => {
+    expect(parseEnv({ ...base }).EMAIL_TRANSPORT).toBe('log');
+    expect(parseEnv({ ...base, EMAIL_TRANSPORT: 'console' }).EMAIL_TRANSPORT).toBe('console');
+  });
+});

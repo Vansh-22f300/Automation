@@ -457,9 +457,30 @@ const envSchema = z
    * never emits the link or token — the safe production default while no real
    * ESP is wired. `console` is an opt-in dev-only smoke transport that prints the
    * link to stdout; it is rejected in production (superRefine below) so a
-   * one-time credential can never reach a shipped log sink.
+   * one-time credential can never reach a shipped log sink. `resend` is the real
+   * ESP transport that delivers over HTTPS; it requires `RESEND_API_KEY` and
+   * `EMAIL_FROM` (Invariant 7 below).
    */
-  EMAIL_TRANSPORT: z.enum(['log', 'console']).default('log'),
+  EMAIL_TRANSPORT: z.enum(['log', 'console', 'resend']).default('log'),
+
+  /**
+   * Sender address for delivered auth emails when `EMAIL_TRANSPORT=resend`, e.g.
+   * `AI Workforce <noreply@mail.example.com>` or a bare `noreply@mail.example.com`.
+   * Deliberately validated only as a non-empty string — NOT `z.string().email()`,
+   * which rejects the common `Display Name <addr>` form Resend accepts. Must be an
+   * address on a Resend-verified sending domain, or the provider refuses the send.
+   * Required when the transport is `resend` (Invariant 7 below).
+   */
+  EMAIL_FROM: z.string().min(1, 'must not be empty when set').optional(),
+
+  /**
+   * Resend API key. A secret: only ever sent in the provider `Authorization`
+   * header, never logged, never persisted, never returned to a client, and never
+   * exposed to the browser/Nuxt public runtime (server-only). `.min(1)` rejects an
+   * explicitly-empty value; an unset variable is simply absent. Required when the
+   * transport is `resend` (Invariant 7 below).
+   */
+  RESEND_API_KEY: z.string().min(1, 'must not be empty when set').optional(),
   })
   .superRefine((env, ctx) => {
     // Reject ambiguous credentials rather than silently picking one. An API key
@@ -609,6 +630,28 @@ const envSchema = z
         message:
           "must not be 'console' in production — it prints one-time verification/reset links to stdout; leave it unset (log)",
       });
+    }
+
+    // Invariant 7: the `resend` transport cannot send without an API key and a
+    // sender address. Unlike Invariants 5/6 this holds in EVERY environment — a
+    // `resend` transport with no credentials can never work — so we fail fast at
+    // boot rather than at the first (best-effort, swallowed) send. Not tied to
+    // NODE_ENV so it also catches a misconfigured dev/staging box.
+    if (env.EMAIL_TRANSPORT === 'resend') {
+      if (env.RESEND_API_KEY === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['RESEND_API_KEY'],
+          message: "is required when EMAIL_TRANSPORT='resend'",
+        });
+      }
+      if (env.EMAIL_FROM === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['EMAIL_FROM'],
+          message: "is required when EMAIL_TRANSPORT='resend'",
+        });
+      }
     }
   });
 

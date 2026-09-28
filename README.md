@@ -1364,16 +1364,18 @@ health check → traffic shift.
 
 ### Environment variables in production
 
-The blueprint sets everything except one secret. The variables fall into four
-distinct groups; the full reference for each is in
+The blueprint sets everything except two values you supply once in the Render
+dashboard (a secret key and the public frontend origin). The variables fall into
+five distinct groups; the full reference for each is in
 [Configuration](#configuration).
 
-**1. Required secret — you set it (once).** Declared `sync: false`, so it lives
-only in Render, never in the repo:
+**1. Set by you, once (`sync: false`).** Declared in the blueprint without a
+value, so each lives only in Render, never in the repo:
 
 | Variable                    | Where                   | Handling                                                                                                                        |
 | --------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `CREDENTIAL_ENCRYPTION_KEY` | `ai-workforce-shared`   | **Required at boot** on both services (the process refuses to start without it). Set once in the shared group; see group 3.      |
+| `APP_ORIGIN`                | `ai-workforce-shared`   | **Required in production** — the public **frontend** (Vercel) origin, e.g. `https://<your-app>.vercel.app`. Must be `https://` and non-loopback or boot is refused. Not a secret, but deployment-specific. It is the origin emailed verification/reset links point at (the BFF `/backend/auth/*` routes), **not** the Render API host. |
 
 **2. Injected by Render — you set nothing.** Render computes these at deploy time:
 
@@ -1404,6 +1406,19 @@ you run `llm` steps, add the appropriate credential to **both** services in the
 dashboard (see [LLM provider](#llm-provider) for the direct-vs-gateway rules).
 Keep them out of `render.yaml` — they are secrets.
 
+**5. Optional email delivery — not in the blueprint.** Auth emails default to the
+metadata-only `log` transport, so signup and password reset work without any mail
+provider (no message is delivered). To send real mail, set three variables on the
+**API service** in the dashboard: `EMAIL_TRANSPORT=resend`, `EMAIL_FROM` (a
+`Display Name <addr>` whose address is on a **Resend-verified sending domain**),
+and the secret `RESEND_API_KEY`. They are required together — with
+`EMAIL_TRANSPORT=resend` the API refuses to boot unless the other two are present.
+`RESEND_API_KEY` is **server-only**: it travels only in Resend's `Authorization`
+header and never reaches the browser or the Nuxt public runtime. Keep it out of
+`render.yaml`. The links these emails carry are built from `APP_ORIGIN` (group 1),
+so they resolve to the frontend BFF, not to the API host. The worker sends no mail,
+so these belong on the API only.
+
 ### Production invariants the blueprint satisfies
 
 The env validator in [`src/config/env.ts`](src/config/env.ts) refuses to start
@@ -1421,6 +1436,11 @@ them:
   at module load in both `dist/api/server.js` and `dist/worker/main.js`) throws
   if neither `CREDENTIAL_ENCRYPTION_KEY` nor `CREDENTIAL_ENCRYPTION_KEYS` is set.
   The shared group supplies `CREDENTIAL_ENCRYPTION_KEY`.
+- **`APP_ORIGIN` must be `https://` and non-loopback in production.** Emailed
+  verification and reset links are built from it, so it must be reachable and
+  TLS-protected; a localhost or `http://` value is refused. Set to the public
+  frontend origin in the shared group (`sync: false`). This applies to the worker
+  too, which runs the same validation at boot even though it sends no mail.
 
 The key **must be the same value on the API and the worker**: the API encrypts
 connection credentials and the worker decrypts them when it runs a step, so a

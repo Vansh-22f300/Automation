@@ -26,6 +26,13 @@ describe("login page", () => {
     expect(signupLink.text()).toContain("Create your workspace");
     expect(wrapper.text()).toContain("Don't have an account");
   });
+
+  it("links to the password-reset flow so a user who forgot their password can recover it", () => {
+    const wrapper = mount(Login);
+    const forgotLink = wrapper.find('a[href="/forgot-password"]');
+    expect(forgotLink.exists()).toBe(true);
+    expect(forgotLink.text().toLowerCase()).toContain("forgot");
+  });
 });
 
 describe("signup page", () => {
@@ -52,6 +59,23 @@ describe("landing page — logged out", () => {
     expect(wrapper.text()).toContain("Get started");
     expect(wrapper.text()).toContain("Start building");
   });
+
+  it("offers returning users a Log in link in the header and keeps footer product links public", () => {
+    const wrapper = mount(Index);
+
+    // Returning (logged-out) visitors get an explicit, secondary Log in CTA in the nav.
+    const header = wrapper.find("header");
+    expect(header.find('a[href="/login"]').exists()).toBe(true);
+
+    // Footer "Product" links must not point at guarded app routes a logged-out
+    // visitor cannot reach; they now target public in-page sections instead.
+    const footer = wrapper.find("footer");
+    expect(footer.exists()).toBe(true);
+    expect(footer.findAll('a[href="/workflows"]')).toHaveLength(0);
+    expect(footer.findAll('a[href="/runs"]')).toHaveLength(0);
+    expect(footer.findAll('a[href="/connections"]')).toHaveLength(0);
+    expect(footer.find('a[href="#capabilities"]').exists()).toBe(true);
+  });
 });
 
 describe("landing page — authenticated", () => {
@@ -67,6 +91,13 @@ describe("landing page — authenticated", () => {
 
     expect(wrapper.findAll('a[href="/signup"]')).toHaveLength(0);
     expect(wrapper.text()).toContain("Open Workspace");
+  });
+
+  it("does not surface a Log in link once the visitor is already signed in", () => {
+    setAuth(true, { user: { email: "ada@example.com" }, tenant: { name: "Acme" } });
+    const wrapper = mount(Index);
+
+    expect(wrapper.findAll('a[href="/login"]')).toHaveLength(0);
   });
 });
 

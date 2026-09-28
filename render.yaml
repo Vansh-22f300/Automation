@@ -79,6 +79,20 @@ services:
         value: "10"
       # PORT is provided by Render automatically for web services; the app reads
       # it via env.PORT. Do not hard-code it here.
+      #
+      # ---- Auth email delivery (optional; only the API sends mail) ----------
+      # Left unset the API uses the metadata-only `log` transport: signup/reset
+      # still work, but no message is delivered. To send real email via Resend,
+      # set ALL THREE below in the dashboard (env.ts Invariant 7 refuses to boot
+      # with EMAIL_TRANSPORT=resend unless the other two are present):
+      #   - key: EMAIL_TRANSPORT
+      #     value: resend
+      #   - key: EMAIL_FROM
+      #     value: AI Workforce <noreply@your-verified-domain>   # a Resend-verified sender
+      #   - key: RESEND_API_KEY
+      #     sync: false   # SECRET — server-only, never exposed to the browser/Nuxt public runtime
+      # The links these emails contain are built from APP_ORIGIN (the Vercel
+      # frontend origin above), so they land on the BFF, not on this API host.
 
   # ---- Worker (background) ----------------------------------------------
   - type: worker
@@ -126,4 +140,16 @@ envVarGroups:
       # services). Generate with:
       #   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
       - key: CREDENTIAL_ENCRYPTION_KEY
+        sync: false
+      # Canonical public origin used to build emailed verification/reset links.
+      # This is the PUBLIC FRONTEND (Vercel) origin that serves the same-origin
+      # `/backend/auth/*` BFF handoff routes — NOT the Render API host (that is the
+      # BFF's private NUXT_BACKEND_URL, set on Vercel). In production the app
+      # refuses to boot unless APP_ORIGIN is https:// and non-loopback (env.ts
+      # Invariant 5), so it is REQUIRED, not optional. It lives in the shared group
+      # because the worker runs the same boot validation (it builds no links, but a
+      # loopback default would refuse to start it). Set once in the dashboard, e.g.
+      # https://<your-app>.vercel.app — no secret, but deployment-specific, so
+      # sync:false rather than a guessed literal.
+      - key: APP_ORIGIN
         sync: false

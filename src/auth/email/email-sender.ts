@@ -2,14 +2,15 @@
  * The provider-neutral email transport seam (Phase 6 §10).
  *
  * `EmailSender` is the one interface the auth flows depend on to "send" a
- * verification or reset message. The repository has **no** email provider and no
- * mail dependency, and this phase deliberately does not invent one — so the
- * concrete implementations are the honest set for that reality:
+ * verification or reset message. The concrete implementations are:
  *
- *   - {@link LogOnlyEmailSender} — the default (and the production default). It
- *     records that a message *would* be sent, with metadata only. It never logs
- *     the link, the token, or the body, so a normal application log can never
- *     leak a live credential (§10/§21).
+ *   - {@link LogOnlyEmailSender} — the default (and the safe production fallback
+ *     while no ESP is configured). It records that a message *would* be sent,
+ *     with metadata only. It never logs the link, the token, or the body, so a
+ *     normal application log can never leak a live credential (§10/§21).
+ *   - `ResendEmailSender` (in `resend-email-sender.ts`) — the real ESP transport
+ *     that actually delivers over HTTPS. Opt-in via `EMAIL_TRANSPORT=resend`;
+ *     renders the same templates and observes the same secrets discipline.
  *   - {@link ConsoleEmailSender} — a dev-only manual-smoke transport that prints
  *     the action link to stdout (not through the structured logger). Opt-in via
  *     `EMAIL_TRANSPORT=console`, and env validation forbids it in production.
@@ -17,9 +18,10 @@
  *     structured inputs so a test can read the link it would have sent. Injected
  *     directly by tests, never selected by configuration.
  *
- * Wiring a real ESP later means adding one implementation and a factory branch;
- * nothing above the seam changes. Secrets discipline: no implementation here
- * logs a token or a URL through the structured logger.
+ * The interface carries STRUCTURED data (recipient, name, action URL, TTL), not
+ * pre-rendered content: each transport renders via `templates.ts` itself, so
+ * nothing above the seam changes when a transport is added. Secrets discipline:
+ * no implementation here logs a token or a URL through the structured logger.
  */
 
 import type { Env } from '@/config/env.js';
@@ -29,6 +31,7 @@ import {
   renderVerificationEmail,
   type RenderedEmail,
 } from '@/auth/email/templates.js';
+import { ResendEmailSender } from '@/auth/email/resend-email-sender.js';
 
 /** A verification message to deliver. The URL was built by the notifier. */
 export interface VerificationEmail {
@@ -138,13 +141,27 @@ export class ConsoleEmailSender implements EmailSender {
 }
 
 /**
- * Select the transport from configuration. `console` is the opt-in dev smoke
- * transport (rejected in production by env validation); everything else — and
- * the default — is the metadata-only log transport. A real ESP would slot in as
- * one more branch here, leaving every caller untouched.
+ * Select the transport from configuration. `resend` is the real ESP transport
+ * (see {@link ResendEmailSender}); `console` is the opt-in dev smoke transport
+ * (rejected in production by env validation); everything else — and the default —
+ * is the metadata-only log transport. Each slots in as one branch here, leaving
+ * every caller untouched.
  */
 export function createEmailSender(env: Env, logger: Logger): EmailSender {
   switch (env.EMAIL_TRANSPORT) {
+    case 'resend': {
+      // Env validation (Invariant 7) guarantees both are set when the transport
+      // is 'resend'; this guard is defensive and also narrows the types for the
+      // constructor below.
+      if (env.RESEND_API_KEY === undefined || env.EMAIL_FROM === undefined) {
+        throw new Error("EMAIL_TRANSPORT='resend' requires RESEND_API_KEY and EMAIL_FROM");
+      }
+      return new ResendEmailSender({
+        apiKey: env.RESEND_API_KEY,
+        from: env.EMAIL_FROM,
+        logger,
+      });
+    }
     case 'console':
       return new ConsoleEmailSender();
     case 'log':
