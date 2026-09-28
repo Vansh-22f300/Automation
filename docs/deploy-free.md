@@ -92,10 +92,14 @@ free mode is dashboard state, not a repo file.
 | `PORT` | *(leave unset)* | **Render injects `PORT` automatically**; the app reads it. Do not hard-code it. |
 | `DATABASE_URL` | Neon **pooled** connection string, ending `?sslmode=require` | Non-loopback and the db name must not contain `test`, or boot is refused. |
 | `CREDENTIAL_ENCRYPTION_KEY` | a generated 32-byte key | **Required at boot.** **Must be byte-identical to the worker's** GitHub secret. |
+| `APP_ORIGIN` | your **Vercel frontend** URL, e.g. `https://<your-app>.vercel.app` | **Required in production** (https, non-loopback, or boot is refused). The public **frontend** origin emailed verification/reset links point at — the BFF `/backend/auth/*` routes — **not** this Render API host. |
 | `TRUST_PROXY` | `true` | Render's proxy is the sole ingress; this makes the per-IP rate limiter key on the real client IP from `X-Forwarded-For` rather than the proxy's IP. |
 | `DATABASE_POOL_MAX` | `5` | Neon Free caps connections; the API shares that ceiling with overlapping worker sessions. |
 | `LOG_LEVEL` | `info` | Optional; omit to accept the default. |
 | `ANTHROPIC_API_KEY` **or** `ANTHROPIC_AUTH_TOKEN` | your key/token | **Only if** exercising LLM steps. Mutually exclusive — set at most one. |
+| `EMAIL_TRANSPORT` | *(leave unset)* → `log` | **Only if** sending real email. Set `resend` to deliver via Resend; then `EMAIL_FROM` + `RESEND_API_KEY` are required or boot is refused. Left unset, signup/reset work but send no mail. |
+| `EMAIL_FROM` | `AI Workforce <noreply@your-verified-domain>` | **Only with** `EMAIL_TRANSPORT=resend`. `Display Name <addr>` is accepted; the address must be on a Resend-verified sending domain. |
+| `RESEND_API_KEY` | your Resend key | **Only with** `EMAIL_TRANSPORT=resend`. **Secret, server-only** — never exposed to the browser/Nuxt public runtime. |
 
 Generate the encryption key with:
 
@@ -105,6 +109,16 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 
 Keep the exact output. You will paste the **same** value into the worker's
 `CREDENTIAL_ENCRYPTION_KEY` GitHub secret.
+
+**Email delivery (optional).** In free/demo mode you can leave `EMAIL_TRANSPORT`
+unset: signup and password reset work, but no email is actually sent (the
+`log` transport records metadata only). To deliver real messages, verify a
+sending domain in Resend, then set `EMAIL_TRANSPORT=resend`, `EMAIL_FROM` (an
+address on that verified domain), and `RESEND_API_KEY` on the **API service**
+only (the worker sends no mail). `RESEND_API_KEY` is a secret — set it in the
+dashboard, never in the repo. The verification/reset links are built from
+`APP_ORIGIN` (the Vercel frontend URL above), so they land on the frontend BFF,
+not on this Render API host.
 
 ## Database (Neon — unchanged)
 

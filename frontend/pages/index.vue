@@ -60,6 +60,7 @@ const year = new Date().getFullYear();
           <a href="#capabilities" @click="closeMenu">Capabilities</a>
           <a href="#how-it-works" @click="closeMenu">How it works</a>
           <a href="#faq" @click="closeMenu">FAQ</a>
+          <NuxtLink v-if="!isAuthenticated" to="/login" @click="closeMenu">Log in</NuxtLink>
         </nav>
 
         <div class="landing-ctas">
@@ -439,9 +440,9 @@ const year = new Date().getFullYear();
           </div>
           <div>
             <strong>Product</strong>
-            <NuxtLink to="/workflows">Workflows</NuxtLink>
-            <NuxtLink to="/runs">Runs</NuxtLink>
-            <NuxtLink to="/connections">Connections</NuxtLink>
+            <a href="#capabilities">Workflows</a>
+            <a href="#capabilities">Runs</a>
+            <a href="#capabilities">Connections</a>
             <a href="#how-it-works">How it works</a>
           </div>
           <div>

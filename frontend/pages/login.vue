@@ -110,6 +110,8 @@ async function onSubmit(): Promise<void> {
         </div>
       </div>
 
+      <NuxtLink to="/forgot-password" class="auth-forgot">Forgot your password?</NuxtLink>
+
       <p v-if="errorMessage" id="login-error" class="auth-error" role="alert">{{ errorMessage }}</p>
 
       <button class="button button-primary auth-submit" type="submit" :disabled="pending">
@@ -142,6 +144,8 @@ async function onSubmit(): Promise<void> {
 .auth-subtitle { margin: 6px 0 20px; font-size: 13px; color: var(--landing-dim); }
 .auth-form { display: grid; gap: 14px; }
 .auth-label { color: var(--landing-dim); }
+.auth-forgot { justify-self: end; margin-top: -4px; font-size: 12px; color: var(--landing-dim); }
+.auth-forgot:hover { color: var(--landing-mist); }
 .auth-card .lookup-control { max-width: none; width: 100%; }
 .auth-error {
   margin: 0; font-size: 12px; color: var(--landing-danger);
