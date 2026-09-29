@@ -36,6 +36,12 @@ import { TenantScope } from "@/repositories/tenant-scope.js";
 import { WebhookRepository } from "@/repositories/webhook-repository.js";
 import { WebhookSignatureRepository } from "@/repositories/webhook-signature-resolver.js";
 import { WorkflowRepository } from "@/repositories/workflow-repository.js";
+import { DrizzleOAuthStateStore } from "@/repositories/oauth-state-repository.js";
+import { OAuthService } from "@/oauth/oauth-service.js";
+import { OAuthProviderRegistry } from "@/oauth/provider-config.js";
+import { createOAuthStateSecretBox } from "@/oauth/state-secret-box.js";
+import { OAuthTokenClient } from "@/oauth/token-client.js";
+import { NoopTokenRevoker } from "@/oauth/token-source.js";
 import { createCredentialCipher } from "@/security/credential-cipher.js";
 
 /** Time allowed for in-flight requests to drain before we stop waiting. */
@@ -111,6 +117,30 @@ const accountRecoveryService = new AccountRecoveryService({
   notifier: authNotifier,
 });
 
+// OAuth foundation (provider-neutral, fail-closed). The registry is EMPTY in
+// this phase, so every provider lookup 404s until a concrete provider is
+// registered from server configuration — no GitHub/Google is wired here. The
+// PKCE verifier is sealed at rest by a dedicated AES-256-GCM box whose key is
+// HKDF-derived from the credential cipher's active key (a connection-scoped AAD
+// is unavailable at mint time, so the shared cipher is not misused). The state
+// store is deliberately NOT tenant-scoped: the callback is unauthenticated and
+// recovers the trusted tenant/user from the consumed row. The exact redirect URI
+// is built from the trusted `APP_ORIGIN`, never a request header. Disconnect's
+// revoke is a no-op until a provider wires a revocation endpoint; the local
+// connection is disabled either way.
+const oauthService = new OAuthService({
+  registry: new OAuthProviderRegistry(),
+  stateStore: new DrizzleOAuthStateStore(
+    database.db,
+    createOAuthStateSecretBox(cipher),
+  ),
+  tokenClient: new OAuthTokenClient(),
+  revoker: new NoopTokenRevoker(),
+  connectionRepositoryFor: (tenantId) =>
+    new ConnectionRepository(new TenantScope(database.db, tenantId), cipher),
+  appOrigin: env.APP_ORIGIN,
+});
+
 const app = await buildApp({
   logger,
   // `TRUST_PROXY` is validated in `src/config/env.ts`; `false` by default so
@@ -132,6 +162,7 @@ const app = await buildApp({
   sessionAuthenticator,
   authService,
   accountRecoveryService,
+  oauthService,
   checkDatabase: () => database.ping(),
   // One tenant-scoped service per authenticated request — the repository is
   // pinned to that tenant and cannot reach across tenants.

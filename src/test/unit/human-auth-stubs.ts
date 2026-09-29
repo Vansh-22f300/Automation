@@ -19,13 +19,39 @@ import { UnauthorizedError } from '@/api/errors.js';
 import type { AuthService } from '@/auth/auth-service.js';
 import type { AccountRecoveryService } from '@/auth/account-recovery-service.js';
 import type { AuthContext, Authenticator } from '@/auth/context.js';
+import type { OAuthService } from '@/oauth/oauth-service.js';
+
+/**
+ * An inert OAuth orchestrator for suites that never drive the OAuth routes.
+ * `buildApp` requires an `oauthService` because it *always* registers the public
+ * callback and the authenticated authorize/disconnect routes (see `server.ts`),
+ * so suites that never send an OAuth request still have to satisfy that contract.
+ * Registration only closes over the instance — no method is called — so a
+ * stand-in whose use-cases throw is safe: an OAuth request that somehow reached
+ * it would fault loudly rather than silently succeed.
+ */
+export function inertOAuthService(): OAuthService {
+  return {
+    beginAuthorization: async () => {
+      throw new Error('not used');
+    },
+    completeCallback: async () => {
+      throw new Error('not used');
+    },
+    disconnect: async () => {
+      throw new Error('not used');
+    },
+  } as unknown as OAuthService;
+}
 
 export function inertHumanAuth(): {
   sessionAuthenticator: Authenticator;
   authService: AuthService;
   accountRecoveryService: AccountRecoveryService;
+  oauthService: OAuthService;
 } {
   return {
+    oauthService: inertOAuthService(),
     sessionAuthenticator: {
       authenticate: async (): Promise<AuthContext> => {
         throw new UnauthorizedError();

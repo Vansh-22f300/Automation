@@ -22,6 +22,7 @@ import {
   membershipRole,
   membershipStatus,
   memberships,
+  oauthStates,
   passwordCredentials,
   sessions,
   tenantStatus,
@@ -659,5 +660,84 @@ describe('sessions', () => {
     expect(index).toBeDefined();
     expect(index?.config.unique).toBe(false);
     expect(columnNames(index?.config.columns ?? [])).toEqual(['tenant_id', 'user_id']);
+  });
+});
+
+describe('oauth_states', () => {
+  it('stores the state only as a hash and the PKCE verifier only encrypted', () => {
+    const names = [...columns(oauthStates).keys()];
+
+    expect(names).toContain('state_hash');
+    expect(column(oauthStates, 'state_hash').notNull).toBe(true);
+
+    // The verifier lives in an AES-256-GCM envelope (jsonb), never in the clear.
+    expect(column(oauthStates, 'encrypted_code_verifier').getSQLType()).toBe('jsonb');
+    expect(column(oauthStates, 'encrypted_code_verifier').notNull).toBe(true);
+
+    // No column that could hold the raw state, verifier, code, or a token.
+    for (const forbidden of ['state', 'code_verifier', 'verifier', 'code', 'token', 'secret']) {
+      expect(names).not.toContain(forbidden);
+    }
+  });
+
+  it('resolves a pending flow by a unique state hash', () => {
+    const index = getTableConfig(oauthStates).indexes.find(
+      (i) => i.config.name === 'oauth_states_state_hash_key',
+    );
+
+    expect(index).toBeDefined();
+    expect(index?.config.unique).toBe(true);
+    expect(columnNames(index?.config.columns ?? [])).toEqual(['state_hash']);
+  });
+
+  it('has a non-unique expires_at index to back the bounded cleanup sweep', () => {
+    const index = getTableConfig(oauthStates).indexes.find(
+      (i) => i.config.name === 'oauth_states_expires_at_idx',
+    );
+
+    expect(index).toBeDefined();
+    expect(index?.config.unique).toBe(false);
+    expect(columnNames(index?.config.columns ?? [])).toEqual(['expires_at']);
+  });
+
+  it('is short-lived and single-use: created + expires NOT NULL, consumed a nullable soft mark', () => {
+    expect(column(oauthStates, 'created_at').notNull).toBe(true);
+    expect(column(oauthStates, 'created_at').hasDefault).toBe(true);
+    expect(column(oauthStates, 'expires_at').notNull).toBe(true);
+
+    const consumedAt = column(oauthStates, 'consumed_at');
+    expect(consumedAt.notNull).toBe(false);
+    expect(consumedAt.hasDefault).toBe(false);
+
+    // A state is created, then maybe consumed — no generic updated_at.
+    expect([...columns(oauthStates).keys()]).not.toContain('updated_at');
+  });
+
+  it('stores its lifecycle timestamps with a time zone', () => {
+    for (const name of ['created_at', 'expires_at', 'consumed_at']) {
+      expect(column(oauthStates, name).getSQLType()).toBe('timestamp with time zone');
+    }
+  });
+
+  it('binds the initiating tenant + user through a composite FK onto a membership', () => {
+    const foreignKeys = getTableConfig(oauthStates).foreignKeys;
+    expect(foreignKeys).toHaveLength(1);
+
+    const reference = foreignKeys[0]?.reference();
+    // (tenant_id, user_id) → memberships(tenant_id, user_id): the callback
+    // recovers the trusted (tenant, user) from this row, so a forged query can
+    // never redirect the new connection into another tenant.
+    expect(columnNames(reference?.columns ?? [])).toEqual(['tenant_id', 'user_id']);
+    expect(getTableConfig(reference!.foreignTable).name).toBe('memberships');
+    expect(columnNames(reference?.foreignColumns ?? [])).toEqual(['tenant_id', 'user_id']);
+    expect(foreignKeys[0]?.onDelete).toBe('cascade');
+  });
+
+  it('has a single uuid primary key with an application-side default', () => {
+    const primaries = getTableConfig(oauthStates).columns.filter((c) => c.primary);
+    expect(primaries).toHaveLength(1);
+    expect(primaries[0]?.name).toBe('id');
+    expect(primaries[0]?.getSQLType()).toBe('uuid');
+    expect(primaries[0]?.hasDefault).toBe(true);
   });
 });

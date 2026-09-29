@@ -46,7 +46,7 @@ import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { WorkflowRepository } from '@/repositories/workflow-repository.js';
 
-import { TEST_DATABASE_URL, createTestDatabaseHandle, inertAccountRecovery } from './support.js';
+import { TEST_DATABASE_URL, createTestDatabaseHandle, inertAccountRecovery, inertOAuthService } from './support.js';
 const PASSWORD = 'correct-horse-battery-staple';
 const RUN = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 const email = (who: string): string => `${who}-${RUN}@signup-it.test`;
@@ -55,6 +55,7 @@ const bearer = (token: string): { authorization: string } => ({ authorization: `
 
 /** Non-auth, non-workflow surfaces buildApp requires but this suite never drives. */
 const unusedFactories = {
+  oauthService: inertOAuthService(),
   connectionServiceFor: () => ({
     create: async () => { throw new Error('not used'); },
     listMetadata: async () => [],
