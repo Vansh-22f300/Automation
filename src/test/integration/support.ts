@@ -93,3 +93,11 @@ export function inertAccountRecovery(): AccountRecoveryService {
     },
   } as unknown as AccountRecoveryService;
 }
+
+/**
+ * Re-exported from the unit stubs (single source of truth): a fail-closed
+ * `OAuthService` stand-in for full-app suites that never drive the OAuth routes.
+ * `buildApp` always registers those routes, so every assembling suite must supply
+ * an `oauthService`; this one throws if any use-case is reached.
+ */
+export { inertOAuthService } from '../unit/human-auth-stubs.js';

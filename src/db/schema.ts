@@ -503,6 +503,78 @@ export const authTokens = pgTable(
   ],
 );
 
+/**
+ * A single in-flight OAuth authorization-code flow — the server-side memory that
+ * lets an unauthenticated provider callback recover the *trusted* context that
+ * began the flow, without believing anything the browser or provider says.
+ *
+ * Everything a confused-deputy attack would try to forge lives here, bound at
+ * initiation and read back at the callback:
+ *   - `(tenant_id, user_id)` is a composite FK onto `memberships(tenant_id,
+ *     user_id)` — identical to `sessions` — so a state can only be minted for a
+ *     real member of a real tenant, and revoking that membership (or deleting the
+ *     user/tenant) cascades the pending state away. The callback derives tenant
+ *     and user from *this row*, never from its query string.
+ *   - `provider` is the allowlisted provider id the flow was started for; the
+ *     callback refuses to proceed unless its route provider matches.
+ *   - `return_path` is a pre-validated safe *internal relative* path; an absolute
+ *     or scheme-bearing URL never reaches this column (see `@/oauth/return-path`).
+ *
+ * Security discipline mirrors `auth_tokens`/`sessions`:
+ *   - **`state_hash` stores only a SHA-256 of the opaque state value**, never the
+ *     state itself. Lookup is by hash; a database dump cannot reconstruct a
+ *     working callback URL. Unique, so a state resolves to at most one row.
+ *   - **Single-use**: `consumed_at` is null until the first valid callback spends
+ *     it atomically (`UPDATE … SET consumed_at = now() WHERE state_hash = ? AND
+ *     consumed_at IS NULL AND expires_at > now()`), so a replayed or raced
+ *     callback matches no row.
+ *   - **Short-lived**: `expires_at` is mandatory and set to a few minutes; expiry
+ *     is judged by Postgres' clock, never the app's.
+ *   - **`encrypted_code_verifier`** is the PKCE `code_verifier` sealed in an
+ *     AES-256-GCM envelope (AAD = the row's `state_hash`), never plaintext. The
+ *     verifier is a bearer secret for the token exchange; see
+ *     `@/oauth/state-secret-box` for why a dedicated ephemeral box is used here
+ *     rather than the connection credential cipher.
+ */
+export const oauthStates = pgTable(
+  'oauth_states',
+  {
+    id: primaryId(),
+    tenantId: uuid('tenant_id').notNull(),
+    userId: uuid('user_id').notNull(),
+    /** SHA-256 hex of the opaque state value. Never the raw state. */
+    stateHash: text('state_hash').notNull(),
+    /** Allowlisted provider id (resolved via the registry), never a URL. */
+    provider: text('provider').notNull(),
+    /** A safe internal relative path, validated before it is ever persisted. */
+    returnPath: text('return_path').notNull(),
+    /** AES-256-GCM envelope of the PKCE code_verifier (AAD = state_hash). Never plaintext. */
+    encryptedCodeVerifier: jsonb('encrypted_code_verifier').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }).notNull(),
+    /** Set the instant the state is spent; null while it is still redeemable. */
+    consumedAt: timestamp('consumed_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    /**
+     * Bound to a real membership in the same tenant — the callback recovers the
+     * initiating (tenant, user) from here, so a forged query cannot redirect the
+     * new connection into another tenant. Cascades away with the membership.
+     */
+    foreignKey({
+      name: 'oauth_states_tenant_id_user_id_fkey',
+      columns: [t.tenantId, t.userId],
+      foreignColumns: [memberships.tenantId, memberships.userId],
+    }).onDelete('cascade'),
+    /** Every callback resolves a pending flow by its state hash. */
+    uniqueIndex('oauth_states_state_hash_key').on(t.stateHash),
+    /** Backs the bounded cleanup sweep of expired rows. */
+    index('oauth_states_expires_at_idx').on(t.expiresAt),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // workflows
 // ---------------------------------------------------------------------------

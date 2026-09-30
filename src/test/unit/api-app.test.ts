@@ -23,6 +23,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "@/api/app.js";
 import { UnauthorizedError } from "@/api/errors.js";
+import { inertOAuthService } from "./human-auth-stubs.js";
 import type { ApiServer } from "@/api/types.js";
 import type { AuthService } from "@/auth/auth-service.js";
 import type { AccountRecoveryService } from "@/auth/account-recovery-service.js";
@@ -181,6 +182,9 @@ async function makeApp(): Promise<Harness> {
         throw new Error("not used");
       },
     } as unknown as AccountRecoveryService,
+    // The OAuth routes are always registered; this suite never drives them, so an
+    // inert orchestrator satisfies the contract without loosening anything.
+    oauthService: inertOAuthService(),
     checkDatabase: async () => {
       if (!dbHealthy.value)
         throw new Error("connection refused to 10.0.0.9:5432");

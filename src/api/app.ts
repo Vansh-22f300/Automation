@@ -29,6 +29,7 @@ import { registerConnectionRoutes } from "@/api/routes/connections.js";
 import type { ConnectionServiceFactory } from "@/api/routes/connections.js";
 import { registerHealthRoute } from "@/api/routes/health.js";
 import type { DatabaseHealthCheck } from "@/api/routes/health.js";
+import { registerOAuthCallbackRoute, registerOAuthRoutes } from "@/api/routes/oauth.js";
 import { registerReadyzRoute } from "@/api/routes/readyz.js";
 import { registerRunInspectionRoutes } from "@/api/routes/runs.js";
 import type { RunInspectionServiceFactory } from "@/api/routes/runs.js";
@@ -41,6 +42,7 @@ import type { ApiServer } from "@/api/types.js";
 import type { Authenticator } from "@/auth/context.js";
 import type { AuthService } from "@/auth/auth-service.js";
 import type { AccountRecoveryService } from "@/auth/account-recovery-service.js";
+import type { OAuthService } from "@/oauth/oauth-service.js";
 import { RateLimitedError } from "@/api/errors.js";
 import { newId } from "@/domain/ids.js";
 
@@ -70,6 +72,12 @@ export interface AppDependencies {
    * every token/enumeration decision stays unit-testable off the wire.
    */
   readonly accountRecoveryService: AccountRecoveryService;
+  /**
+   * The OAuth foundation orchestrator (state design §12). One shared, stateless
+   * instance backs the public callback and the authenticated authorize/disconnect
+   * routes; it builds a tenant-scoped connection repository per recovered tenant.
+   */
+  readonly oauthService: OAuthService;
   /** Probes database reachability for `/readyz`. */
   readonly checkDatabase: DatabaseHealthCheck;
   /** Builds a tenant-scoped API-key service for an authenticated request. */
@@ -241,6 +249,13 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     sessionAuthenticator: deps.sessionAuthenticator,
   });
 
+  // Public OAuth callback. Registered here, as a sibling of the health/auth
+  // routes, so NO auth hook runs on it — the browser returns from the provider
+  // with only `state` and `code`, and every trusted fact is recovered from the
+  // consumed state row inside the service. It stays subject to the global IP
+  // limiter, which is appropriate for an unauthenticated public endpoint.
+  registerOAuthCallbackRoute(app, deps.oauthService);
+
   // Everything below requires a valid API key. Encapsulated so the auth hook does
   // not touch the public route above. The plugin callback's instance is typed
   // with Fastify's default logger; we re-assert our pino-typed `ApiServer` here
@@ -251,6 +266,10 @@ export async function buildApp(deps: AppDependencies): Promise<ApiServer> {
     registerApiKeyRoutes(protectedScope, deps.apiKeyServiceFor);
     registerWorkflowRoutes(protectedScope, deps.workflowServiceFor);
     registerConnectionRoutes(protectedScope, deps.connectionServiceFor);
+    // Authenticated OAuth routes. Inside the `/v1/*` scope, but each handler
+    // additionally demands a human session, so tenant/user come from the verified
+    // session and a machine API key is refused with a 401.
+    registerOAuthRoutes(protectedScope, deps.oauthService);
     registerWebhookRoutes(
       protectedScope,
       deps.webhookIngestorFor,

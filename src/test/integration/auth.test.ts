@@ -40,7 +40,7 @@ import { loginAttempts, memberships, passwordCredentials, sessions, tenants, use
 import { ApiKeyRepository } from '@/repositories/api-key-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 
-import { TEST_DATABASE_URL, createTestDatabaseHandle, inertAccountRecovery } from './support.js';
+import { TEST_DATABASE_URL, createTestDatabaseHandle, inertAccountRecovery, inertOAuthService } from './support.js';
 
 const PASSWORD = 'correct-horse-battery-staple';
 const RUN = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -48,6 +48,7 @@ const email = (who: string): string => `${who}-${RUN}@auth-it.test`;
 
 /** No-op factories for the non-auth surfaces buildApp requires but this suite never drives. */
 const unusedFactories = {
+  oauthService: inertOAuthService(),
   workflowServiceFor: () => ({
     create: async () => { throw new Error('not used'); },
     createVersion: async () => { throw new Error('not used'); },
