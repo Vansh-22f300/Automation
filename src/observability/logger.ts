@@ -12,6 +12,7 @@
 import pino from 'pino';
 import type { Logger } from 'pino';
 import type { Env } from '@/config/env.js';
+import { REQUEST_URL_REDACTION } from '@/observability/log-redaction.js';
 
 export type { Logger };
 
@@ -32,19 +33,35 @@ export interface LoggerOptions {
  *
  * Pretty-printing is enabled only in development; `pino-pretty` is a
  * devDependency and is deliberately not required in production.
+ *
+ * A `req.url` censor is always installed (see {@link REQUEST_URL_REDACTION}): the
+ * framework logs the request URL verbatim on every request, so sensitive OAuth
+ * query values are masked before any line is written, in every environment.
+ *
+ * `destination` is a test seam: passing a stream captures output and forces the
+ * pretty transport off (pino forbids a transport and an explicit destination
+ * together). Production callers omit it and log to stdout.
  */
-export function createLogger(env: Env, options: LoggerOptions): Logger {
-  const pretty = env.NODE_ENV === 'development';
+export function createLogger(
+  env: Env,
+  options: LoggerOptions,
+  destination?: pino.DestinationStream,
+): Logger {
+  const pretty = env.NODE_ENV === 'development' && destination === undefined;
 
-  return pino({
+  const config = {
     level: env.LOG_LEVEL,
     base: { service: options.service },
     timestamp: pino.stdTimeFunctions.isoTime,
     // Emit `"level":"info"` rather than pino's numeric default, so logs are
     // readable without a decoder ring in whatever aggregator we end up using.
     formatters: {
-      level: (label) => ({ level: label }),
+      level: (label: string) => ({ level: label }),
     },
+    // Censor sensitive OAuth query values (state, code, tokens, …) out of any
+    // logged request URL. Path, provider and all other params are preserved, and
+    // a URL carrying none of those keys is logged unchanged.
+    redact: REQUEST_URL_REDACTION,
     ...(pretty
       ? {
           transport: {
@@ -57,7 +74,9 @@ export function createLogger(env: Env, options: LoggerOptions): Logger {
           },
         }
       : {}),
-  });
+  };
+
+  return destination === undefined ? pino(config) : pino(config, destination);
 }
 
 /**
