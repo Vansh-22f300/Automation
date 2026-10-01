@@ -1461,15 +1461,25 @@ both services.
 ## Frontend deployment (Vercel)
 
 The frontend in [`frontend/`](frontend/) is a Nuxt 3 SPA (`ssr: false`) with a
-Nitro **BFF**. The browser calls only the same-origin path `/backend/*`; the
-Nitro server route forwards each request to Fastify with a server-only API key.
-The full request chain in production is:
+Nitro **BFF**. For its application data and auth traffic the browser calls the same-origin
+path `/backend/*`; the Nitro server route forwards each request to Fastify with
+a server-only API key. The full request chain in production is:
 
 **Browser → Vercel (Nuxt SPA + Nitro BFF, `/backend/*`) → Render (Fastify API) → Neon/Postgres.**
 
-Because `/backend/*` is a **server route**, the deploy target must run the Nitro
-server. A static-only upload (`.output/public` alone) has no BFF and is
-unsupported.
+One public route sits outside `/backend/*`: the OAuth redirect endpoint
+**`GET /oauth/:provider/callback`**. An OAuth provider redirects the browser
+there — the redirect URI is `${APP_ORIGIN}/oauth/:provider/callback`, and
+`APP_ORIGIN` is this public frontend origin, not the API host — so it must be a
+top-level Nitro server route, not a client-side fetch. It forwards the callback
+server-side to Fastify's matching `/oauth/:provider/callback` and re-emits
+Fastify's site-relative redirect on this origin, never exposing the API host:
+
+**Browser → frontend BFF OAuth callback (`/oauth/:provider/callback`) → backend OAuth callback → provider connection.**
+
+Because `/backend/*` and the OAuth callback are **server routes**, the deploy
+target must run the Nitro server. A static-only upload (`.output/public` alone)
+has no BFF and is unsupported.
 
 ### Vercel project settings
 
