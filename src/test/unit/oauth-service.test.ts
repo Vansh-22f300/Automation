@@ -49,9 +49,15 @@ const makeService = (registry = new OAuthProviderRegistry([config])) => {
   const exchangeCode = vi.fn();
   const revoke = vi.fn(async (): Promise<void> => {});
   const repoCreate = vi.fn();
+  const repoUpsert = vi.fn();
   const getMetadata = vi.fn();
   const disable = vi.fn();
-  const repo = { create: repoCreate, getMetadata, disable } as unknown as ConnectionRepository;
+  const repo = {
+    create: repoCreate,
+    upsertByProviderName: repoUpsert,
+    getMetadata,
+    disable,
+  } as unknown as ConnectionRepository;
   const connectionRepositoryFor = vi.fn((_tenantId: string) => repo);
   const service = new OAuthService({
     registry,
@@ -62,7 +68,7 @@ const makeService = (registry = new OAuthProviderRegistry([config])) => {
     appOrigin: 'https://app.example',
     now: () => NOW,
   });
-  return { service, create, consume, exchangeCode, revoke, repoCreate, getMetadata, disable, connectionRepositoryFor };
+  return { service, create, consume, exchangeCode, revoke, repoCreate, repoUpsert, getMetadata, disable, connectionRepositoryFor };
 };
 
 describe('beginAuthorization', () => {
@@ -117,10 +123,10 @@ describe('completeCallback', () => {
   const tokenSet = { accessToken: 'at', tokenType: 'bearer', refreshToken: 'rt', scope: 'read', expiresAt: new Date('2026-01-01T00:00:00.000Z') };
 
   it('recovers the trusted context from the row and persists the exchanged token', async () => {
-    const { service, consume, exchangeCode, repoCreate, connectionRepositoryFor } = makeService();
+    const { service, consume, exchangeCode, repoUpsert, connectionRepositoryFor } = makeService();
     consume.mockResolvedValue(consumedRow);
     exchangeCode.mockResolvedValue(tokenSet);
-    repoCreate.mockResolvedValue({ id: 'conn-1' });
+    repoUpsert.mockResolvedValue({ id: 'conn-1' });
 
     const result = await service.completeCallback({ provider: 'demo', state: 'opaque-state', code: 'the-code' });
 
@@ -128,7 +134,9 @@ describe('completeCallback', () => {
     // Verifier + redirect URI come from the row / server config, never the callback query.
     expect(exchangeCode).toHaveBeenCalledWith({ config, code: 'the-code', redirectUri: REDIRECT_URI, codeVerifier: 'the-verifier' });
     expect(connectionRepositoryFor).toHaveBeenCalledWith('t9'); // tenant recovered from the row
-    expect(repoCreate).toHaveBeenCalledWith({
+    // No finalizer registered for 'demo' ⇒ the default names the connection after the
+    // provider and attaches no metadata; the token set is serialized into the credential.
+    expect(repoUpsert).toHaveBeenCalledWith({
       provider: 'demo',
       name: 'demo',
       credential: { accessToken: 'at', tokenType: 'bearer', refreshToken: 'rt', scope: 'read', expiresAt: '2026-01-01T00:00:00.000Z' },

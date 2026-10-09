@@ -41,7 +41,13 @@ import { OAuthService } from "@/oauth/oauth-service.js";
 import { OAuthProviderRegistry } from "@/oauth/provider-config.js";
 import { createOAuthStateSecretBox } from "@/oauth/state-secret-box.js";
 import { OAuthTokenClient } from "@/oauth/token-client.js";
-import { NoopTokenRevoker } from "@/oauth/token-source.js";
+import { GITHUB_PROVIDER, loadOAuthProviders } from "@/oauth/providers/index.js";
+import type { ConnectionFinalizer } from "@/oauth/oauth-service.js";
+import {
+  createFetchGithubTransport,
+  GithubConnectionFinalizer,
+  GithubTokenRevoker,
+} from "@/connectors/github/index.js";
 import { createCredentialCipher } from "@/security/credential-cipher.js";
 
 /** Time allowed for in-flight requests to drain before we stop waiting. */
@@ -117,27 +123,48 @@ const accountRecoveryService = new AccountRecoveryService({
   notifier: authNotifier,
 });
 
-// OAuth foundation (provider-neutral, fail-closed). The registry is EMPTY in
-// this phase, so every provider lookup 404s until a concrete provider is
-// registered from server configuration — no GitHub/Google is wired here. The
-// PKCE verifier is sealed at rest by a dedicated AES-256-GCM box whose key is
-// HKDF-derived from the credential cipher's active key (a connection-scoped AAD
-// is unavailable at mint time, so the shared cipher is not misused). The state
-// store is deliberately NOT tenant-scoped: the callback is unauthenticated and
-// recovers the trusted tenant/user from the consumed row. The exact redirect URI
-// is built from the trusted `APP_ORIGIN`, never a request header. Disconnect's
-// revoke is a no-op until a provider wires a revocation endpoint; the local
-// connection is disabled either way.
+// OAuth providers, assembled from validated env. GitHub registers only when both
+// `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` are set (env Invariant 8); otherwise
+// the registry is empty and every provider lookup 404s — fail-closed, no half-
+// configured provider. The PKCE verifier is sealed at rest by a dedicated AES-256-GCM
+// box whose key is HKDF-derived from the credential cipher's active key (a
+// connection-scoped AAD is unavailable at mint time, so the shared cipher is not
+// misused). The state store is deliberately NOT tenant-scoped: the callback is
+// unauthenticated and recovers the trusted tenant/user from the consumed row. The
+// exact redirect URI is built from the trusted `APP_ORIGIN`, never a request header.
+const oauthRegistry = new OAuthProviderRegistry(loadOAuthProviders(env));
+
+// Per-tenant connection repositories, shared by the OAuth service (callback persist /
+// disconnect) and the GitHub revoker (which resolves the token it must revoke).
+const connectionRepositoryFor = (tenantId: string): ConnectionRepository =>
+  new ConnectionRepository(new TenantScope(database.db, tenantId), cipher);
+
+// GitHub glue. The identity finalizer validates `GET /user` right after the code
+// exchange and names the connection after the GitHub login (so re-authorizing the
+// same account heals one row via the (tenant, provider, name) upsert). The revoker
+// makes a REAL provider-side token deletion on disconnect — best-effort; the local
+// row is disabled regardless. Both are inert until GitHub is configured: with an empty
+// registry no `github` state is ever minted, so the finalizer never runs, and the
+// revoker no-ops for any provider without a configured revocation endpoint.
+const githubTransport = createFetchGithubTransport();
+const connectionFinalizers = new Map<string, ConnectionFinalizer>([
+  [GITHUB_PROVIDER, new GithubConnectionFinalizer({ transport: githubTransport, logger })],
+]);
+
 const oauthService = new OAuthService({
-  registry: new OAuthProviderRegistry(),
+  registry: oauthRegistry,
   stateStore: new DrizzleOAuthStateStore(
     database.db,
     createOAuthStateSecretBox(cipher),
   ),
   tokenClient: new OAuthTokenClient(),
-  revoker: new NoopTokenRevoker(),
-  connectionRepositoryFor: (tenantId) =>
-    new ConnectionRepository(new TenantScope(database.db, tenantId), cipher),
+  revoker: new GithubTokenRevoker({
+    registry: oauthRegistry,
+    connectionRepositoryFor,
+    logger,
+  }),
+  connectionRepositoryFor,
+  connectionFinalizers,
   appOrigin: env.APP_ORIGIN,
 });
 

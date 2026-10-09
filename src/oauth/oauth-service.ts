@@ -24,7 +24,7 @@ import { deriveCodeChallenge, generateCodeVerifier } from '@/oauth/pkce.js';
 import { buildAuthorizationUrl, type OAuthProviderRegistry } from '@/oauth/provider-config.js';
 import { resolveReturnPath } from '@/oauth/return-path.js';
 import { generateOAuthState, hashOAuthState } from '@/oauth/state-token.js';
-import type { OAuthTokenClient } from '@/oauth/token-client.js';
+import type { OAuthTokenClient, OAuthTokenSet } from '@/oauth/token-client.js';
 import { serializeTokenSet, type TokenRevoker } from '@/oauth/token-source.js';
 import type { ConnectionRepository } from '@/repositories/connection-repository.js';
 import type { OAuthStateStore } from '@/repositories/oauth-state-repository.js';
@@ -61,6 +61,29 @@ export interface DisconnectInput {
   readonly connectionId: string;
 }
 
+/**
+ * What a provider-specific finalizer decides about the connection to persist: the
+ * `name` it should carry (e.g. the GitHub login, so re-authorizing the same account
+ * heals one row via the `(tenant, provider, name)` upsert instead of piling up
+ * duplicates) and optional non-secret `metadata` (identity descriptors, scopes).
+ */
+export interface ConnectionFinalization {
+  readonly name: string;
+  readonly metadata?: Record<string, unknown>;
+}
+
+/**
+ * An optional, per-provider post-exchange hook. Runs on the API server inside
+ * {@link OAuthService.completeCallback} with the freshly-exchanged token set, and
+ * may call the provider's identity endpoint to derive the connection name/metadata.
+ * It MUST NOT return (or log) any secret — only non-secret descriptors. A thrown
+ * {@link OAuthProviderError}/{@link OAuthProviderUnavailableError} surfaces through the
+ * callback route's error mapping; the connection is not persisted.
+ */
+export interface ConnectionFinalizer {
+  finalize(input: { readonly tokenSet: OAuthTokenSet }): Promise<ConnectionFinalization>;
+}
+
 export interface OAuthServiceDeps {
   readonly registry: OAuthProviderRegistry;
   readonly stateStore: OAuthStateStore;
@@ -68,6 +91,11 @@ export interface OAuthServiceDeps {
   readonly revoker: TokenRevoker;
   /** Builds a tenant-scoped connection repository for the recovered tenant. */
   readonly connectionRepositoryFor: (tenantId: string) => ConnectionRepository;
+  /**
+   * Optional per-provider finalizers, keyed by provider slug. A provider without an
+   * entry persists a connection named after the provider itself (the prior default).
+   */
+  readonly connectionFinalizers?: ReadonlyMap<string, ConnectionFinalizer>;
   /** The trusted origin for the exact redirect URI (e.g. `env.APP_ORIGIN`). */
   readonly appOrigin: string;
   readonly stateTtlMs?: number;
@@ -146,11 +174,23 @@ export class OAuthService {
       codeVerifier: consumed.codeVerifier,
     });
 
+    // An optional provider finalizer may validate the granted identity and choose
+    // the connection name/metadata; without one, the connection is named for the
+    // provider (the prior default). It runs after a successful exchange, so a thrown
+    // provider error here means "token obtained but identity rejected" and the
+    // connection is not persisted.
+    const finalizer = this.deps.connectionFinalizers?.get(consumed.provider);
+    const finalized: ConnectionFinalization =
+      finalizer !== undefined ? await finalizer.finalize({ tokenSet }) : { name: consumed.provider };
+
     const repository = this.deps.connectionRepositoryFor(consumed.tenantId);
-    const connection = await repository.create({
+    // Upsert on (tenant, provider, name): re-authorizing the same account heals the
+    // existing row (re-credential + re-activate) rather than accumulating duplicates.
+    const connection = await repository.upsertByProviderName({
       provider: consumed.provider,
-      name: consumed.provider,
+      name: finalized.name,
       credential: { ...serializeTokenSet(tokenSet) },
+      ...(finalized.metadata !== undefined ? { metadata: finalized.metadata } : {}),
     });
 
     return { returnPath: consumed.returnPath, connectionId: connection.id };

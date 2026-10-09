@@ -32,6 +32,12 @@ export interface OAuthTokenSet {
   readonly scope?: string;
   /** Absolute expiry derived from `expires_in` at receipt; absent if none given. */
   readonly expiresAt?: Date;
+  /**
+   * Absolute refresh-token expiry derived from `refresh_token_expires_in` at
+   * receipt; absent if the provider issues non-expiring refresh tokens (or none).
+   * GitHub only sends this when the OAuth App has token expiration enabled.
+   */
+  readonly refreshTokenExpiresAt?: Date;
 }
 
 /** Only the fields we read from the provider's JSON; everything else is ignored. */
@@ -40,6 +46,7 @@ interface RawTokenResponse {
   readonly token_type?: unknown;
   readonly expires_in?: unknown;
   readonly refresh_token?: unknown;
+  readonly refresh_token_expires_in?: unknown;
   readonly scope?: unknown;
   readonly error?: unknown;
 }
@@ -149,12 +156,17 @@ export class OAuthTokenClient {
       typeof raw.expires_in === 'number' && Number.isFinite(raw.expires_in)
         ? new Date(this.now() + raw.expires_in * 1000)
         : undefined;
+    const refreshTokenExpiresAt =
+      typeof raw.refresh_token_expires_in === 'number' && Number.isFinite(raw.refresh_token_expires_in)
+        ? new Date(this.now() + raw.refresh_token_expires_in * 1000)
+        : undefined;
     return {
       accessToken: raw.access_token as string,
       tokenType: typeof raw.token_type === 'string' ? raw.token_type : 'bearer',
       ...(refreshToken !== undefined ? { refreshToken } : {}),
       ...(scope !== undefined ? { scope } : {}),
       ...(expiresAt !== undefined ? { expiresAt } : {}),
+      ...(refreshTokenExpiresAt !== undefined ? { refreshTokenExpiresAt } : {}),
     };
   }
 }
