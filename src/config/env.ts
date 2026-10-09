@@ -481,6 +481,28 @@ const envSchema = z
    * transport is `resend` (Invariant 7 below).
    */
   RESEND_API_KEY: z.string().min(1, 'must not be empty when set').optional(),
+
+  /**
+   * GitHub OAuth App client id (`GITHUB_CLIENT_ID`). Optional: the app boots
+   * without it and the GitHub provider is simply not registered (every
+   * `github` OAuth lookup then fails closed through the empty registry). When
+   * present it MUST be accompanied by `GITHUB_CLIENT_SECRET` (Invariant 8
+   * below). The client id is not a secret (it rides in the browser authorize
+   * URL), but it is paired with the secret so a half-configured provider can
+   * never start.
+   */
+  GITHUB_CLIENT_ID: z.string().min(1, 'must not be empty when set').optional(),
+
+  /**
+   * GitHub OAuth App client secret (`GITHUB_CLIENT_SECRET`). A secret: only
+   * ever sent in a server-side token/refresh/revocation request body or Basic
+   * header, never logged, never persisted, never returned to a client, and
+   * never exposed to the browser/Nuxt public runtime. Optional for boot, but
+   * both-or-neither with `GITHUB_CLIENT_ID` (Invariant 8). A worker that never
+   * refreshes an expiring token can run without it; a refresh or revocation
+   * that needs it fails clearly at use time.
+   */
+  GITHUB_CLIENT_SECRET: z.string().min(1, 'must not be empty when set').optional(),
   })
   .superRefine((env, ctx) => {
     // Reject ambiguous credentials rather than silently picking one. An API key
@@ -650,6 +672,24 @@ const envSchema = z
           code: 'custom',
           path: ['EMAIL_FROM'],
           message: "is required when EMAIL_TRANSPORT='resend'",
+        });
+      }
+    }
+
+    // Invariant 8: GitHub OAuth App credentials are both-or-neither.
+    // A client id without its secret (or vice versa) is a half-configured
+    // provider: the authorize URL would be built with a client id the token
+    // exchange cannot complete, or a secret would sit unused. Fail fast so a
+    // partial deployment is caught at boot rather than at the callback.
+    {
+      const githubIdSet = env.GITHUB_CLIENT_ID !== undefined;
+      const githubSecretSet = env.GITHUB_CLIENT_SECRET !== undefined;
+      if (githubIdSet !== githubSecretSet) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [githubIdSet ? 'GITHUB_CLIENT_SECRET' : 'GITHUB_CLIENT_ID'],
+          message:
+            'GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be set together (both or neither)',
         });
       }
     }

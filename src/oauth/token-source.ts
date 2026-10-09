@@ -30,6 +30,11 @@ export interface OAuthCredential {
   readonly scope?: string;
   /** ISO-8601 absolute expiry as stored; parsed to judge validity. */
   readonly expiresAt?: string;
+  /**
+   * ISO-8601 absolute refresh-token expiry as stored; parsed to judge whether a
+   * refresh is even possible. Absent for non-expiring refresh tokens.
+   */
+  readonly refreshTokenExpiresAt?: string;
 }
 
 /** Flatten a freshly-obtained token set into the persisted credential shape. */
@@ -40,6 +45,9 @@ export function serializeTokenSet(tokenSet: OAuthTokenSet): OAuthCredential {
     ...(tokenSet.refreshToken !== undefined ? { refreshToken: tokenSet.refreshToken } : {}),
     ...(tokenSet.scope !== undefined ? { scope: tokenSet.scope } : {}),
     ...(tokenSet.expiresAt !== undefined ? { expiresAt: tokenSet.expiresAt.toISOString() } : {}),
+    ...(tokenSet.refreshTokenExpiresAt !== undefined
+      ? { refreshTokenExpiresAt: tokenSet.refreshTokenExpiresAt.toISOString() }
+      : {}),
   };
 }
 
@@ -100,15 +108,35 @@ export class RefreshingTokenSource implements TokenSource {
         'not_refreshable',
       );
     }
+    // A rotated refresh token eventually expires too (GitHub: ~6 months). Once it
+    // has, no network call can succeed — fail permanently so the caller prompts a
+    // reconnect, rather than burning a doomed round-trip. No skew here: unlike the
+    // access-token check, there is no benefit to refreshing "early".
+    if (this.isRefreshTokenExpired(credential)) {
+      throw new OAuthProviderError(
+        'the stored OAuth refresh token has expired; the connection must be re-authorized',
+        'not_refreshable',
+      );
+    }
     const config = this.registry.get(request.provider);
     const refreshed = await this.tokenClient.refresh({
       config,
       refreshToken: credential.refreshToken,
     });
     // A provider may omit a new refresh_token (RFC 6749 §5.1); keep the old one.
+    // When we keep the old refresh token, its stored expiry still applies, so carry
+    // it forward (converted back to a Date); when the provider rotated the refresh
+    // token, the fresh set's own expiry (if any) in `...refreshed` is authoritative.
+    const carriedRefreshTokenExpiresAt =
+      refreshed.refreshToken === undefined && credential.refreshTokenExpiresAt !== undefined
+        ? new Date(credential.refreshTokenExpiresAt)
+        : undefined;
     const merged: OAuthTokenSet = {
       ...refreshed,
       refreshToken: refreshed.refreshToken ?? credential.refreshToken,
+      ...(carriedRefreshTokenExpiresAt !== undefined
+        ? { refreshTokenExpiresAt: carriedRefreshTokenExpiresAt }
+        : {}),
     };
     return { accessToken: merged.accessToken, tokenType: merged.tokenType, refreshed: merged };
   }
@@ -119,6 +147,14 @@ export class RefreshingTokenSource implements TokenSource {
     const expiresAtMs = Date.parse(credential.expiresAt);
     if (Number.isNaN(expiresAtMs)) return true;
     return expiresAtMs - this.skewMs <= this.now();
+  }
+
+  /** No stated refresh expiry → still usable; unparseable or past → unusable. */
+  private isRefreshTokenExpired(credential: OAuthCredential): boolean {
+    if (credential.refreshTokenExpiresAt === undefined) return false;
+    const expiresAtMs = Date.parse(credential.refreshTokenExpiresAt);
+    if (Number.isNaN(expiresAtMs)) return true;
+    return expiresAtMs <= this.now();
   }
 }
 

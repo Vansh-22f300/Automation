@@ -66,6 +66,18 @@ describe('serializeTokenSet', () => {
       tokenType: 'bearer',
     });
   });
+
+  it('ISO-encodes the refresh-token expiry when present', () => {
+    expect(
+      serializeTokenSet({
+        accessToken: 'at',
+        tokenType: 'bearer',
+        refreshToken: 'rt',
+        expiresAt: new Date('2026-01-01T00:00:00.000Z'),
+        refreshTokenExpiresAt: new Date('2026-06-01T00:00:00.000Z'),
+      }),
+    ).toMatchObject({ refreshTokenExpiresAt: '2026-06-01T00:00:00.000Z' });
+  });
 });
 
 describe('RefreshingTokenSource', () => {
@@ -146,6 +158,52 @@ describe('RefreshingTokenSource', () => {
     expect(error).toBeInstanceOf(OAuthProviderError);
     expect(error.details).toEqual({ reason: 'unknown_provider' });
     expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('fails permanently when the refresh token itself has expired, before any network call', async () => {
+    const { source, refresh } = makeSource();
+    const credential = {
+      accessToken: 'at',
+      tokenType: 'bearer',
+      refreshToken: 'rt',
+      expiresAt: iso(NOW - 1000),
+      refreshTokenExpiresAt: iso(NOW - 1000),
+    };
+    const error = await rejected(source.getAccessToken({ provider: 'demo', credential }));
+    expect(error).toBeInstanceOf(OAuthProviderError);
+    expect(error.details).toEqual({ reason: 'not_refreshable' });
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('carries the stored refresh-token expiry forward when the provider omits a new refresh token', async () => {
+    const { source, refresh } = makeSource();
+    refresh.mockResolvedValue({ accessToken: 'new-at', tokenType: 'bearer' });
+    const credential = {
+      accessToken: 'old-at',
+      tokenType: 'bearer',
+      refreshToken: 'old-rt',
+      expiresAt: iso(NOW - 1000),
+      refreshTokenExpiresAt: iso(NOW + 10_000_000),
+    };
+    const result = await source.getAccessToken({ provider: 'demo', credential });
+    expect(result.refreshed?.refreshToken).toBe('old-rt');
+    expect(result.refreshed?.refreshTokenExpiresAt).toEqual(new Date(NOW + 10_000_000));
+  });
+
+  it('adopts the provider’s new refresh-token expiry when the refresh token rotates', async () => {
+    const { source, refresh } = makeSource();
+    const newRtExpiry = new Date(NOW + 20_000_000);
+    refresh.mockResolvedValue({ accessToken: 'new-at', tokenType: 'bearer', refreshToken: 'new-rt', refreshTokenExpiresAt: newRtExpiry });
+    const credential = {
+      accessToken: 'old-at',
+      tokenType: 'bearer',
+      refreshToken: 'old-rt',
+      expiresAt: iso(NOW - 1000),
+      refreshTokenExpiresAt: iso(NOW + 10_000_000),
+    };
+    const result = await source.getAccessToken({ provider: 'demo', credential });
+    expect(result.refreshed?.refreshToken).toBe('new-rt');
+    expect(result.refreshed?.refreshTokenExpiresAt).toEqual(newRtExpiry);
   });
 });
 

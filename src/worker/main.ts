@@ -44,6 +44,7 @@
 import { and, eq } from 'drizzle-orm';
 
 import { loadEnv } from '@/config/env.js';
+import { registerGithubTools } from '@/connectors/github/index.js';
 import { createSlackToolRegistry } from '@/connectors/slack/index.js';
 import { createDatabase } from '@/db/client.js';
 import { workflowRuns } from '@/db/schema.js';
@@ -55,6 +56,11 @@ import type { LlmProvider } from '@/domain/llm.js';
 import { defaultStepHandlerRegistry } from '@/domain/step-handler.js';
 import { createRetryPolicy } from '@/domain/retry-policy.js';
 import { createClaudeProvider } from '@/llm/claude-provider.js';
+import { OAuthProviderRegistry } from '@/oauth/provider-config.js';
+import { loadOAuthProviders } from '@/oauth/providers/index.js';
+import { RefreshingConnectionResolver } from '@/oauth/refreshing-connection-resolver.js';
+import { OAuthTokenClient } from '@/oauth/token-client.js';
+import { RefreshingTokenSource } from '@/oauth/token-source.js';
 import { createLogger } from '@/observability/logger.js';
 import { ConnectionRepository } from '@/repositories/connection-repository.js';
 import { EffectLedgerRepository } from '@/repositories/effect-ledger-repository.js';
@@ -131,9 +137,28 @@ try {
 // decrypt runs — so the worker still boots when no connection is configured; a
 // tool call for a tenant with no key then fails cleanly at execution.
 const toolRegistry = createSlackToolRegistry({ logger });
+// GitHub tools share the same model-facing registry; adding a provider is purely
+// additive. Registration is unconditional (like Slack): a tenant with no GitHub
+// connection simply fails resolution cleanly, exactly as a missing Slack connection does.
+registerGithubTools(toolRegistry, { logger });
 const cipher = createCredentialCipher(env, { logger });
+// OAuth token refresh wiring. The registry is built from env — empty when GitHub is
+// not configured, so refreshing a `github` credential then fails closed with a clear
+// permanent error rather than silently. The RefreshingTokenSource passes a still-valid
+// access token through and transparently refreshes an expired/near-expiry one.
+const oauthTokenSource = new RefreshingTokenSource(
+  new OAuthTokenClient(),
+  new OAuthProviderRegistry(loadOAuthProviders(env)),
+);
+// Each per-tenant resolver is wrapped so an OAuth access token is refreshed — and the
+// rotated set persisted under compare-and-swap — transparently at the execution
+// boundary. Non-OAuth credentials (e.g. a Slack bot token) pass straight through, so
+// this is safe for every provider.
 const resolverFactory = (tenantId: string): ConnectionResolver =>
-  new ConnectionRepository(new TenantScope(database.db, tenantId), cipher);
+  new RefreshingConnectionResolver(
+    new ConnectionRepository(new TenantScope(database.db, tenantId), cipher),
+    oauthTokenSource,
+  );
 // The effect ledger makes each tool call retry-safe: it reserves the external
 // effect under `(tenant_id, idempotency_key)` and settles the outcome durably, so a
 // redelivered job replays a stored success instead of resending, and an unknown

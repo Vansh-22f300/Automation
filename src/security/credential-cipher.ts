@@ -23,9 +23,10 @@
  *     producing byte-identical envelopes after upgrade.
  *   - **v2** (`{v, alg, kid, iv, ct, tag}`): adds `kid` (so the keyring can resolve
  *     the key) and an AAD binding of `${tenantId}:${connectionId}` that ties the
- *     ciphertext to its row cryptographically. v2 is written **only** by the
- *     `connections:rotate` operator action — `connections:create` continues to emit
- *     v1 envelopes until an operator opts in to v2 writes (deliberate, deferred).
+ *     ciphertext to its row cryptographically. v2 is written whenever an active key
+ *     is configured — by the `connections:rotate` operator action and by OAuth
+ *     credential writes (callback upsert + refresh write-back, via
+ *     `ConnectionRepository.encryptForRow`). `connections:create` still emits v1.
  *
  * Two parallel capabilities back the cipher:
  *
@@ -264,8 +265,9 @@ export class CredentialCipher {
 
   /**
    * Encrypt a credential object into a **v2** envelope using the keyring's active
-   * kid and the supplied AAD. Used only by `connections:rotate`; an operator-initiated
-   * action that re-encrypts every ciphertext under the current active key.
+   * kid and the supplied AAD. Used by `connections:rotate` and by OAuth credential
+   * writes (via `ConnectionRepository.encryptForRow`) whenever an active key is
+   * configured — a re-encryption under the current active key.
    *
    * The `aad` binds the ciphertext to `${tenantId}:${connectionId}` so a row-swap
    * fails GCM verification on the next read. The AAD is a 73-byte UTF-8 buffer for

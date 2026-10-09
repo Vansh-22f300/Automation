@@ -32,6 +32,7 @@ import type {
   ConnectionResolver,
   ConnectionStatus,
 } from "@/domain/connection.js";
+import { newId } from "@/domain/ids.js";
 import {
   DisabledConnectionError,
   MissingConnectionError,
@@ -42,6 +43,7 @@ import {
 } from "@/repositories/tenant-scope.js";
 import type {
   CredentialCipher,
+  CredentialPayload,
   EncryptedEnvelope,
 } from "@/security/credential-cipher.js";
 
@@ -90,6 +92,38 @@ export interface CreateConnectionInput {
   /** Optional non-secret descriptors. Never put the secret here. */
   readonly metadata?: Record<string, unknown>;
 }
+
+/**
+ * An {@link AuthorizedConnection} plus the still-encrypted envelope it was
+ * decrypted from. The envelope's `ct` (base64 GCM ciphertext) is the
+ * compare-and-swap token used by {@link ConnectionRepository.compareAndSwapCredential}:
+ * jsonb does not preserve key order, and `updated_at` is auto-bumped, so neither the
+ * whole envelope nor the timestamp is a stable token — the random-IV ciphertext is.
+ */
+export interface AuthorizedConnectionWithEnvelope extends AuthorizedConnection {
+  readonly encryptedCredentials: EncryptedEnvelope;
+}
+
+/**
+ * The outcome of a compare-and-swap credential write (used by the OAuth refresh
+ * write-back). Exactly one of:
+ *   - `applied`    — this writer won the race; the credential it wrote, with the new envelope.
+ *   - `superseded` — a concurrent writer rotated the credential first; the caller is handed
+ *                    the current (already-persisted) credential + envelope to adopt instead.
+ *   - `missing`    — the row no longer exists in this tenant.
+ */
+export type CredentialSwapOutcome =
+  | {
+      readonly status: "applied";
+      readonly credential: CredentialPayload;
+      readonly encryptedCredentials: EncryptedEnvelope;
+    }
+  | {
+      readonly status: "superseded";
+      readonly credential: CredentialPayload;
+      readonly encryptedCredentials: EncryptedEnvelope;
+    }
+  | { readonly status: "missing" };
 
 export class ConnectionRepository
   extends TenantScopedRepository
@@ -264,6 +298,18 @@ export class ConnectionRepository
    * (→ {@link DisabledConnectionError}). On success, `last_used_at` is touched.
    */
   async resolveForTool(ref: ConnectionRef): Promise<AuthorizedConnection> {
+    const { metadata, credential } = await this.resolveWithEnvelope(ref);
+    return { metadata, credential };
+  }
+
+  /**
+   * As {@link resolveForTool}, but also returns the still-encrypted envelope the
+   * credential was decrypted from. The OAuth refresh write-back needs the envelope's
+   * `ct` as its compare-and-swap token; ordinary tool execution uses
+   * {@link resolveForTool} and never sees the envelope. Same tenant scoping, same
+   * Missing/Disabled semantics, same best-effort `last_used_at` touch.
+   */
+  async resolveWithEnvelope(ref: ConnectionRef): Promise<AuthorizedConnectionWithEnvelope> {
     // Resolve either by explicit id (trusted config only) or the active connection
     // for the provider. Both are anchored to this tenant.
     const [row] =
@@ -300,10 +346,11 @@ export class ConnectionRepository
       throw new DisabledConnectionError(row.id, row.status);
     }
 
-    const credential = this.cipher.decrypt(
-      row.encryptedCredentials as EncryptedEnvelope,
-      { tenantId: this.tenantId, connectionId: row.id },
-    );
+    const encryptedCredentials = row.encryptedCredentials as EncryptedEnvelope;
+    const credential = this.cipher.decrypt(encryptedCredentials, {
+      tenantId: this.tenantId,
+      connectionId: row.id,
+    });
 
     // Best-effort hygiene: record that the credential was used. Scoped to tenant.
     await this.db
@@ -319,6 +366,7 @@ export class ConnectionRepository
         lastUsedAt: new Date(),
       },
       credential,
+      encryptedCredentials,
     };
   }
 
@@ -453,6 +501,159 @@ export class ConnectionRepository
         )
         .returning();
       return updated ? ConnectionRepository.toMetadata(updated) : null;
+    });
+  }
+
+  /**
+   * Encrypt a credential for persistence, binding it to its row with the strongest
+   * envelope the deployment's keyring allows. With an ACTIVE key (a v2 deployment)
+   * this writes a v2 envelope whose AAD is `${tenantId}:${connectionId}` — the exact
+   * binding {@link rotateCredentials} uses and {@link resolveWithEnvelope} reconstructs
+   * on read — so a stored ciphertext cannot be replayed across tenants or connections.
+   * With no active key (a legacy `CREDENTIAL_ENCRYPTION_KEY`-only deployment, which
+   * cannot produce v2 at all) it falls back to v1, exactly as {@link create} does.
+   *
+   * It therefore never DOWNGRADES: a v2 row can only exist where an active key is
+   * configured, and that same configuration always re-encrypts here as v2 — so a
+   * credential write (OAuth callback upsert, or refresh write-back) preserves or
+   * upgrades the envelope version, never regresses it.
+   */
+  private encryptForRow(connectionId: string, credential: CredentialPayload): EncryptedEnvelope {
+    if (this.cipher.ring.activeKid !== null) {
+      const aad = Buffer.from(`${this.tenantId}:${connectionId}`, "utf8");
+      return this.cipher.encryptWithActive(credential, aad);
+    }
+    return this.cipher.encrypt(credential);
+  }
+
+  /**
+   * Persist a refreshed OAuth credential IFF the row's stored ciphertext still
+   * matches `expectedCt` — a compare-and-set keyed on the GCM `ct` the caller read
+   * a moment earlier. This is the write-back half of a transparent token refresh.
+   *
+   * The provider round-trip that produced `credential` has ALREADY completed
+   * OUTSIDE this method; here we only take a short row lock, compare, and write. We
+   * never hold a transaction open across a network call.
+   *
+   *   - `expectedCt === current.ct` → encrypt (v1, mirroring {@link create}) and
+   *     UPDATE → `applied`.
+   *   - `expectedCt !== current.ct` → a concurrent refresh already rotated the
+   *     credential; decrypt and hand back the winner's credential → `superseded`
+   *     (the caller adopts it instead of overwriting a newer token with an older one).
+   *   - row absent in this tenant → `missing`.
+   *
+   * The write-back uses {@link encryptForRow}: a v2 envelope bound to this row's
+   * `${tenantId}:${connectionId}` AAD when an active key is configured (which also
+   * UPGRADES a legacy v1 row in place), or v1 only in a legacy-key-only deployment
+   * that cannot produce v2 at all. It never downgrades a v2 row to v1.
+   */
+  async compareAndSwapCredential(
+    id: string,
+    expectedCt: string,
+    credential: CredentialPayload,
+  ): Promise<CredentialSwapOutcome> {
+    return this.db.transaction(async (tx) => {
+      const [row] = await tx
+        .select()
+        .from(connections)
+        .where(and(eq(connections.tenantId, this.tenantId), eq(connections.id, id)))
+        .for("update");
+      if (!row) return { status: "missing" };
+
+      const current = row.encryptedCredentials as EncryptedEnvelope;
+      if (current.ct !== expectedCt) {
+        // Someone refreshed first. Decrypt the winning envelope exactly as
+        // resolveForTool would (tenant/connection AAD derivation) and hand it back.
+        const adopted = this.cipher.decrypt(current, {
+          tenantId: this.tenantId,
+          connectionId: row.id,
+        });
+        return { status: "superseded", credential: adopted, encryptedCredentials: current };
+      }
+
+      const envelope = this.encryptForRow(id, credential);
+      const [updated] = await tx
+        .update(connections)
+        .set({ encryptedCredentials: envelope, updatedAt: new Date() })
+        .where(and(eq(connections.tenantId, this.tenantId), eq(connections.id, id)))
+        .returning();
+      if (!updated) return { status: "missing" };
+      return {
+        status: "applied",
+        credential,
+        encryptedCredentials: updated.encryptedCredentials as EncryptedEnvelope,
+      };
+    });
+  }
+
+  /**
+   * Create the connection for `(provider, name)`, or heal an existing one in place.
+   *
+   * This is how an OAuth callback persists a connection: re-authorizing the same
+   * provider account (same `name`) must not pile up duplicate rows, so the write is
+   * keyed on the `(tenant_id, provider, name)` unique constraint.
+   *
+   * It runs in a transaction that resolves the authoritative connection id FIRST —
+   * the existing row's id on re-auth (taken under `FOR UPDATE`, which serialises a
+   * concurrent refresh write-back on that row), or a freshly generated id for a new
+   * connection — so the credential is encrypted and bound to the id it is actually
+   * stored under (see {@link encryptForRow}). Encrypting against the final id is why
+   * this is not a single `INSERT ... ON CONFLICT`: the v2 AAD must match the row that
+   * ends up holding the ciphertext, and a conflict row's id is not known until read.
+   * On re-auth the credential is replaced, the connection re-activated
+   * (`status = 'active'`, healing a disabled row), `updated_at` bumped, and — when
+   * supplied — the non-secret metadata refreshed.
+   *
+   * Tenant-safe by construction: every statement is constrained to `this.tenantId`,
+   * so no other tenant's connection is reachable. Two truly simultaneous FIRST-TIME
+   * authorizations of the same `(tenant, provider, name)` can race to insert; the
+   * unique constraint lets one win and the other's transaction fails with a unique
+   * violation (no duplicate, no corruption) — a re-run then takes the heal path.
+   */
+  async upsertByProviderName(input: CreateConnectionInput): Promise<ConnectionMetadata> {
+    return this.db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ id: connections.id })
+        .from(connections)
+        .where(
+          and(
+            eq(connections.tenantId, this.tenantId),
+            eq(connections.provider, input.provider),
+            eq(connections.name, input.name),
+          ),
+        )
+        .for("update");
+
+      const id = existing?.id ?? newId();
+      const envelope = this.encryptForRow(id, input.credential);
+
+      if (existing !== undefined) {
+        const [updated] = await tx
+          .update(connections)
+          .set({
+            encryptedCredentials: envelope,
+            status: "active",
+            updatedAt: new Date(),
+            ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+          })
+          .where(and(eq(connections.tenantId, this.tenantId), eq(connections.id, id)))
+          .returning();
+        return ConnectionRepository.toMetadata(updated!);
+      }
+
+      const [inserted] = await tx
+        .insert(connections)
+        .values({
+          id,
+          tenantId: this.tenantId,
+          provider: input.provider,
+          name: input.name,
+          status: "active",
+          encryptedCredentials: envelope,
+          ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+        })
+        .returning();
+      return ConnectionRepository.toMetadata(inserted!);
     });
   }
 }

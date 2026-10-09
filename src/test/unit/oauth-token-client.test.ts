@@ -99,6 +99,22 @@ describe('OAuthTokenClient normalization', () => {
     const client = new OAuthTokenClient({ fetch: async () => jsonResponse(200, { access_token: 'only-access' }) });
     expect(await exchange(client)).toEqual({ accessToken: 'only-access', tokenType: 'bearer' });
   });
+
+  it('derives refreshTokenExpiresAt from refresh_token_expires_in', async () => {
+    const client = new OAuthTokenClient({
+      now: () => 1_000_000,
+      fetch: async () =>
+        jsonResponse(200, {
+          access_token: 'at',
+          refresh_token: 'rt',
+          expires_in: 3600,
+          refresh_token_expires_in: 7200,
+        }),
+    });
+    expect(await exchange(client)).toMatchObject({
+      refreshTokenExpiresAt: new Date(1_000_000 + 7200 * 1000),
+    });
+  });
 });
 
 describe('OAuthTokenClient failure classification', () => {
