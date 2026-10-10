@@ -376,6 +376,43 @@ I. **Run the first real GitHub OAuth test only after** the connection flow and t
   failure surfaces as a typed `credential_decryption_failed`, never a key value.
 - Do not run `connections:rotate` or any live GitHub OAuth flow as a "test" before G/I.
 
+### Manually verifying a connection decrypts (phase D / F)
+
+A dedicated manual workflow, **"verify connection decrypt (manual)"**
+([`.github/workflows/verify-connection-decrypt.yml`](../.github/workflows/verify-connection-decrypt.yml)),
+proves one connection's stored credential decrypts under the configured keyring
+**with no database write, no external (Slack/GitHub) call, and no key rotation** — it
+reuses the rotation dry-run decrypt path. Use it at phase D (worker keyring) and
+phase F (API keyring) to confirm, e.g., the existing legacy Slack connection decrypts.
+
+**Get the two IDs (both UUIDs, neither secret).** The frontend Connections page shows
+only a shortened connection ID and no tenant ID, so read both straight from the
+database. In the **Neon Console → SQL Editor**, run this read-only metadata query:
+
+```sql
+SELECT id, tenant_id, provider, status FROM connections WHERE provider = 'slack';
+```
+
+Take the connection UUID from the `id` column and the tenant UUID from `tenant_id`.
+Select **only** these non-secret metadata columns — never `SELECT *`, and never query,
+read, or copy `encrypted_credentials` (or any other credential/secret column). The
+verification does not need the ciphertext and it must never appear in the SQL Editor,
+a screenshot, logs, or a ticket. The two UUIDs are internal identifiers, not secrets,
+but keep them out of public issues, chats, and screenshots anyway. (If you already know
+the tenant UUID, `pnpm connections list <tenantId>` prints the same non-secret
+metadata — `<id> <provider>/<name> [status]` — and never a credential.)
+
+**Run it:** GitHub → Actions → **verify connection decrypt (manual)** → **Run
+workflow**, paste the tenant and connection UUIDs, run. (The two IDs show in the run
+metadata — expected; they are not secrets. Never paste a key or token here.) It runs
+in the `worker-free` environment, so it uses the same secrets as the worker.
+
+**Read the result:** exactly one line is printed —
+`RESULT: PASS — …` (found and decrypted) or `RESULT: FAIL — …` (did not decrypt, or
+the connection was not found / already current). A **PASS requires an actual decrypt**:
+a missing or already-rotated connection reports FAIL, never a false pass. No
+credential, key, DB URL, envelope, or connection name is ever printed.
+
 ## Frontend
 
 **Not deployed in free mode yet.** The Nuxt app is an SPA (`ssr: false`) with a
