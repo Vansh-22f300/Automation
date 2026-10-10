@@ -65,6 +65,33 @@ The broad `repo` scope (private repositories) is deliberately **not** requested.
   services. Set `CREDENTIAL_ENCRYPTION_KEY` (or `CREDENTIAL_ENCRYPTION_KEYS`) so tokens
   can be encrypted at rest.
 
+## Credential encryption at rest (v1 vs v2 keyring)
+
+GitHub tokens are encrypted via the existing credential cipher. Which envelope is
+written depends only on the keyring configuration — the connector code is unchanged:
+
+- **`CREDENTIAL_ENCRYPTION_KEY` only (default):** a single key, **v1** envelopes
+  (AES-256-GCM, no AAD). GitHub connections work, but a stored ciphertext is not
+  cryptographically bound to its row.
+- **`CREDENTIAL_ENCRYPTION_KEYS` with an active key:** **v2** envelopes bound to a
+  `${tenantId}:${connectionId}` AAD, so a ciphertext cannot be replayed across rows
+  or tenants. New GitHub connections are written v2 and existing v1 rows upgrade to
+  v2 on their next refresh. Format (never real values):
+
+  ```
+  <active-kid>:<base64-new-active-key>,legacy-v1:<base64-original-legacy-key>
+  ```
+
+  The first entry is active (not `legacy-v1`); the `legacy-v1` entry is decrypt-only
+  and **must carry the current `CREDENTIAL_ENCRYPTION_KEY` bytes** so existing v1
+  credentials keep decrypting; both keys decode to exactly 32 bytes. If your current
+  key is **hex**, convert its decoded bytes to base64 — do not generate a new one.
+
+The keyring must be **byte-identical on the API and the worker** (the worker decrypts
+v2 rows the API wrote and writes v2 on refresh). The full, ordered rollout for the
+free-mode deployment — worker before API, legacy reads preserved throughout — is in
+[docs/deploy-free.md](../deploy-free.md#enabling-v2-credential-encryption-and-github-oauth).
+
 ## Token refresh behavior
 
 Access tokens are refreshed transparently at the execution boundary — the model never
