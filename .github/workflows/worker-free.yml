@@ -97,15 +97,18 @@ jobs:
       #
       # Secret-safe: values are read into step-scoped env, tested with -n only, and
       # written to $GITHUB_ENV via the masked multiline form — never echoed to stdout,
-      # no `set -x`. CREDENTIAL_ENCRYPTION_KEYS and GITHUB_CLIENT_SECRET are worker-free
-      # environment SECRETS (auto-masked); GITHUB_CLIENT_ID is a worker-free
-      # environment VARIABLE (non-secret). The only stdout is a presence/absence line
-      # (never a value), which is what lets an operator verify a phase safely.
+      # no `set -x`. GitHub Actions reserves the `GITHUB_` prefix for secret/variable
+      # names, so the OAuth client is configured under Actions names OAUTH_GH_CLIENT_ID
+      # (a worker-free VARIABLE, non-secret) and OAUTH_GH_CLIENT_SECRET (a worker-free
+      # SECRET, auto-masked), and this step forwards them to the app's runtime names
+      # GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET. CREDENTIAL_ENCRYPTION_KEYS is also a
+      # worker-free SECRET. The only stdout is a presence/absence line (never a value),
+      # which is what lets an operator verify a phase safely.
       - name: Resolve optional OAuth + keyring configuration
         env:
           OPT_CREDENTIAL_ENCRYPTION_KEYS: ${{ secrets.CREDENTIAL_ENCRYPTION_KEYS }}
-          OPT_GITHUB_CLIENT_ID: ${{ vars.GITHUB_CLIENT_ID }}
-          OPT_GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}
+          OPT_GITHUB_CLIENT_ID: ${{ vars.OAUTH_GH_CLIENT_ID }}
+          OPT_GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GH_CLIENT_SECRET }}
         run: |
           # Multi-key keyring (optional). Forwarded only when set, so the backend sees
           # it as ABSENT (not "") otherwise and keeps legacy CREDENTIAL_ENCRYPTION_KEY
@@ -130,7 +133,7 @@ jobs:
           if [ -n "${OPT_GITHUB_CLIENT_ID}" ]; then id_set=true; fi
           if [ -n "${OPT_GITHUB_CLIENT_SECRET}" ]; then secret_set=true; fi
           if [ "${id_set}" != "${secret_set}" ]; then
-            echo "::error::GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be set together for the worker-free environment (both or neither)."
+            echo "::error::OAUTH_GH_CLIENT_ID (variable) and OAUTH_GH_CLIENT_SECRET (secret) must be set together for the worker-free environment (both or neither)."
             exit 1
           fi
           if [ "${id_set}" = "true" ]; then

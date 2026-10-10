@@ -265,14 +265,18 @@ The worker needs two secrets, scoped to a GitHub **Environment** named
    | `DATABASE_URL` | the **same** Neon pooled URL (`...?sslmode=require`) the API uses |
    | `CREDENTIAL_ENCRYPTION_KEY` | the **same** key configured for the API on Render — a mismatch makes every stored connection credential unreadable on one side |
    | `CREDENTIAL_ENCRYPTION_KEYS` *(optional)* | the **same** keyring value as the API — enables v2 (AAD-bound) encryption; must be byte-identical to the API's, because the worker decrypts v2 rows the API wrote. Leave unset to keep single-key v1. |
-   | `GITHUB_CLIENT_SECRET` *(optional)* | the GitHub OAuth App client secret — the worker needs it for token refresh. **Both-or-neither** with `GITHUB_CLIENT_ID` (an environment **variable**, below). |
+   | `OAUTH_GH_CLIENT_SECRET` *(optional)* | the GitHub OAuth App client secret — the worker needs it for token refresh. **Both-or-neither** with `OAUTH_GH_CLIENT_ID` (an environment **variable**, below). |
 
-   `GITHUB_CLIENT_ID` is **not** a secret — add it as a `worker-free` environment
+   `OAUTH_GH_CLIENT_ID` is **not** a secret — add it as a `worker-free` environment
    **variable** (Settings > Environments > worker-free > Variables), not a secret.
-   The two GitHub values are **both-or-neither**: the workflow fails the run with a
-   clear, non-secret diagnostic if exactly one is set, so a half-configured provider
-   never starts. All three optional values may be left unset — the worker then runs
-   exactly as before (single-key v1, GitHub disabled).
+   **Why these names:** GitHub Actions reserves the `GITHUB_` prefix for secret/variable
+   names, so the Actions environment uses `OAUTH_GH_CLIENT_ID` / `OAUTH_GH_CLIENT_SECRET`;
+   `worker-free.yml` forwards them to the application's `GITHUB_CLIENT_ID` /
+   `GITHUB_CLIENT_SECRET` at runtime (the names used on Render and in a local `.env`).
+   The two values are **both-or-neither**: the workflow fails the run with a clear,
+   non-secret diagnostic if exactly one is set, so a half-configured provider never
+   starts. All three optional values may be left unset — the worker then runs exactly as
+   before (single-key v1, GitHub disabled).
 
 Security notes:
 
@@ -355,8 +359,11 @@ E. **Only then** set the **identical** keyring on the Render Free API (dashboard
 F. **Verify both processes still decrypt existing legacy connections** — exercise a
    tool that uses a pre-v2 connection on each side; it resolves without a decryption
    error (the `legacy-v1` entry covers v1 rows).
-G. **Configure `GITHUB_CLIENT_ID` + `GITHUB_CLIENT_SECRET` together** on API and
-   worker, only when ready to activate GitHub OAuth. Setting one fails fast.
+G. **Configure the GitHub OAuth client together on API and worker**, only when ready to
+   activate GitHub OAuth — setting one without the other fails fast. On **Render** (API)
+   use `GITHUB_CLIENT_ID` + `GITHUB_CLIENT_SECRET`; on the **GitHub Actions `worker-free`**
+   environment use `OAUTH_GH_CLIENT_ID` (variable) + `OAUTH_GH_CLIENT_SECRET` (secret),
+   which the workflow forwards to the app's `GITHUB_CLIENT_*` names.
 H. **Keep `APP_ORIGIN` on the public Vercel frontend** (API). Do not change auth link
    origins — the GitHub callback is reached via the BFF at `${APP_ORIGIN}/oauth/github/callback`.
    For the planned production frontend `https://ai-worke.vercel.app`, that is
@@ -373,8 +380,8 @@ I. **Run the first real GitHub OAuth test only after** the connection flow and t
   keyring parsed and the legacy key still decrypts. A bad keyring (e.g. missing
   `legacy-v1` while `CREDENTIAL_ENCRYPTION_KEY` is set) fails at boot with a typed,
   non-secret error.
-- Both-or-neither GitHub: setting one value fails the run with `::error::GITHUB_CLIENT_ID
-  and GITHUB_CLIENT_SECRET must be set together…` — no value printed.
+- Both-or-neither GitHub: setting one value fails the run with `::error::OAUTH_GH_CLIENT_ID
+  (variable) and OAUTH_GH_CLIENT_SECRET (secret) must be set together…` — no value printed.
 - Legacy reads: confirm an existing connection still resolves after each step; a
   failure surfaces as a typed `credential_decryption_failed`, never a key value.
 - Do not run `connections:rotate` or any live GitHub OAuth flow as a "test" before G/I.
