@@ -64,8 +64,18 @@ describe('worker-free.yml — optional keyring / GitHub wiring is safe', () => {
 
   it('reads the optional values only as OPT_ aliases from the right sources', () => {
     expect(cfg).toContain('OPT_CREDENTIAL_ENCRYPTION_KEYS: ${{ secrets.CREDENTIAL_ENCRYPTION_KEYS }}');
-    expect(cfg).toContain('OPT_GITHUB_CLIENT_ID: ${{ vars.GITHUB_CLIENT_ID }}');
-    expect(cfg).toContain('OPT_GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}');
+    // GitHub Actions reserves the GITHUB_ prefix for secret/variable NAMES, so the
+    // OAuth client is sourced from OAUTH_GH_* (variable + secret), then forwarded to
+    // the app's GITHUB_CLIENT_* runtime names below.
+    expect(cfg).toContain('OPT_GITHUB_CLIENT_ID: ${{ vars.OAUTH_GH_CLIENT_ID }}');
+    expect(cfg).toContain('OPT_GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GH_CLIENT_SECRET }}');
+  });
+
+  it('never references a reserved GITHUB_-prefixed Actions secret/variable name', () => {
+    // Actions rejects `vars.GITHUB_*` / `secrets.GITHUB_*`; this fix must not regress.
+    expect(workflow).not.toContain('vars.GITHUB_CLIENT_ID');
+    expect(workflow).not.toContain('secrets.GITHUB_CLIENT_SECRET');
+    expect(workflow).not.toMatch(/\$\{\{\s*(?:vars|secrets)\.GITHUB_/);
   });
 
   it('NEVER binds the real env names to an expression (empty-string = "set" to Zod)', () => {
@@ -84,7 +94,7 @@ describe('worker-free.yml — optional keyring / GitHub wiring is safe', () => {
 
   it('enforces GitHub both-or-neither with a non-secret fail-fast, and forwards both only together', () => {
     expect(cfg).toContain('if [ "${id_set}" != "${secret_set}" ]; then');
-    expect(cfg).toContain('::error::GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be set together');
+    expect(cfg).toContain('::error::OAUTH_GH_CLIENT_ID (variable) and OAUTH_GH_CLIENT_SECRET (secret) must be set together');
     expect(cfg).toContain('exit 1');
     expect(cfg).toContain('if [ "${id_set}" = "true" ]; then');
     expect(cfg).toContain('GITHUB_CLIENT_ID<<__WORKER_ENV_EOF__');

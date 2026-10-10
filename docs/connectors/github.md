@@ -18,6 +18,13 @@ both unset and GitHub is simply not registered — every GitHub OAuth lookup fai
 API and the worker need the pair: the API runs authorize / callback / revoke, the worker
 runs tool execution and token refresh (refresh needs the client secret).
 
+**Naming by platform.** The variable names above are the **application/runtime** names the
+backend reads — what you set on the **Render** API service and in a local `.env`. On the
+**GitHub Actions `worker-free`** environment they must instead be named `OAUTH_GH_CLIENT_ID`
+(variable) and `OAUTH_GH_CLIENT_SECRET` (secret), because GitHub Actions reserves the
+`GITHUB_` prefix for secret/variable names; `worker-free.yml` forwards them to
+`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` for the worker process.
+
 ## Create the GitHub OAuth App
 
 1. github.com → Settings → Developer settings → **OAuth Apps** → New OAuth App.
@@ -84,12 +91,16 @@ than starting a flow that cannot complete.
   The planned production frontend is **`https://ai-worke.vercel.app`**, so its callback
   URL is **`https://ai-worke.vercel.app/oauth/github/callback`** and
   `APP_ORIGIN=https://ai-worke.vercel.app`.
-- Set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` on **both** the API and the worker
-  services — **together, and only when activation is explicitly authorized** (they are
-  currently unset, so the provider is not registered). On the free-mode worker,
-  `GITHUB_CLIENT_ID` is a `worker-free` Actions **variable** and `GITHUB_CLIENT_SECRET`
-  a `worker-free` **secret**. Set `CREDENTIAL_ENCRYPTION_KEY` (or
-  `CREDENTIAL_ENCRYPTION_KEYS`) so tokens can be encrypted at rest.
+- Configure the client **on both the API and the worker — together, and only when
+  activation is explicitly authorized** (they are currently unset, so the provider is not
+  registered). The names differ by platform:
+  - **Render API service** (and local `.env`): `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`.
+  - **GitHub Actions `worker-free` environment**: `OAUTH_GH_CLIENT_ID` (**variable**) and
+    `OAUTH_GH_CLIENT_SECRET` (**secret**) — the `GITHUB_` prefix is reserved by Actions —
+    which `worker-free.yml` forwards to the app's `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`.
+
+  Set `CREDENTIAL_ENCRYPTION_KEY` (or `CREDENTIAL_ENCRYPTION_KEYS`) so tokens can be
+  encrypted at rest.
 
 ## Credential encryption at rest (v1 vs v2 keyring)
 

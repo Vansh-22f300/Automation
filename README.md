@@ -1540,9 +1540,12 @@ manually pasted token.
 **Disabled by default.** With `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` unset the GitHub
 provider is not registered: the authorize lookup fails closed (`404`) and the UI shows a
 "not enabled yet" message instead of starting a flow that cannot complete. Configure the
-pair **together** on the Render API service and the GitHub Actions `worker-free`
-environment **only when activation is explicitly authorized**; the planned production
-callback is `https://ai-worke.vercel.app/oauth/github/callback`. Prerequisites, scopes and
+client **together** **only when activation is explicitly authorized**, using the right
+names per platform — `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` on the Render API service,
+but `OAUTH_GH_CLIENT_ID` (variable) / `OAUTH_GH_CLIENT_SECRET` (secret) on the GitHub
+Actions `worker-free` environment (the `GITHUB_` prefix is reserved there), which
+`worker-free.yml` forwards to the app's names. The planned production callback is
+`https://ai-worke.vercel.app/oauth/github/callback`. Prerequisites, scopes and
 token-refresh behavior are in [docs/connectors/github.md](docs/connectors/github.md); the
 ordered rollout is in
 [docs/deploy-free.md](docs/deploy-free.md#enabling-v2-credential-encryption-and-github-oauth).
