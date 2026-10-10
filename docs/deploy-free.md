@@ -385,9 +385,22 @@ proves one connection's stored credential decrypts under the configured keyring
 reuses the rotation dry-run decrypt path. Use it at phase D (worker keyring) and
 phase F (API keyring) to confirm, e.g., the existing legacy Slack connection decrypts.
 
-**Get the two IDs (both UUIDs, neither secret):** `pnpm connections list <tenantId>`
-prints only non-secret metadata (`<id> <provider>/<name> [status]`), or read them from
-the app's Connections view. Note the `tenantId` and the connection `id`.
+**Get the two IDs (both UUIDs, neither secret).** The frontend Connections page shows
+only a shortened connection ID and no tenant ID, so read both straight from the
+database. In the **Neon Console → SQL Editor**, run this read-only metadata query:
+
+```sql
+SELECT id, tenant_id, provider, status FROM connections WHERE provider = 'slack';
+```
+
+Take the connection UUID from the `id` column and the tenant UUID from `tenant_id`.
+Select **only** these non-secret metadata columns — never `SELECT *`, and never query,
+read, or copy `encrypted_credentials` (or any other credential/secret column). The
+verification does not need the ciphertext and it must never appear in the SQL Editor,
+a screenshot, logs, or a ticket. The two UUIDs are internal identifiers, not secrets,
+but keep them out of public issues, chats, and screenshots anyway. (If you already know
+the tenant UUID, `pnpm connections list <tenantId>` prints the same non-secret
+metadata — `<id> <provider>/<name> [status]` — and never a credential.)
 
 **Run it:** GitHub → Actions → **verify connection decrypt (manual)** → **Run
 workflow**, paste the tenant and connection UUIDs, run. (The two IDs show in the run

@@ -24,10 +24,13 @@ import { pathToFileURL } from 'node:url';
 
 import { runRotate } from '@/cli/connections-rotate.js';
 import type { RunRotateSummary } from '@/cli/connections-rotate.js';
-import { loadEnv } from '@/config/env.js';
+import { parseEnv } from '@/config/env.js';
+import type { Env } from '@/config/env.js';
 import { createDatabase } from '@/db/client.js';
+import type { DatabaseHandle } from '@/db/client.js';
 import { isAppError } from '@/domain/errors.js';
 import { createLogger } from '@/observability/logger.js';
+import type { Logger } from '@/observability/logger.js';
 import { ConnectionRepository } from '@/repositories/connection-repository.js';
 import { TenantScope } from '@/repositories/tenant-scope.js';
 import { CredentialCipher, createCredentialCipher } from '@/security/credential-cipher.js';
@@ -116,37 +119,110 @@ export async function runVerifyDecrypt(options: VerifyDecryptOptions): Promise<V
   return verdict;
 }
 
-async function main(): Promise<void> {
-  const tenantId = process.argv[2];
-  const connectionId = process.argv[3];
+/**
+ * Process-level dependencies, injected so the initialization-failure paths are
+ * testable without a real environment, database, or keyring. The defaults wire the
+ * real factories; tests pass fakes that throw at a chosen stage.
+ */
+export interface VerifyCliDeps {
+  readonly loadEnv: () => Env;
+  readonly createLogger: (env: Env) => Logger;
+  readonly createCipher: (env: Env, logger: Logger) => CredentialCipher;
+  readonly createDatabase: (env: Env, logger: Logger) => DatabaseHandle;
+}
+
+const DEFAULT_DEPS: VerifyCliDeps = {
+  // parseEnv, not loadEnv: loadEnv calls process.exit(1) on a config error, which would
+  // bypass the guard in runCli; parseEnv throws instead, so an environment failure flows
+  // through the guard and yields the single sanitized RESULT: FAIL line like every other
+  // stage. The thrown EnvValidationError lists variable names + shape messages, never
+  // values — and runCli never prints or logs it anyway.
+  loadEnv: () => parseEnv(),
+  createLogger: (env) => createLogger(env, { service: 'cli' }),
+  createCipher: (env, logger) => createCredentialCipher(env, { logger }),
+  createDatabase: (env, logger) => createDatabase(env, logger, { service: 'cli' }),
+};
+
+/** Where the CLI reads its args and writes its output. Injectable for tests. */
+export interface VerifyCliIo {
+  /** The two positional args — [tenantId, connectionId] (i.e. process.argv.slice(2)). */
+  readonly argv: readonly string[];
+  readonly stdout: NodeJS.WritableStream;
+  readonly stderr: NodeJS.WritableStream;
+}
+
+/**
+ * Run the CLI end to end and return its exit code (never throws).
+ *
+ * EVERY step — env load, logger/cipher/database construction, the verify itself, and
+ * cleanup — runs inside one guard, so no raw exception (a DB host from a connect
+ * failure, a keyring parse detail, a stack trace) can escape to the Actions log. On
+ * any failure it logs at most a typed, non-secret code, prints exactly one sanitized
+ * `RESULT: FAIL` line, and returns 1. A database handle, once constructed, is always
+ * closed; a failure while closing is swallowed so it can neither replace the verdict
+ * nor leak a detail of its own.
+ */
+export async function runCli(
+  io: VerifyCliIo,
+  deps: VerifyCliDeps = DEFAULT_DEPS,
+): Promise<0 | 1> {
+  const tenantId = io.argv[0];
+  const connectionId = io.argv[1];
   if (!isValidId(tenantId) || !isValidId(connectionId)) {
-    process.stderr.write('usage: verify-connection-decrypt <tenantId:uuid> <connectionId:uuid>\n');
-    process.exitCode = 1;
-    return;
+    io.stderr.write('usage: verify-connection-decrypt <tenantId:uuid> <connectionId:uuid>\n');
+    return 1;
   }
-  // LOG_LEVEL is expected to be `silent` in the manual workflow, so the only output is
-  // the RESULT line; the logger carries at most a typed, non-secret error code.
-  const env = loadEnv();
-  const logger = createLogger(env, { service: 'cli' });
-  const database = createDatabase(env, logger, { service: 'cli' });
-  const cipher = createCredentialCipher(env, { logger });
+
+  let database: DatabaseHandle | undefined;
+  let logger: Logger | undefined;
   try {
+    const env = deps.loadEnv();
+    logger = deps.createLogger(env);
+    // Build the cipher before opening a pool: a malformed keyring is the most likely
+    // initialization failure during a rollout, and failing here leaves no database
+    // handle to clean up.
+    const cipher = deps.createCipher(env, logger);
+    database = deps.createDatabase(env, logger);
     await database.verifyConnection();
     const repository = new ConnectionRepository(new TenantScope(database.db, tenantId), cipher);
-    const verdict = await runVerifyDecrypt({ repository, cipher, tenantId, connectionId });
-    process.exitCode = verdict.exitCode;
+    const verdict = await runVerifyDecrypt({
+      repository,
+      cipher,
+      tenantId,
+      connectionId,
+      stdout: io.stdout,
+    });
+    return verdict.exitCode;
   } catch (error) {
-    // Never surface raw exception detail (it may carry a host/DB string). Log a typed
-    // code only, and print one generic, sanitized failure line.
-    logger.error(
-      { event: 'verify_connection_decrypt_error', code: isAppError(error) ? error.code : 'unknown' },
-      'verify_connection_decrypt_error',
-    );
-    process.stdout.write('RESULT: FAIL — verification could not run (see run logs for a non-secret error code).\n');
-    process.exitCode = 1;
+    // Never surface raw exception detail. Log a typed code only — and only if the
+    // logger was constructed — then print one generic, sanitized failure line.
+    if (logger !== undefined) {
+      logger.error(
+        { event: 'verify_connection_decrypt_error', code: isAppError(error) ? error.code : 'unknown' },
+        'verify_connection_decrypt_error',
+      );
+    }
+    io.stdout.write('RESULT: FAIL — verification could not run (see run logs for a non-secret error code).\n');
+    return 1;
   } finally {
-    await database.close();
+    if (database !== undefined) {
+      try {
+        await database.close();
+      } catch {
+        // A cleanup failure must neither replace the verdict nor leak a raw detail.
+      }
+    }
   }
+}
+
+async function main(): Promise<void> {
+  // LOG_LEVEL is expected to be `silent` in the manual workflow, so the only output
+  // is the RESULT line; the logger carries at most a typed, non-secret error code.
+  process.exitCode = await runCli({
+    argv: process.argv.slice(2),
+    stdout: process.stdout,
+    stderr: process.stderr,
+  });
 }
 
 // Run `main` only when executed directly, so tests can import the pure helpers above

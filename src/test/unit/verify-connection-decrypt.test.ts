@@ -15,7 +15,13 @@ import { Writable } from 'node:stream';
 
 import { describe, expect, it } from 'vitest';
 
-import { isValidId, mapSummaryToVerdict, runVerifyDecrypt } from '@/cli/verify-connection-decrypt.js';
+import { isValidId, mapSummaryToVerdict, runCli, runVerifyDecrypt } from '@/cli/verify-connection-decrypt.js';
+import type { VerifyCliDeps } from '@/cli/verify-connection-decrypt.js';
+import { EnvValidationError } from '@/config/env.js';
+import type { Env } from '@/config/env.js';
+import type { DatabaseHandle } from '@/db/client.js';
+import { RetryableError } from '@/domain/errors.js';
+import type { Logger } from '@/observability/logger.js';
 import type { ConnectionRepository, RotatableConnection, RotatableListPage } from '@/repositories/connection-repository.js';
 import {
   CredentialCipher,
@@ -159,6 +165,201 @@ describe('runVerifyDecrypt', () => {
     });
     expect(verdict).toMatchObject({ outcome: 'fail', reason: 'no_active_key', exitCode: 1 });
     expect(repo.listCalls).toBe(0);
+  });
+});
+
+// ─── runCli: initialization + cleanup safety ──────────────────────────────────
+// runCli enforces the UUID gate itself, so these use real UUIDs (unlike the direct
+// runVerifyDecrypt tests above, which bypass it). The fakes make a chosen init stage
+// fail; the assertions prove no raw detail (keyring, DB host, error message) reaches
+// stdout/stderr, the exit code is nonzero, and a constructed pool is always closed.
+
+const UUID_A = '018f3a3c-1b2c-7d3e-8f90-abcdef012345';
+const UUID_B = '018f3a3c-1b2c-7d3e-8f90-abcdef999999';
+
+/** A logger stub recording its `.error` calls — the only method runCli uses. */
+function spyLogger(): { logger: Logger; calls: readonly unknown[][] } {
+  const calls: unknown[][] = [];
+  const logger = { error: (...args: unknown[]) => { calls.push(args); } } as unknown as Logger;
+  return { logger, calls };
+}
+
+/** A database handle with scripted verify/close behavior; counts close() calls. */
+function fakeHandle(opts: {
+  verify?: () => Promise<void>;
+  close?: () => Promise<void>;
+}): { handle: DatabaseHandle; closeCalls: () => number } {
+  let closeCount = 0;
+  const handle = {
+    db: {},
+    pool: {},
+    verifyConnection: opts.verify ?? (async () => {}),
+    ping: async () => {},
+    close: async () => {
+      closeCount += 1;
+      if (opts.close) await opts.close();
+    },
+  } as unknown as DatabaseHandle;
+  return { handle, closeCalls: () => closeCount };
+}
+
+describe('runCli (initialization + cleanup safety)', () => {
+  it('rejects non-UUID args without constructing env, cipher, or database', async () => {
+    let loadCalls = 0;
+    let cipherCalls = 0;
+    let dbCalls = 0;
+    const deps: VerifyCliDeps = {
+      loadEnv: () => { loadCalls += 1; return {} as Env; },
+      createLogger: () => spyLogger().logger,
+      createCipher: () => { cipherCalls += 1; return cipherWithActive(); },
+      createDatabase: () => { dbCalls += 1; return fakeHandle({}).handle; },
+    };
+    const out = captureSink();
+    const err = captureSink();
+    const code = await runCli({ argv: ['not-a-uuid', 'nope'], stdout: out.stream, stderr: err.stream }, deps);
+    expect(code).toBe(1);
+    expect(err.text()).toContain('usage:');
+    expect(loadCalls).toBe(0);
+    expect(cipherCalls).toBe(0);
+    expect(dbCalls).toBe(0);
+  });
+
+  it('returns a sanitized FAIL when env validation fails (as the real parseEnv does) — no message leaks, no pool, no log', async () => {
+    // The real default wires parseEnv, which throws EnvValidationError on a bad config.
+    // Its message lists variable names + shape messages; a value must never leak even if a
+    // message carried one, and the logger is not built yet, so nothing is logged at all.
+    const SECRET = 'SECRET-value-smuggled-into-a-message';
+    const envError = new EnvValidationError([
+      { variable: 'CREDENTIAL_ENCRYPTION_KEYS', message: `invalid: ${SECRET}` },
+    ]);
+    let dbCalls = 0;
+    const { logger, calls } = spyLogger();
+    const deps: VerifyCliDeps = {
+      loadEnv: () => { throw envError; },
+      createLogger: () => logger,
+      createCipher: () => cipherWithActive(),
+      createDatabase: () => { dbCalls += 1; return fakeHandle({}).handle; },
+    };
+    const out = captureSink();
+    const err = captureSink();
+    const code = await runCli({ argv: [UUID_A, UUID_B], stdout: out.stream, stderr: err.stream }, deps);
+    expect(code).toBe(1);
+    expect(out.text()).toContain('RESULT: FAIL');
+    expect(out.text() + err.text()).not.toContain(SECRET);
+    expect(dbCalls).toBe(0); // never reached database construction
+    expect(calls.length).toBe(0); // logger is built after env load, so nothing is logged
+  });
+
+  it('returns a sanitized FAIL when cipher construction throws — no keyring detail leaks, no pool opened', async () => {
+    const SECRET = 'base64-KEYRING-secret-bytes';
+    let dbCalls = 0;
+    const { logger, calls } = spyLogger();
+    const deps: VerifyCliDeps = {
+      loadEnv: () => ({} as Env),
+      createLogger: () => logger,
+      createCipher: () => { throw new Error(SECRET); },
+      createDatabase: () => { dbCalls += 1; return fakeHandle({}).handle; },
+    };
+    const out = captureSink();
+    const err = captureSink();
+    const code = await runCli({ argv: [UUID_A, UUID_B], stdout: out.stream, stderr: err.stream }, deps);
+    expect(code).toBe(1);
+    expect(out.text()).toContain('RESULT: FAIL');
+    expect(out.text() + err.text()).not.toContain(SECRET);
+    expect(dbCalls).toBe(0); // cipher is built before the pool
+    // The logger existed, so exactly one typed, non-secret line is logged.
+    expect(calls.length).toBe(1);
+    expect(JSON.stringify(calls)).toContain('verify_connection_decrypt_error');
+    expect(JSON.stringify(calls)).not.toContain(SECRET);
+  });
+
+  it('closes the pool and emits a sanitized FAIL when verifyConnection fails — no DB host leaks', async () => {
+    const SECRET_HOST = 'secret-neon-host.example';
+    const unreachable = new RetryableError(
+      'database_unreachable',
+      `Cannot connect to PostgreSQL at ${SECRET_HOST}:5432/secretdb`,
+      { details: { host: SECRET_HOST } },
+    );
+    const { handle, closeCalls } = fakeHandle({ verify: async () => { throw unreachable; } });
+    const { logger, calls } = spyLogger();
+    const deps: VerifyCliDeps = {
+      loadEnv: () => ({} as Env),
+      createLogger: () => logger,
+      createCipher: () => cipherWithActive(),
+      createDatabase: () => handle,
+    };
+    const out = captureSink();
+    const err = captureSink();
+    const code = await runCli({ argv: [UUID_A, UUID_B], stdout: out.stream, stderr: err.stream }, deps);
+    expect(code).toBe(1);
+    expect(out.text()).toContain('RESULT: FAIL');
+    expect(out.text() + err.text()).not.toContain(SECRET_HOST);
+    expect(closeCalls()).toBe(1); // cleanup ran even though the body failed
+    // Only the typed code is logged, never the host-bearing message.
+    expect(JSON.stringify(calls)).toContain('database_unreachable');
+    expect(JSON.stringify(calls)).not.toContain(SECRET_HOST);
+  });
+
+  it('returns a sanitized FAIL when database construction throws — logs only a typed code, closes nothing', async () => {
+    const SECRET = 'SECRET-pool-config-detail';
+    const { logger, calls } = spyLogger();
+    const deps: VerifyCliDeps = {
+      loadEnv: () => ({} as Env),
+      createLogger: () => logger,
+      createCipher: () => cipherWithActive(),
+      createDatabase: () => { throw new Error(SECRET); },
+    };
+    const out = captureSink();
+    const err = captureSink();
+    const code = await runCli({ argv: [UUID_A, UUID_B], stdout: out.stream, stderr: err.stream }, deps);
+    expect(code).toBe(1);
+    expect(out.text()).toContain('RESULT: FAIL');
+    expect(out.text() + err.text()).not.toContain(SECRET);
+    expect(calls.length).toBe(1); // logger existed → exactly one typed line
+    expect(JSON.stringify(calls)).not.toContain(SECRET);
+  });
+
+  it('returns a sanitized FAIL and closes the pool when the verify fails after connecting', async () => {
+    // verifyConnection succeeds, so the body reaches runVerifyDecrypt → runRotate →
+    // repository.listRotatable, which throws on the fake db (the realistic "DB drops
+    // mid-run" case). The failure must stay sanitized and the pool must still close.
+    const { handle, closeCalls } = fakeHandle({ verify: async () => {} });
+    const { logger } = spyLogger();
+    const deps: VerifyCliDeps = {
+      loadEnv: () => ({} as Env),
+      createLogger: () => logger,
+      createCipher: () => cipherWithActive(),
+      createDatabase: () => handle,
+    };
+    const out = captureSink();
+    const err = captureSink();
+    const code = await runCli({ argv: [UUID_A, UUID_B], stdout: out.stream, stderr: err.stream }, deps);
+    expect(code).toBe(1);
+    expect(closeCalls()).toBe(1); // cleanup ran after a post-connect failure
+    expect(out.text()).toContain('RESULT: FAIL');
+    expect(err.text()).toBe(''); // no stack trace / raw error on stderr
+  });
+
+  it('swallows a cleanup failure: a throwing close() changes neither the exit code nor the output', async () => {
+    const SECRET_HOST = 'secret-neon-host.example';
+    const { handle, closeCalls } = fakeHandle({
+      verify: async () => { throw new RetryableError('database_unreachable', `at ${SECRET_HOST}`, {}); },
+      close: async () => { throw new Error(`close failed talking to ${SECRET_HOST}`); },
+    });
+    const { logger } = spyLogger();
+    const deps: VerifyCliDeps = {
+      loadEnv: () => ({} as Env),
+      createLogger: () => logger,
+      createCipher: () => cipherWithActive(),
+      createDatabase: () => handle,
+    };
+    const out = captureSink();
+    const err = captureSink();
+    const code = await runCli({ argv: [UUID_A, UUID_B], stdout: out.stream, stderr: err.stream }, deps);
+    expect(code).toBe(1);
+    expect(closeCalls()).toBe(1);
+    expect(out.text()).toContain('RESULT: FAIL');
+    expect(out.text() + err.text()).not.toContain(SECRET_HOST);
   });
 });
 
