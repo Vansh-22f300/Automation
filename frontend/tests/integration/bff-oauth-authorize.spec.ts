@@ -15,6 +15,10 @@ import { startUpstreamMock, type UpstreamMock } from './helpers/upstream-mock';
 const TEST_API_KEY = 'test-server-key-do-not-leak-github-authorize';
 const TRUSTED_ORIGIN = 'https://app.trusted.example';
 const EVIL_ORIGIN = 'https://evil.example';
+// Opaque to the BFF: it relays whatever Fastify returns and never validates the
+// URL (that is the client/page's job). Deliberately NOT guard-valid (no
+// redirect_uri/code_challenge) so a future edit can't "fix" it into implying the
+// BFF validates.
 const AUTHORIZE_URL =
   'https://github.com/login/oauth/authorize?client_id=abc&state=xyz&scope=read%3Auser';
 const ROOT_DIR = resolvePath(process.cwd());

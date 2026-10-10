@@ -1,13 +1,26 @@
 import type { ApiErrorResponse } from "~/types/api";
 import { ApiClientError } from "./api-client";
 
+/** The exact GitHub authorize endpoint path the backend builds. */
+const GITHUB_AUTHORIZE_PATHNAME = "/login/oauth/authorize";
+
 /**
- * True only for a GitHub OAuth *authorize* URL served over https on
- * `https://github.com`. The host is matched EXACTLY (not a suffix), so neither
- * `github.com.evil.test` nor `evilgithub.com` can pass, and a non-https scheme
- * is rejected. Pure predicate — the page calls it immediately before any
- * `window.location` navigation, so an unexpected or hostile value can never
- * redirect the browser off to another origin (no open redirect).
+ * Authorization-request params the backend always sets (see `buildAuthorizationUrl`
+ * in `src/oauth/provider-config.ts`); every one is required here.
+ */
+const REQUIRED_AUTHORIZE_PARAMS = ["client_id", "state", "redirect_uri", "code_challenge"] as const;
+
+/**
+ * True only for the exact GitHub OAuth *authorize* endpoint the backend is
+ * configured to build — `https://github.com/login/oauth/authorize` (see
+ * `src/oauth/providers/github.ts` + `buildAuthorizationUrl` in
+ * `src/oauth/provider-config.ts`). Beyond scheme + host it also requires: no URL
+ * credentials (`user:pass@`), no fragment, the default port only, the exact
+ * `/login/oauth/authorize` path, and the params the backend always sets —
+ * `client_id`, `state`, `redirect_uri`, `code_challenge` — each present and
+ * non-empty. Pure predicate — the page calls it immediately before any
+ * `window.location` navigation, so a hostile or malformed value can never redirect
+ * the browser off to another origin or to a non-authorize GitHub path.
  */
 export function isTrustedGithubAuthorizeUrl(value: unknown): value is string {
   if (typeof value !== "string" || value === "") return false;
@@ -17,7 +30,17 @@ export function isTrustedGithubAuthorizeUrl(value: unknown): value is string {
   } catch {
     return false;
   }
-  return url.protocol === "https:" && url.hostname === "github.com";
+  if (url.protocol !== "https:") return false;
+  if (url.username !== "" || url.password !== "") return false; // no embedded credentials
+  if (url.hostname !== "github.com") return false;
+  if (url.port !== "") return false; // default (443) only — reject nonstandard ports
+  if (url.hash !== "") return false; // no fragment
+  if (url.pathname !== GITHUB_AUTHORIZE_PATHNAME) return false; // exact authorize endpoint
+  for (const key of REQUIRED_AUTHORIZE_PARAMS) {
+    const param = url.searchParams.get(key);
+    if (param === null || param === "") return false;
+  }
+  return true;
 }
 
 interface OAuthClientOptions {

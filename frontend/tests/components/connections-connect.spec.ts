@@ -24,9 +24,13 @@ const ISO = "2026-01-01T00:00:00.000Z";
 function conn(partial: Partial<Conn> & { provider: string; name: string }): Conn {
   return { id: `c-${partial.provider}-0000000000`, status: "active", metadata: {}, createdAt: ISO, updatedAt: ISO, lastUsedAt: ISO, ...partial };
 }
-function listResponse(items: Conn[]) {
-  return { items, page: { limit: 20, nextCursor: null } };
+function listResponse(items: Conn[], nextCursor: string | null = null) {
+  return { items, page: { limit: 20, nextCursor } };
 }
+
+// A fully-formed GitHub authorize URL that passes the tightened trusted-URL guard.
+const VALID_AUTHORIZE_URL =
+  "https://github.com/login/oauth/authorize?response_type=code&client_id=Iv1.abc&redirect_uri=https%3A%2F%2Fapp.example%2Foauth%2Fgithub%2Fcallback&state=state123&code_challenge=chal123&code_challenge_method=S256&scope=read%3Auser";
 
 let listConnections: ReturnType<typeof vi.fn>;
 let beginGithubAuthorization: ReturnType<typeof vi.fn>;
@@ -36,7 +40,7 @@ let assign: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   listConnections = vi.fn(async () => listResponse([]));
-  beginGithubAuthorization = vi.fn(async () => ({ authorizationUrl: "https://github.com/login/oauth/authorize?client_id=x" }));
+  beginGithubAuthorization = vi.fn(async () => ({ authorizationUrl: VALID_AUTHORIZE_URL }));
   routeQuery = {};
   routerReplace = vi.fn();
   assign = vi.spyOn(window.location, "assign").mockImplementation(() => undefined) as unknown as ReturnType<typeof vi.fn>;
@@ -85,7 +89,7 @@ describe("Connect GitHub button", () => {
     await button.trigger("click");
     await flushPromises();
     expect(beginGithubAuthorization).toHaveBeenCalledTimes(1);
-    expect(assign).toHaveBeenCalledWith("https://github.com/login/oauth/authorize?client_id=x");
+    expect(assign).toHaveBeenCalledWith(VALID_AUTHORIZE_URL);
   });
 
   it("ignores duplicate clicks while an initiation is pending", async () => {
@@ -138,5 +142,93 @@ describe("Connections registry", () => {
     expect(wrapper.text().toLowerCase()).toContain("slack");
     expect(wrapper.find('[data-test="connect-github"]').exists()).toBe(true);
     expect(wrapper.text()).not.toContain("GitHub connected");
+  });
+
+  it("detects a GitHub connection on a later page via the bounded status probe", async () => {
+    // Visible page (limit 20) shows no GitHub; the authoritative probe (limit 100) finds it.
+    listConnections = vi.fn(async (limit?: number) =>
+      limit === 100
+        ? listResponse([conn({ provider: "github", name: "octocat" })])
+        : listResponse([conn({ provider: "slack", name: "prod" })], "next-cursor"),
+    );
+    const wrapper = await mountReady();
+    expect(listConnections).toHaveBeenCalledWith(100); // the authoritative probe call shape
+    expect(wrapper.text()).toContain("GitHub connected"); // from the probe, not the visible page
+    expect(wrapper.text()).toContain("prod"); // the visible page still shows Slack
+    expect(wrapper.find('[data-test="connect-github"]').exists()).toBe(true);
+  });
+
+  it("does not falsely report a missing GitHub connection on callback return with a cursor", async () => {
+    routeQuery = { connected: "github", cursor: "page2" };
+    listConnections = vi.fn(async (limit?: number) =>
+      limit === 100
+        ? listResponse([conn({ provider: "github", name: "octocat" })])
+        : listResponse([conn({ provider: "slack", name: "prod" })], "next-cursor"),
+    );
+    const wrapper = await mountReady();
+    expect(listConnections).toHaveBeenCalledWith(100); // probe ran despite the pagination cursor
+    expect(routerReplace).toHaveBeenCalled(); // one-shot ?connected marker stripped
+    expect(wrapper.find(".connect-banner--ok").exists()).toBe(true); // confirmed connected
+    expect(wrapper.text()).toContain("GitHub connected");
+    expect(wrapper.find('[data-test="oauth-unconfirmed"]').exists()).toBe(false); // not a false "can't confirm"
+    expect(wrapper.text()).not.toContain("Unable to confirm");
+  });
+
+  it("reports a neutral 'unable to confirm' (never missing) when the probe window is incomplete on callback return", async () => {
+    routeQuery = { connected: "github" };
+    listConnections = vi.fn(async (limit?: number) =>
+      limit === 100
+        ? listResponse([conn({ provider: "slack", name: "prod" })], "more-cursor")
+        : listResponse([conn({ provider: "slack", name: "prod" })], "next-cursor"),
+    );
+    const wrapper = await mountReady();
+    expect(wrapper.find('[data-test="oauth-unconfirmed"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="retry-github-status"]').exists()).toBe(true);
+    expect(wrapper.find(".connect-banner--ok").exists()).toBe(false);
+    expect(wrapper.text()).toContain("Unable to confirm");
+    expect(wrapper.text()).not.toContain("GitHub connected");
+  });
+
+  it("reports 'unable to confirm' on probe failure and recovers via Retry", async () => {
+    routeQuery = { connected: "github" };
+    let probeCalls = 0;
+    listConnections = vi.fn(async (limit?: number) => {
+      if (limit === 100) {
+        probeCalls += 1;
+        if (probeCalls === 1) throw new ApiClientError(0, "network down");
+        return listResponse([conn({ provider: "github", name: "octocat" })]);
+      }
+      return listResponse([conn({ provider: "slack", name: "prod" })], "next-cursor");
+    });
+    const wrapper = await mountReady();
+    expect(wrapper.find('[data-test="oauth-unconfirmed"]').exists()).toBe(true);
+    await wrapper.get('[data-test="retry-github-status"]').trigger("click");
+    await flushPromises();
+    await nextTick();
+    expect(wrapper.find('[data-test="oauth-unconfirmed"]').exists()).toBe(false);
+    expect(wrapper.find(".connect-banner--ok").exists()).toBe(true);
+    expect(wrapper.text()).toContain("GitHub connected");
+  });
+
+  it("waits for the GitHub-status probe to settle before confirming the callback return", async () => {
+    routeQuery = { connected: "github" };
+    let resolveProbe!: (v: ReturnType<typeof listResponse>) => void;
+    const probePromise = new Promise<ReturnType<typeof listResponse>>((r) => {
+      resolveProbe = r;
+    });
+    listConnections = vi.fn(async (limit?: number) => {
+      if (limit === 100) return probePromise;
+      return listResponse([conn({ provider: "slack", name: "prod" })], "next-cursor");
+    });
+    const wrapper = mount(Connections);
+    await flushPromises(); // the visible list settles; the probe is still pending
+    await nextTick();
+    expect(wrapper.find(".connect-banner--ok").exists()).toBe(false);
+    expect(wrapper.find('[data-test="oauth-unconfirmed"]').exists()).toBe(false);
+    resolveProbe(listResponse([conn({ provider: "github", name: "octocat" })]));
+    await flushPromises();
+    await nextTick();
+    expect(wrapper.find(".connect-banner--ok").exists()).toBe(true);
+    expect(wrapper.text()).toContain("GitHub connected");
   });
 });

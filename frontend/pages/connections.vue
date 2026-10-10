@@ -21,9 +21,46 @@ const items = computed(() => data.value?.items ?? []);
 const hasPrevious = computed(() => previousCursors.value.length > 0);
 const hasNext = computed(() => (data.value?.page.nextCursor ?? null) !== null);
 const activeCount = computed(() => items.value.filter(c => c.status === 'active').length);
-const hasActiveGithub = computed(() =>
+
+// GitHub status must NOT be inferred from the visible 20-item page alone — a
+// connection on another page would read as "absent". A single bounded,
+// tenant-scoped, metadata-only probe (the list API's max page size) is the
+// authoritative source. It is TRI-STATE so an INCOMPLETE result is never reported
+// as "not connected":
+//   - 'connected' — an active GitHub connection was seen;
+//   - 'absent'    — the probe saw EVERY connection (no next page) and none is GitHub;
+//   - 'unknown'   — a next page exists (GitHub may be beyond the window) or the
+//                   probe failed; we cannot conclude either way.
+const GITHUB_STATUS_PROBE_LIMIT = 100;
+type GithubProbeStatus = 'unknown' | 'connected' | 'absent';
+const pageHasActiveGithub = computed(() =>
   items.value.some(c => c.provider === 'github' && c.status === 'active'),
 );
+const probedGithubStatus = ref<GithubProbeStatus>('unknown');
+// Only a positive signal asserts "connected"; 'absent'/'unknown' never render a
+// false "connected", and 'unknown' never renders a false "disconnected".
+const hasActiveGithub = computed(
+  () => pageHasActiveGithub.value || probedGithubStatus.value === 'connected',
+);
+
+async function probeGithubStatus(): Promise<void> {
+  try {
+    const probe = await api.listConnections(GITHUB_STATUS_PROBE_LIMIT);
+    if (probe.items.some(c => c.provider === 'github' && c.status === 'active')) {
+      probedGithubStatus.value = 'connected';
+    } else if ((probe.page.nextCursor ?? null) === null) {
+      // Saw every connection; none is an active GitHub → definitively absent.
+      probedGithubStatus.value = 'absent';
+    } else {
+      // A next page exists: GitHub could be beyond this bounded window. Do NOT
+      // conclude "absent" — represent the incomplete result as unknown.
+      probedGithubStatus.value = 'unknown';
+    }
+  } catch {
+    // Probe failed — remain 'unknown'; never report "not connected" from a failure.
+    probedGithubStatus.value = 'unknown';
+  }
+}
 
 // --- GitHub OAuth connect ---------------------------------------------------
 // A click POSTs to the dedicated same-origin BFF route, which forwards the
@@ -33,7 +70,8 @@ const hasActiveGithub = computed(() =>
 // of success — the registry metadata below is the source of truth.
 const connecting = ref(false);
 const connectError = ref<string | undefined>();
-const oauthReturn = ref<'idle' | 'connected' | 'pending'>('idle');
+const oauthReturn = ref<'idle' | 'connected' | 'unconfirmed'>('idle');
+const confirmingGithub = ref(false);
 
 async function connectGithub(): Promise<void> {
   if (connecting.value) return; // at most one pending initiation
@@ -96,20 +134,40 @@ function connectErrorMessage(caught: unknown): string {
   return 'We could not start the GitHub connection. Please try again.';
 }
 
-// Returning from the GitHub callback: the backend redirect lands here with a
-// one-shot `?connected=github` marker. Strip it (so a reload won't replay the
-// banner) and, once the initial load settles, reflect what the REFRESHED
-// metadata actually shows — a confirmed connection or a "not showing yet" nudge.
-onMounted(() => {
+/**
+ * Resolve the callback-return banner from the SETTLED, page-independent probe:
+ * 'connected' only on a positive signal, otherwise 'unconfirmed' (a neutral,
+ * retryable "can't confirm yet" — never a false "not connected"). Shared by the
+ * initial mount and the Retry action.
+ */
+function resolveOauthReturn(): void {
+  oauthReturn.value = hasActiveGithub.value ? 'connected' : 'unconfirmed';
+}
+
+async function retryGithubStatus(): Promise<void> {
+  if (confirmingGithub.value) return;
+  confirmingGithub.value = true;
+  try {
+    await Promise.all([refresh(), probeGithubStatus()]);
+    resolveOauthReturn();
+  } finally {
+    confirmingGithub.value = false;
+  }
+}
+
+// On every load, resolve GitHub status authoritatively (page-independent) so the
+// connected indicator is correct even when viewing a later page. On a callback
+// return (`?connected=github`), WAIT for the separate status probe to settle, strip
+// the one-shot marker, then report from that refreshed status — never an assumed
+// success, and never a false "missing" from pagination, an incomplete window, or a
+// failed probe (those surface as a neutral, retryable "unable to confirm").
+onMounted(async () => {
+  await probeGithubStatus();
   if (route.query.connected !== 'github') return;
   const cleaned = { ...route.query };
   delete cleaned.connected;
   void router.replace({ query: cleaned });
-  const stop = watch(pending, (isPending) => {
-    if (isPending) return;
-    oauthReturn.value = hasActiveGithub.value ? 'connected' : 'pending';
-    stop();
-  });
+  resolveOauthReturn();
 });
 </script>
 
@@ -205,12 +263,23 @@ onMounted(() => {
           </div>
           <button class="connect-banner__dismiss" type="button" aria-label="Dismiss" @click="oauthReturn = 'idle'"><X :size="15" aria-hidden="true" /></button>
         </div>
-        <div v-else-if="oauthReturn === 'pending'" class="connect-banner connect-banner--warn" role="status">
-          <AlertCircle :size="16" aria-hidden="true" style="color:#ffc46e; flex:0 0 auto; margin-top:1px" />
+        <div v-else-if="oauthReturn === 'unconfirmed'" class="connect-banner connect-banner--info" role="status" data-test="oauth-unconfirmed">
+          <AlertCircle :size="16" aria-hidden="true" style="color:var(--landing-lilac); flex:0 0 auto; margin-top:1px" />
           <div class="connect-banner__copy">
-            <strong>Finishing up</strong>
-            <span>We returned from GitHub but don’t see the connection yet. Use Refresh in a moment.</span>
+            <strong>Unable to confirm yet</strong>
+            <span>We couldn’t confirm your GitHub connection — it may still be finishing. Retry in a moment.</span>
           </div>
+          <button
+            class="button button-secondary"
+            type="button"
+            data-test="retry-github-status"
+            :disabled="confirmingGithub"
+            :aria-busy="confirmingGithub"
+            style="border-radius:999px; margin-left:auto; flex:0 0 auto"
+            @click="retryGithubStatus"
+          >
+            {{ confirmingGithub ? 'Checking…' : 'Retry' }}
+          </button>
           <button class="connect-banner__dismiss" type="button" aria-label="Dismiss" @click="oauthReturn = 'idle'"><X :size="15" aria-hidden="true" /></button>
         </div>
         <div v-if="connectError" class="connect-banner connect-banner--error" role="alert">
@@ -300,6 +369,6 @@ onMounted(() => {
 .connect-banner__dismiss:hover { color:var(--landing-mist); background:rgba(255,255,255,0.06); }
 .connect-banner--ok { border-color:rgba(139,245,201,0.28); background:rgba(139,245,201,0.08); }
 .connect-banner--ok .connect-banner__copy span { color:var(--landing-mint); }
-.connect-banner--warn { border-color:rgba(255,196,110,0.26); background:rgba(255,196,110,0.08); }
+.connect-banner--info { border-color:rgba(183,164,251,0.26); background:rgba(183,164,251,0.08); }
 .connect-banner--error { border-color:rgba(255,107,107,0.26); background:rgba(255,107,107,0.08); }
 </style>
