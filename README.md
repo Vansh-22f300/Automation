@@ -23,9 +23,10 @@ an LLM, calling external tools, and keeping a durable audit trail of every step.
 > Claude**: an `llm` step may declare tools, the model can request them across a
 > bounded, per-round-metered loop, and the platform executes each one through the
 > tool executor with the trusted connection bound entirely on the platform side.
-> **OAuth is not implemented** (the Slack app is installed manually in development
-> and its bot token stored as an encrypted connection), there is still only one
-> connector, and no autonomous multi-step agent loop beyond the bounded per-step
+> **GitHub OAuth onboarding now exists** — a signed-in user connects a GitHub account
+> from `/connections`, disabled until its credentials are configured; Slack is still
+> installed manually with its bot token stored as an encrypted connection. There is no
+> autonomous multi-step agent loop beyond the bounded per-step
 > tool rounds. **Durable business retries with equal-jitter backoff now exist**
 > (Step 11), though external side effects remain **at-least-once** — a crash or
 > retry after a tool has already acted can repeat that action.
@@ -662,6 +663,8 @@ FATAL: configuration error — refusing to start.
 | `ANTHROPIC_BASE_URL`         | _(unset)_       | Optional. Points the provider at an Anthropic-compatible gateway instead of `https://api.anthropic.com`. Give the **origin only** (optionally with a base path); do **not** include `/v1` — the SDK appends `/v1/messages` itself, so a trailing `/v1` would produce `/v1/v1/messages` (rejected at startup). **Requires** a credential (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`) when set; in `production` must be `https://` (http allowed only for local dev). |
 | `ANTHROPIC_MODEL`            | `claude-opus-5` | The model the provider defaults to when a request names none. A deployment decision; any request may override it. Against a gateway, this must be a model id **that gateway accepts** — the default is not guaranteed to be valid there.                                                                      |
 | `CREDENTIAL_ENCRYPTION_KEYS` | _(unset)_       | **Secret. Satisfies the boot requirement above** (setting this alone is sufficient; setting neither it nor `CREDENTIAL_ENCRYPTION_KEY` refuses startup). Multi-key keyring for credential encryption — comma-separated `<kid>:<base64key>` pairs. The **first** entry is the v2 active encrypt key; every subsequent entry is decrypt-only. Kid format: `^[a-zA-Z0-9._-]{1,64}$`; key bytes: 32 (same shape rule as `CREDENTIAL_ENCRYPTION_KEY`). The literal kid `legacy-v1` is reserved (always decrypt-only; can never be the first entry). When both this var and `CREDENTIAL_ENCRYPTION_KEY` are set, the keyring is the single source of truth and the legacy var is ignored; a v1 writer exists only when the keyring carries a `legacy-v1` entry (a v1 write capability always has a matching v1 read capability). Required for `pnpm connections rotate` — the CLI fails fast with typed `active_key_missing` when no active entry is configured. Never logged. |
+| `GITHUB_CLIENT_ID`           | _(unset)_       | **Optional; enables the GitHub OAuth connector.** GitHub OAuth App client id — not a secret (it rides in the browser authorize URL) but deployment-specific. **Both-or-neither** with `GITHUB_CLIENT_SECRET` (env Invariant 8). Unset ⇒ the GitHub provider is not registered and every GitHub OAuth lookup fails closed (`404`). Needed on **both** the API and the worker. See [docs/connectors/github.md](docs/connectors/github.md). |
+| `GITHUB_CLIENT_SECRET`       | _(unset)_       | **Optional secret; both-or-neither with `GITHUB_CLIENT_ID`.** GitHub OAuth App client secret — server-only, never logged or returned, never exposed to the Nuxt public runtime. Needed on the **API** (authorize/callback/revoke) and the **worker** (token refresh). Unset keeps GitHub disabled. |
 
 Two PostgreSQL **session guards** are always active, without any extra env var: `statement_timeout = 30s` (raised to `300s` only for the migration runner, `60s` in integration tests) caps any single query, and `idle_in_transaction_session_timeout = 30s` — per PostgreSQL docs, an idle-in-transaction session is terminated with `25P03` — limits how long a `BEGIN`…`COMMIT` may sit idle, reducing the window where a stuck `await` could hold row locks or bloat `pg_stat_activity`. Legitimate transactions are the short `beginStep`/`settleStep` and `claim`/`requeueExpired` bookkeeping the engine already runs outside handlers (the handler itself executes with no DB transaction held, per the two-transaction model), so `30s` is generous for normal work but tight enough to reclaim a leaked transaction. The values are centralized in [`src/db/client.ts`](src/db/client.ts) as `DEFAULT_*_TIMEOUT_MS` and applied in two layers: retained as `pg` startup parameters for direct/vanilla PostgreSQL where they are honored, and additionally via explicit session initialization (`SET`) on each new physical connection (`onConnect` hook, awaited before the connection is usable — `options=-c` is not used because Neon pooled endpoints reject it as unsupported). The integration test verifies the effective `SHOW` values against the configured `TEST_DATABASE_URL` (idle `30s`, `statement_timeout` `>0`, preserved inside `BEGIN`/`COMMIT` and after reacquire) without sleeping 30s to trigger the `25P03` abort.
 
@@ -1518,6 +1521,32 @@ delayed or dropped — so a cold start can still occur. See
 alternative. The paid [`render.yaml`](render.yaml) blueprint above is always-on
 and has no sleep behavior.
 
+## Connecting GitHub (OAuth)
+
+GitHub is the first provider a signed-in user can connect from the UI — no CLI, no
+manually pasted token.
+
+1. Sign in and open **Connections** (`/connections`).
+2. Click **Connect GitHub**. The page POSTs to the dedicated same-origin BFF route
+   `POST /backend/oauth/github/authorize`, which forwards the HttpOnly session (never the
+   machine API key) to Fastify `POST /v1/oauth/github/authorize` and returns the GitHub
+   authorization URL. The page verifies it is an `https://github.com` URL before navigating.
+3. Authorize on GitHub. GitHub redirects to `${APP_ORIGIN}/oauth/github/callback` — the
+   existing Nuxt BFF callback — which forwards to the API; the API stores an encrypted,
+   tenant-scoped connection and redirects you back to `/connections`.
+4. The page confirms the result from the **refreshed connection metadata**, never from the
+   mere fact that the authorize page opened. The token is encrypted at rest and never shown.
+
+**Disabled by default.** With `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` unset the GitHub
+provider is not registered: the authorize lookup fails closed (`404`) and the UI shows a
+"not enabled yet" message instead of starting a flow that cannot complete. Configure the
+pair **together** on the Render API service and the GitHub Actions `worker-free`
+environment **only when activation is explicitly authorized**; the planned production
+callback is `https://ai-worke.vercel.app/oauth/github/callback`. Prerequisites, scopes and
+token-refresh behavior are in [docs/connectors/github.md](docs/connectors/github.md); the
+ordered rollout is in
+[docs/deploy-free.md](docs/deploy-free.md#enabling-v2-credential-encryption-and-github-oauth).
+
 ## Current status
 
 ### Implemented (Steps 1–12; Step 13 hardening in progress)
@@ -1795,7 +1824,7 @@ Nothing below exists in any form. It is sequenced, not forgotten.
 
 | Area                                                                                                                                    | Arrives in                                               |
 | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Additional connectors (Gmail, GitHub, …), OAuth onboarding                                                                              | later steps / not scheduled                              |
+| Further connectors (Gmail, …) beyond Slack and GitHub                                                                                   | later steps / not scheduled                              |
 | Run inspection endpoints and log redaction                                                                                              | Step 12                                                  |
 | Distributed rate limiting, PostgreSQL RLS, CI                                                                                           | Step 13                                                  |
 | Tool-execution idempotency ledger (exactly-once external effects)                                                                       | deferred — external effects are at-least-once until then |
@@ -1808,9 +1837,11 @@ retries with equal-jitter backoff** (Step 11) now exist: the `connections` table
 credential encryption, the tool registry and executor, a `send_slack_message` tool
 over `chat.postMessage`, an `llm` step that can offer those tools to the model and
 execute the ones it requests, and a retry/backoff layer that defers retryable
-failures durably on the job row. What does **not** exist yet: any other provider,
-OAuth onboarding, a tool-execution idempotency ledger (so external effects are
-**at-least-once** — a retry after a tool acted can repeat it), and any autonomous
+failures durably on the job row. GitHub OAuth onboarding has since been added — a
+signed-in user connects GitHub from `/connections`, disabled until configured. What
+does **not** exist yet: further providers beyond Slack and GitHub, a tool-execution
+idempotency ledger (so external effects are **at-least-once** — a retry after a tool
+acted can repeat it), and any autonomous
 agent loop beyond a single step's bounded tool rounds. A generic
 `audit_log` table is deliberately still absent — the structured, metadata-only
 execution record and logging stand in until the code that proves an audit schema
@@ -1820,6 +1851,6 @@ necessary arrives.
 production hardening (Step 13). Each step is implemented, verified and
 paused for review before the next begins.
 
-Explicitly out of scope for the MVP entirely: OAuth flows, billing, a visual
+Explicitly out of scope for the MVP entirely: billing, a visual
 workflow builder, Redis/Kafka, Kubernetes, microservices, vector stores or agent
 memory, and any model training or fine-tuning.

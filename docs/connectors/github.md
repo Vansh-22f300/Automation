@@ -57,13 +57,39 @@ The broad `repo` scope (private repositories) is deliberately **not** requested.
    redirects you to GitHub; GitHub returns to the Nuxt BFF callback, which forwards to
    `GET /oauth/github/callback`.
 
+## Connecting from the app
+
+A signed-in user connects GitHub from **Connections** (`/connections`) — no CLI, no
+pasted token:
+
+1. Open **Connections** and click **Connect GitHub**.
+2. The page POSTs to the authenticated same-origin BFF route
+   `POST /backend/oauth/github/authorize`, which forwards the HttpOnly session (never a
+   machine API key) to Fastify `POST /v1/oauth/github/authorize` and returns the provider
+   authorization URL. The page verifies it is an `https://github.com` URL before navigating.
+3. The browser goes to GitHub to authorize, then returns to
+   `${APP_ORIGIN}/oauth/github/callback` (the existing Nuxt BFF callback); the API stores
+   the encrypted connection and you land back on `/connections`.
+4. The page confirms the result from the **refreshed connection metadata** — it never
+   claims success merely because the authorize page opened.
+
+When `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` are unset the provider is disabled: the
+authorize lookup fails closed (`404`) and the UI shows a "not enabled yet" message rather
+than starting a flow that cannot complete.
+
 ## Production
 
 - Register the callback URL as `https://<your-domain>/oauth/github/callback` and set
   `APP_ORIGIN=https://<your-domain>` (production requires https + a non-loopback host).
+  The planned production frontend is **`https://ai-worke.vercel.app`**, so its callback
+  URL is **`https://ai-worke.vercel.app/oauth/github/callback`** and
+  `APP_ORIGIN=https://ai-worke.vercel.app`.
 - Set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` on **both** the API and the worker
-  services. Set `CREDENTIAL_ENCRYPTION_KEY` (or `CREDENTIAL_ENCRYPTION_KEYS`) so tokens
-  can be encrypted at rest.
+  services — **together, and only when activation is explicitly authorized** (they are
+  currently unset, so the provider is not registered). On the free-mode worker,
+  `GITHUB_CLIENT_ID` is a `worker-free` Actions **variable** and `GITHUB_CLIENT_SECRET`
+  a `worker-free` **secret**. Set `CREDENTIAL_ENCRYPTION_KEY` (or
+  `CREDENTIAL_ENCRYPTION_KEYS`) so tokens can be encrypted at rest.
 
 ## Credential encryption at rest (v1 vs v2 keyring)
 

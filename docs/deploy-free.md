@@ -359,6 +359,9 @@ G. **Configure `GITHUB_CLIENT_ID` + `GITHUB_CLIENT_SECRET` together** on API and
    worker, only when ready to activate GitHub OAuth. Setting one fails fast.
 H. **Keep `APP_ORIGIN` on the public Vercel frontend** (API). Do not change auth link
    origins — the GitHub callback is reached via the BFF at `${APP_ORIGIN}/oauth/github/callback`.
+   For the planned production frontend `https://ai-worke.vercel.app`, that is
+   `https://ai-worke.vercel.app/oauth/github/callback` — the OAuth App's callback URL
+   must match it byte-for-byte.
 I. **Run the first real GitHub OAuth test only after** the connection flow and the
    GitHub OAuth App (with that exact callback URL) are configured.
 
