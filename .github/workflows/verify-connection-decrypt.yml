@@ -1,0 +1,109 @@
+# Manual-only credential-decryption verification — a READ-ONLY check that one
+# connection's stored credential still decrypts under the currently-configured
+# keyring. Used during the v2-keyring rollout to prove the existing (legacy v1)
+# connection decrypts with the new CREDENTIAL_ENCRYPTION_KEYS BEFORE enabling GitHub
+# OAuth.
+#
+# Safety: this workflow runs ONLY on manual dispatch, reuses the rotation dry-run
+# decrypt path (so it makes NO database writes and rotates nothing), performs NO
+# Slack/GitHub API request, and emits only a sanitized PASS/FAIL line — never the
+# credential, keyring, DATABASE_URL, encrypted envelope, connection name, or raw
+# exception details. It is a SEPARATE workflow from worker-free.yml and does not
+# touch the worker schedule or concurrency.
+
+name: verify connection decrypt (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        description: "Tenant UUID. Visible in run metadata — NOT a secret."
+        required: true
+        type: string
+      connection_id:
+        description: "Connection UUID to verify. Visible in run metadata — NOT a secret."
+        required: true
+        type: string
+
+# Isolated from the scheduled worker: its own concurrency group, and no schedule
+# trigger, so this can never affect worker-free.yml's cadence or overlap behavior.
+concurrency:
+  group: verify-connection-decrypt
+  cancel-in-progress: false
+
+# Least privilege: only read the checkout.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify connection decrypt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Reuse the SAME environment the worker uses, so DATABASE_URL /
+    # CREDENTIAL_ENCRYPTION_KEY / CREDENTIAL_ENCRYPTION_KEYS are the identical values.
+    environment: worker-free
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # The whole point of this check is the NEW keyring, so CREDENTIAL_ENCRYPTION_KEYS
+      # is required here. Forward it into $GITHUB_ENV only when set (same absent-vs-""
+      # discipline as the worker); if it is unset there is nothing to verify, so fail
+      # fast with a non-secret diagnostic. The secret value goes only into $GITHUB_ENV
+      # via the masked multiline form — never stdout — and there is no `set -x`.
+      - name: Resolve keyring configuration
+        env:
+          OPT_CREDENTIAL_ENCRYPTION_KEYS: ${{ secrets.CREDENTIAL_ENCRYPTION_KEYS }}
+        run: |
+          if [ -z "${OPT_CREDENTIAL_ENCRYPTION_KEYS}" ]; then
+            echo "::error::CREDENTIAL_ENCRYPTION_KEYS is not configured for the worker-free environment; there is no new keyring to verify."
+            exit 1
+          fi
+          {
+            echo "CREDENTIAL_ENCRYPTION_KEYS<<__VERIFY_ENV_EOF__"
+            echo "${OPT_CREDENTIAL_ENCRYPTION_KEYS}"
+            echo "__VERIFY_ENV_EOF__"
+          } >> "${GITHUB_ENV}"
+          echo "keyring: CREDENTIAL_ENCRYPTION_KEYS provided"
+
+      # Read-only decrypt check. The two manual inputs are bound to env and NEVER
+      # interpolated into the shell (avoids `${{ }}` script injection), validated as
+      # UUIDs, then passed as argv to the compiled CLI. LOG_LEVEL=silent so the only
+      # output is the single RESULT line. Both key env vars mirror the worker exactly;
+      # the CLI reuses the rotation dry-run, so it makes NO DB writes, performs NO
+      # Slack/GitHub request, and rotates nothing.
+      - name: Verify the connection decrypts under the current keyring
+        env:
+          NODE_ENV: production
+          HOST: 0.0.0.0
+          APP_ORIGIN: https://automation-7d1c.onrender.com
+          LOG_LEVEL: silent
+          DATABASE_POOL_MAX: "5"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONNECTION_ID: ${{ inputs.connection_id }}
+        run: |
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          if ! [[ "${TENANT_ID}" =~ ${uuid} ]] || ! [[ "${CONNECTION_ID}" =~ ${uuid} ]]; then
+            echo "::error::tenant_id and connection_id must both be UUIDs"
+            exit 1
+          fi
+          node dist/cli/verify-connection-decrypt.js "${TENANT_ID}" "${CONNECTION_ID}"
