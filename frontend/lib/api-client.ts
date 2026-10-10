@@ -23,11 +23,14 @@ interface ApiClientOptions {
 /**
  * Browser-side Fastify API client.
  *
- * The browser never talks to Fastify directly: it talks to the same-origin
- * Nuxt Nitro BFF at `<baseUrl>/<path>`, which then forwards the request to
- * Fastify with a server-only API key. This client therefore sends NO
- * Authorization header (the server-side API key is not the browser's
- * concern) and NO cookie (the BFF strips incoming cookies).
+ * The browser never talks to Fastify directly: it calls the same-origin Nuxt
+ * Nitro BFF at `<baseUrl>/<path>`. On the `/v1/*` data plane the BFF reads the
+ * HttpOnly `aw_session` cookie server-side and forwards the human's session as a
+ * Bearer token — never a machine API key, and never anything the browser could
+ * set. This client therefore sends no Authorization header of its own; it relies
+ * on the same-origin request carrying the HttpOnly session cookie to the BFF
+ * (fetch's default `credentials: 'same-origin'`), which the browser's JS cannot
+ * read.
  */
 export class ApiClient {
   constructor(private readonly options: ApiClientOptions) {}
