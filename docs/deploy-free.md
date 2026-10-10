@@ -100,6 +100,9 @@ free mode is dashboard state, not a repo file.
 | `EMAIL_TRANSPORT` | *(leave unset)* → `log` | **Only if** sending real email. Set `resend` to deliver via Resend; then `EMAIL_FROM` + `RESEND_API_KEY` are required or boot is refused. Left unset, signup/reset work but send no mail. |
 | `EMAIL_FROM` | `AI Workforce <noreply@your-verified-domain>` | **Only with** `EMAIL_TRANSPORT=resend`. `Display Name <addr>` is accepted; the address must be on a Resend-verified sending domain. |
 | `RESEND_API_KEY` | your Resend key | **Only with** `EMAIL_TRANSPORT=resend`. **Secret, server-only** — never exposed to the browser/Nuxt public runtime. |
+| `CREDENTIAL_ENCRYPTION_KEYS` | *(leave unset)* → single-key v1 | **Optional; enables v2 (AAD-bound) encryption.** Multi-key keyring `<active-kid>:<base64-32B>,legacy-v1:<base64-32B>` whose `legacy-v1` entry MUST carry the current `CREDENTIAL_ENCRYPTION_KEY` bytes. **Must be byte-identical to the worker's.** Secret, server-only. See [Enabling v2 credential encryption and GitHub OAuth](#enabling-v2-credential-encryption-and-github-oauth). |
+| `GITHUB_CLIENT_ID` | *(leave unset)* → GitHub disabled | **Optional.** GitHub OAuth App client id (not a secret, but deployment-specific). **Both-or-neither** with `GITHUB_CLIENT_SECRET`. |
+| `GITHUB_CLIENT_SECRET` | your GitHub OAuth App client secret | **Optional; both-or-neither** with `GITHUB_CLIENT_ID`. **Secret, server-only.** Needed on the API (authorize/callback/revoke) **and** the worker (token refresh). |
 
 Generate the encryption key with:
 
@@ -261,6 +264,15 @@ The worker needs two secrets, scoped to a GitHub **Environment** named
    |---|---|
    | `DATABASE_URL` | the **same** Neon pooled URL (`...?sslmode=require`) the API uses |
    | `CREDENTIAL_ENCRYPTION_KEY` | the **same** key configured for the API on Render — a mismatch makes every stored connection credential unreadable on one side |
+   | `CREDENTIAL_ENCRYPTION_KEYS` *(optional)* | the **same** keyring value as the API — enables v2 (AAD-bound) encryption; must be byte-identical to the API's, because the worker decrypts v2 rows the API wrote. Leave unset to keep single-key v1. |
+   | `GITHUB_CLIENT_SECRET` *(optional)* | the GitHub OAuth App client secret — the worker needs it for token refresh. **Both-or-neither** with `GITHUB_CLIENT_ID` (an environment **variable**, below). |
+
+   `GITHUB_CLIENT_ID` is **not** a secret — add it as a `worker-free` environment
+   **variable** (Settings > Environments > worker-free > Variables), not a secret.
+   The two GitHub values are **both-or-neither**: the workflow fails the run with a
+   clear, non-secret diagnostic if exactly one is set, so a half-configured provider
+   never starts. All three optional values may be left unset — the worker then runs
+   exactly as before (single-key v1, GitHub disabled).
 
 Security notes:
 
@@ -274,6 +286,95 @@ Security notes:
 - `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are only needed if you actually
   test LLM steps; add whichever one as a `worker-free` secret and reference it in
   the workflow's `env` at that point. Free mode omits them by default.
+
+## Enabling v2 credential encryption and GitHub OAuth
+
+These are **optional** and **additive**. With all of them unset the stack runs
+unchanged: a single `CREDENTIAL_ENCRYPTION_KEY` (v1 envelopes), Slack working as
+before, and the GitHub provider simply unregistered. Turn them on in the order
+below, **worker before API**, so the worker can always decrypt what the API writes.
+
+### The keyring format (`CREDENTIAL_ENCRYPTION_KEYS`)
+
+Comma-separated `<kid>:<base64-key>` entries:
+
+```
+<active-kid>:<base64-new-active-key>,legacy-v1:<base64-original-legacy-key>
+```
+
+- The **first** entry is the **active** key — new/rotated credentials are encrypted
+  under it. Its kid matches `^[a-zA-Z0-9._-]{1,64}$` (e.g. a date like
+  `2026-10-active`) and must **not** be `legacy-v1`.
+- `legacy-v1` is **decrypt-only** (never the active/first entry) and lets existing
+  v1 credentials keep decrypting.
+- **Every key decodes to exactly 32 bytes** (AES-256) — base64 (or 64 hex chars) of
+  a 32-byte key.
+- **Preserve the original legacy key bytes.** The `legacy-v1` entry MUST carry the
+  **same bytes** as your current `CREDENTIAL_ENCRYPTION_KEY`, or every existing (v1)
+  connection becomes undecryptable.
+- **If your current key is hexadecimal** (64 hex chars), convert its *decoded bytes*
+  to base64 for the `legacy-v1` entry — do **not** generate a new key:
+
+```bash
+  # Convert the EXISTING hex key's bytes to base64. Run in a private shell; send the
+  # output only to the secret store, never to logs or a PR.
+  node -e "process.stdout.write(Buffer.from(process.env.OLD_HEX_KEY,'hex').toString('base64'))"
+```
+
+Generate the **new active** key with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+Never commit or paste real key values into this repo, a PR, a doc, or CI logs.
+
+### Why order matters
+
+The worker both **reads** credentials (to run tools) and **writes** them (on token
+refresh). A v2 envelope carries the active `kid`; a process whose keyring lacks that
+kid cannot decrypt it. So the worker must carry the new keyring **before** the API
+writes any v2 row. Adding the active key is additive — the `legacy-v1` entry keeps
+every existing v1 row readable throughout, so legacy connections never break.
+
+### Rollout sequence
+
+A. **Merge the worker-wiring PR first, with all new secrets/variables unset.** The
+   workflow change is a no-op until configured.
+B. **Prepare the new keyring securely, keeping the existing legacy key.** Build
+   `CREDENTIAL_ENCRYPTION_KEYS` = `<active-kid>:<base64-new>,legacy-v1:<base64-existing-bytes>`.
+   Keep `CREDENTIAL_ENCRYPTION_KEY` set for now (boot is refused if the legacy var is
+   set but the keyring has no `legacy-v1` entry).
+C. **Configure the worker's `CREDENTIAL_ENCRYPTION_KEYS` secret first** (GitHub
+   `worker-free` environment). Do not touch the API yet.
+D. **Confirm old-config worker runs have finished**, then **manually trigger**
+   (`workflow_dispatch`) a run and verify it boots and drains cleanly. The config
+   step logs `keyring: CREDENTIAL_ENCRYPTION_KEYS provided` (presence only).
+E. **Only then** set the **identical** keyring on the Render Free API (dashboard) and
+   let it restart. The API now writes v2; the worker already reads it.
+F. **Verify both processes still decrypt existing legacy connections** — exercise a
+   tool that uses a pre-v2 connection on each side; it resolves without a decryption
+   error (the `legacy-v1` entry covers v1 rows).
+G. **Configure `GITHUB_CLIENT_ID` + `GITHUB_CLIENT_SECRET` together** on API and
+   worker, only when ready to activate GitHub OAuth. Setting one fails fast.
+H. **Keep `APP_ORIGIN` on the public Vercel frontend** (API). Do not change auth link
+   origins — the GitHub callback is reached via the BFF at `${APP_ORIGIN}/oauth/github/callback`.
+I. **Run the first real GitHub OAuth test only after** the connection flow and the
+   GitHub OAuth App (with that exact callback URL) are configured.
+
+### Verifying each phase without exposing secrets
+
+- Presence, not values: the config step prints only `provided` / `not set` lines,
+  and GitHub masks secret values in logs regardless.
+- Boot health: a worker run that boots and drains (green, clean exit) proves the
+  keyring parsed and the legacy key still decrypts. A bad keyring (e.g. missing
+  `legacy-v1` while `CREDENTIAL_ENCRYPTION_KEY` is set) fails at boot with a typed,
+  non-secret error.
+- Both-or-neither GitHub: setting one value fails the run with `::error::GITHUB_CLIENT_ID
+  and GITHUB_CLIENT_SECRET must be set together…` — no value printed.
+- Legacy reads: confirm an existing connection still resolves after each step; a
+  failure surfaces as a typed `credential_decryption_failed`, never a key value.
+- Do not run `connections:rotate` or any live GitHub OAuth flow as a "test" before G/I.
 
 ## Frontend
 

@@ -82,6 +82,71 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Optional, additive configuration for v2 credential encryption and the GitHub
+      # OAuth provider. These are injected into $GITHUB_ENV for the bounded worker
+      # step below ONLY when actually configured.
+      #
+      # Why not just add them to the worker step's `env:` block like the others: the
+      # backend's Zod env parser distinguishes an ABSENT optional variable from one
+      # explicitly set to an EMPTY STRING. `${{ secrets.X }}` for an unset secret
+      # expands to "", which would (a) fail CREDENTIAL_ENCRYPTION_KEYS validation
+      # (.min(1)) and (b) half-enable the GitHub provider. So each value is forwarded
+      # only when non-empty; when all are unset this step is a no-op and the worker
+      # runs exactly as before — legacy CREDENTIAL_ENCRYPTION_KEY only, Slack
+      # unaffected, every other behaviour unchanged.
+      #
+      # Secret-safe: values are read into step-scoped env, tested with -n only, and
+      # written to $GITHUB_ENV via the masked multiline form — never echoed to stdout,
+      # no `set -x`. CREDENTIAL_ENCRYPTION_KEYS and GITHUB_CLIENT_SECRET are worker-free
+      # environment SECRETS (auto-masked); GITHUB_CLIENT_ID is a worker-free
+      # environment VARIABLE (non-secret). The only stdout is a presence/absence line
+      # (never a value), which is what lets an operator verify a phase safely.
+      - name: Resolve optional OAuth + keyring configuration
+        env:
+          OPT_CREDENTIAL_ENCRYPTION_KEYS: ${{ secrets.CREDENTIAL_ENCRYPTION_KEYS }}
+          OPT_GITHUB_CLIENT_ID: ${{ vars.GITHUB_CLIENT_ID }}
+          OPT_GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}
+        run: |
+          # Multi-key keyring (optional). Forwarded only when set, so the backend sees
+          # it as ABSENT (not "") otherwise and keeps legacy CREDENTIAL_ENCRYPTION_KEY
+          # behaviour. The value MUST include a `legacy-v1:` entry carrying the current
+          # key's bytes (see docs/deploy-free.md) or the API/worker refuse to boot.
+          if [ -n "${OPT_CREDENTIAL_ENCRYPTION_KEYS}" ]; then
+            {
+              echo "CREDENTIAL_ENCRYPTION_KEYS<<__WORKER_ENV_EOF__"
+              echo "${OPT_CREDENTIAL_ENCRYPTION_KEYS}"
+              echo "__WORKER_ENV_EOF__"
+            } >> "${GITHUB_ENV}"
+            echo "keyring: CREDENTIAL_ENCRYPTION_KEYS provided (v2 active key available)"
+          else
+            echo "keyring: CREDENTIAL_ENCRYPTION_KEYS not set (legacy CREDENTIAL_ENCRYPTION_KEY only)"
+          fi
+
+          # GitHub OAuth client (optional, BOTH-OR-NEITHER). A half-configured pair is
+          # refused here with a non-secret diagnostic, so the worker never boots a
+          # partially-wired provider (the backend also enforces this via env Invariant 8).
+          id_set=false
+          secret_set=false
+          if [ -n "${OPT_GITHUB_CLIENT_ID}" ]; then id_set=true; fi
+          if [ -n "${OPT_GITHUB_CLIENT_SECRET}" ]; then secret_set=true; fi
+          if [ "${id_set}" != "${secret_set}" ]; then
+            echo "::error::GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be set together for the worker-free environment (both or neither)."
+            exit 1
+          fi
+          if [ "${id_set}" = "true" ]; then
+            {
+              echo "GITHUB_CLIENT_ID<<__WORKER_ENV_EOF__"
+              echo "${OPT_GITHUB_CLIENT_ID}"
+              echo "__WORKER_ENV_EOF__"
+              echo "GITHUB_CLIENT_SECRET<<__WORKER_ENV_EOF__"
+              echo "${OPT_GITHUB_CLIENT_SECRET}"
+              echo "__WORKER_ENV_EOF__"
+            } >> "${GITHUB_ENV}"
+            echo "github oauth: client id + secret provided (provider will be enabled)"
+          else
+            echo "github oauth: client id/secret not set (GitHub provider disabled)"
+          fi
+
       # Run ONE bounded worker session, then stop gracefully.
       #
       # The worker polls forever (it does not exit when the queue drains), so the

@@ -153,3 +153,32 @@ envVarGroups:
       # sync:false rather than a guessed literal.
       - key: APP_ORIGIN
         sync: false
+      # ---- Optional: v2 credential encryption + GitHub OAuth (dashboard only) ----
+      # OPTIONAL and additive. Left unset, both services run on the single
+      # CREDENTIAL_ENCRYPTION_KEY above (v1 envelopes) with GitHub OAuth disabled —
+      # unchanged behaviour. Set them (dashboard only; sync:false, never in this file)
+      # to enable the AAD-bound v2 envelope and/or the GitHub provider. Because this
+      # is the SHARED group, a value set here reaches BOTH the API and the worker,
+      # which is required: the keyring must be byte-identical on both (the worker
+      # decrypts v2 rows the API wrote), and GitHub needs the client on both (API:
+      # authorize/callback/revoke; worker: token refresh).
+      #
+      # NOTE: the active $0 setup runs a MANUALLY configured Render Free web service;
+      # editing this Blueprint does NOT update that service — set these in its own
+      # dashboard too. Full runbook: docs/deploy-free.md "Enabling v2 credential
+      # encryption and GitHub OAuth". These stay commented so a Blueprint deploy never
+      # treats the optional values as required.
+      #
+      #   # Multi-key keyring. Format: <active-kid>:<base64-32B>,legacy-v1:<base64-32B>
+      #   # The legacy-v1 entry MUST carry the CURRENT CREDENTIAL_ENCRYPTION_KEY bytes
+      #   # (base64 of the same 32 bytes), or boot is refused. Keep
+      #   # CREDENTIAL_ENCRYPTION_KEY set during the transition; the cipher then ignores
+      #   # it with a one-time cleanup log.
+      #   - key: CREDENTIAL_ENCRYPTION_KEYS
+      #     sync: false   # SECRET — server-only
+      #   # GitHub OAuth App credentials — BOTH-OR-NEITHER (env Invariant 8). CLIENT_ID
+      #   # is not secret but is deployment-specific; CLIENT_SECRET is server-only.
+      #   - key: GITHUB_CLIENT_ID
+      #     sync: false
+      #   - key: GITHUB_CLIENT_SECRET
+      #     sync: false   # SECRET — server-only
