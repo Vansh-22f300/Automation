@@ -1,0 +1,124 @@
+# Manual, DRY-RUN-ONLY GitHub pilot authoring check.
+#
+# Runs the merged operator CLI `pnpm github:prepare-pilot <tenantId> <connectionId>`
+# WITHOUT --commit, against the intended production database, to preview (never write) the
+# single-step read-only GitHub pilot workflow. It reuses the `worker-free` environment
+# secrets so no production Neon credential or encryption key is ever copied elsewhere.
+#
+# Safety (asserted by src/test/unit/pilot-dry-run-workflow.test.ts):
+#   * manual-only: workflow_dispatch is the ONLY trigger (no push/pull_request/schedule),
+#     so it can never run during PR CI or on merge;
+#   * NO --commit anywhere — this workflow never enables the write path, enqueues a job,
+#     runs the worker, refreshes a token, or calls the LLM/GitHub API;
+#   * inputs are validated as UUIDs and passed as environment variables (never raw shell
+#     interpolation), avoiding command injection;
+#   * optional CREDENTIAL_ENCRYPTION_KEYS is forwarded only when non-empty (an unset secret
+#     stays ABSENT, never ""), reusing worker-free.yml's safe keyring handling;
+#   * no Anthropic/LLM or GitHub OAuth client secrets are supplied — the dry-run needs none.
+
+name: pilot authoring dry-run (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        description: "Tenant UUID (entered privately at dispatch; never stored in source)"
+        required: true
+        type: string
+      connection_id:
+        description: "GitHub connection UUID (entered privately at dispatch)"
+        required: true
+        type: string
+
+# Least privilege: read the checkout only.
+permissions:
+  contents: read
+
+# Serialise manual dry-run checks so duplicate dispatches do not overlap. The run is
+# read-only, so an in-progress check is allowed to finish rather than being cancelled.
+concurrency:
+  group: pilot-dry-run
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    name: pilot authoring dry run
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Scope the production DATABASE_URL / credential-encryption secrets to the SAME
+    # environment the worker uses; ci.yml and pull_request runs cannot read them.
+    environment: worker-free
+
+    steps:
+      # Fail fast on malformed input BEFORE checkout, build, or any DB access. Inputs are
+      # read as env vars and matched against a UUID regex; the value itself is never echoed.
+      - name: Validate inputs are UUIDs
+        shell: bash
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONNECTION_ID: ${{ inputs.connection_id }}
+        run: |
+          uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          rc=0
+          if [[ ! "${TENANT_ID}" =~ ${uuid_re} ]]; then echo "::error::tenant_id must be a UUID"; rc=1; fi
+          if [[ ! "${CONNECTION_ID}" =~ ${uuid_re} ]]; then echo "::error::connection_id must be a UUID"; rc=1; fi
+          exit "${rc}"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # pnpm before setup-node so `cache: pnpm` can locate the store. Version comes from
+      # package.json packageManager, identical to ci.yml / worker-free.yml.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # Optional multi-key keyring, forwarded to the app's runtime name ONLY when set, so an
+      # unset secret stays ABSENT (not "") to the Zod parser — identical handling to
+      # worker-free.yml. No value is ever echoed to stdout. The dry-run needs no GitHub OAuth
+      # client and no Anthropic credential, so neither is resolved or supplied here.
+      - name: Resolve optional keyring configuration
+        env:
+          OPT_CREDENTIAL_ENCRYPTION_KEYS: ${{ secrets.CREDENTIAL_ENCRYPTION_KEYS }}
+        run: |
+          if [ -n "${OPT_CREDENTIAL_ENCRYPTION_KEYS}" ]; then
+            {
+              echo "CREDENTIAL_ENCRYPTION_KEYS<<__PILOT_ENV_EOF__"
+              echo "${OPT_CREDENTIAL_ENCRYPTION_KEYS}"
+              echo "__PILOT_ENV_EOF__"
+            } >> "${GITHUB_ENV}"
+            echo "keyring: CREDENTIAL_ENCRYPTION_KEYS provided (v2 active key available)"
+          else
+            echo "keyring: CREDENTIAL_ENCRYPTION_KEYS not set (legacy CREDENTIAL_ENCRYPTION_KEY only)"
+          fi
+
+      # DRY RUN ONLY — the merged CLI with NO --commit. It validates the ids, verifies the
+      # connection via metadata (never decrypts), prints the sanitized pilot plan, and writes
+      # nothing. NODE_ENV=production + HOST + APP_ORIGIN satisfy the shared prod env
+      # validation; DATABASE_URL / CREDENTIAL_ENCRYPTION_KEY come from the worker-free
+      # environment secrets (never hard-coded, never echoed); LOG_LEVEL=silent keeps output
+      # to the single sanitized RESULT line. Inputs are passed via env, not shell-interpolated.
+      - name: Pilot authoring dry run (no --commit)
+        env:
+          NODE_ENV: production
+          HOST: 0.0.0.0
+          APP_ORIGIN: https://automation-7d1c.onrender.com
+          LOG_LEVEL: silent
+          DATABASE_POOL_MAX: "5"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONNECTION_ID: ${{ inputs.connection_id }}
+        run: |
+          pnpm github:prepare-pilot "${TENANT_ID}" "${CONNECTION_ID}"
