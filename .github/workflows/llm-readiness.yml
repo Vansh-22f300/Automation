@@ -1,0 +1,85 @@
+# Manual, EXPLICITLY-CONFIRMED minimal LLM-gateway readiness check.
+#
+# Runs `pnpm llm:readiness` against the SAME Anthropic-compatible gateway / token / model the
+# worker uses, sending ONE tiny structured request and requiring {"ok": true}. It FAILS
+# nonzero if the credential is absent, the model is rejected, auth fails, or the structured
+# output is wrong — so a green run reliably proves auth/model/structured-output readiness
+# (NOT the full GitHub tool-calling loop).
+#
+# COST: a live dispatch makes ONE real, billable LLM API request to the configured gateway.
+#
+# It opens no database, starts no worker, and makes no GitHub/Slack/webhook/DB call. It reads
+# only ANTHROPIC_* config and prints a sanitized PASS/FAIL + model + token usage — never a
+# credential, Authorization header, base URL, response body, or prompt/output content.
+#
+# Safety (asserted by src/test/unit/llm-readiness-workflow.test.ts): manual-only trigger;
+# main-only job; exact confirmation RUN_MINIMAL_LLM_SMOKE; supplies only the three ANTHROPIC
+# vars from their worker-free sources; no DATABASE_URL/keyring/OAuth; no arbitrary model,
+# URL, prompt, or command input.
+
+name: llm readiness (manual, confirmed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type exactly RUN_MINIMAL_LLM_SMOKE to authorize ONE billable LLM request"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llm-readiness
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: minimal llm readiness
+    # Secret-bearing job: run ONLY from the default branch (owner must ALSO restrict the
+    # worker-free Environment's deployment branches to `main`; this guard is defense in depth).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: worker-free
+
+    steps:
+      - name: Validate confirmation
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [ "${CONFIRMATION}" != "RUN_MINIMAL_LLM_SMOKE" ]; then
+            echo "::error::confirmation must be exactly RUN_MINIMAL_LLM_SMOKE"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # Minimal LLM readiness — the hardcoded CLI, no arguments. Supplies ONLY the three
+      # ANTHROPIC vars from their worker-free sources (bearer-token secret + gateway URL and
+      # model variables); no DATABASE_URL (the CLI opens no DB), no keyring, no OAuth client.
+      - name: Minimal LLM readiness (one structured request)
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+        run: |
+          pnpm llm:readiness
