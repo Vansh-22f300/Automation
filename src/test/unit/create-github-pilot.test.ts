@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildGithubPilotDefinition,
   isValidId,
+  parsePilotArgs,
   prepareGithubPilot,
   runCli,
   PILOT_MAX_OUTPUT_TOKENS,
@@ -181,6 +182,47 @@ describe('isValidId', () => {
     expect(isValidId(TID)).toBe(true);
     for (const bad of [undefined, '', 'x', `${TID}x`, TID.slice(0, -1)]) {
       expect(isValidId(bad as string | undefined)).toBe(false);
+    }
+  });
+});
+
+describe('runCli — strict argument rejection (no env load, no DB access, no writes)', () => {
+  function strictDeps() {
+    const loadEnv = vi.fn();
+    const createDatabase = vi.fn();
+    const run = vi.fn();
+    return {
+      deps: { loadEnv, createLogger: vi.fn(), createDatabase, run } as unknown as GithubPilotCliDeps,
+      loadEnv,
+      createDatabase,
+      run,
+    };
+  }
+  it.each([
+    ['--commit plus an unsupported --dry-run flag', [TID, CID, '--commit', '--dry-run']],
+    ['--commit plus an unknown flag', [TID, CID, '--commit', '--unknown']],
+    ['a duplicate --commit', [TID, CID, '--commit', '--commit']],
+    ['an extra positional argument', [TID, CID, CID]],
+  ])('rejects %s and never loads env, opens a db, or authors', async (_label, argv) => {
+    const { deps, loadEnv, createDatabase, run } = strictDeps();
+    const err = collect();
+    const code = await runCli({ argv, stdout: collect().stream, stderr: err.stream }, deps);
+    expect(code).toBe(1);
+    expect(loadEnv).not.toHaveBeenCalled();
+    expect(createDatabase).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(err.text()).toContain('usage:');
+  });
+});
+
+describe('parsePilotArgs', () => {
+  it('accepts exactly two UUIDs, with or without a single --commit', () => {
+    expect(parsePilotArgs([TID, CID])).toEqual({ ok: true, tenantId: TID, connectionId: CID, commit: false });
+    expect(parsePilotArgs([TID, CID, '--commit'])).toEqual({ ok: true, tenantId: TID, connectionId: CID, commit: true });
+  });
+  it('rejects unknown flags, duplicate --commit, extra positionals, and missing args', () => {
+    for (const argv of [[TID, CID, '--dry-run'], [TID, CID, '--commit', '--commit'], [TID, CID, CID], [TID]]) {
+      expect(parsePilotArgs(argv).ok).toBe(false);
     }
   });
 });

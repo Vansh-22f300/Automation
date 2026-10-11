@@ -276,21 +276,47 @@ export interface GithubPilotCliIo {
   readonly stderr: NodeJS.WritableStream;
 }
 
+const USAGE = 'usage: pnpm github:prepare-pilot <tenantId:uuid> <connectionId:uuid> [--commit]';
+
 /**
- * Run the CLI and return its exit code (never throws). Validates both ids as UUIDs before
- * any database access, so no production access happens without two well-formed args. The
- * default is a DRY RUN; `--commit` is the explicit, required flag to author for real. The
- * database handle, once opened, is always closed.
+ * Strict argument parse: EXACTLY two UUID positionals and AT MOST one `--commit`. Any
+ * unknown flag, a duplicate `--commit`, a wrong positional count, or a non-UUID is a hard
+ * rejection — so an unsupported option like `--commit --dry-run` can never silently write.
+ */
+export function parsePilotArgs(
+  argv: readonly string[],
+): { ok: true; tenantId: string; connectionId: string; commit: boolean } | { ok: false; error: string } {
+  const positionals: string[] = [];
+  let commitCount = 0;
+  for (const arg of argv) {
+    if (arg === '--commit') commitCount += 1;
+    else if (arg.startsWith('-')) return { ok: false, error: `unknown option "${arg}"` };
+    else positionals.push(arg);
+  }
+  if (commitCount > 1) return { ok: false, error: 'the --commit flag may be given at most once' };
+  if (positionals.length !== 2) {
+    return { ok: false, error: `expected exactly two arguments (tenantId, connectionId), got ${positionals.length}` };
+  }
+  const [tenantId, connectionId] = positionals;
+  if (!isValidId(tenantId) || !isValidId(connectionId)) {
+    return { ok: false, error: 'tenantId and connectionId must both be UUIDs' };
+  }
+  return { ok: true, tenantId, connectionId, commit: commitCount === 1 };
+}
+
+/**
+ * Run the CLI and return its exit code (never throws). Arguments are validated FIRST —
+ * before env load or any database access — so a malformed or unsafe invocation can never
+ * load config, open a connection, or write. The default is a DRY RUN; `--commit` is the
+ * explicit, required flag to author for real. The database handle, once opened, is closed.
  */
 export async function runCli(io: GithubPilotCliIo, deps: GithubPilotCliDeps = DEFAULT_DEPS): Promise<0 | 1> {
-  const positional = io.argv.filter((a) => !a.startsWith('--'));
-  const commit = io.argv.includes('--commit');
-  const tenantId = positional[0];
-  const connectionId = positional[1];
-  if (!isValidId(tenantId) || !isValidId(connectionId)) {
-    io.stderr.write('usage: pnpm github:prepare-pilot <tenantId:uuid> <connectionId:uuid> [--commit]\n');
+  const parsed = parsePilotArgs(io.argv);
+  if (!parsed.ok) {
+    io.stderr.write(`error: ${parsed.error}\n${USAGE}\n`);
     return 1;
   }
+  const { tenantId, connectionId, commit } = parsed;
 
   const run = deps.run ?? realRunPrepare;
   let database: DatabaseHandle | undefined;
