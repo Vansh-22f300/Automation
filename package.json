@@ -34,7 +34,8 @@
     "llm:tool-smoke": "tsx --env-file-if-exists=.env src/cli/llm-tool-smoke.ts",
     "connections": "tsx --env-file-if-exists=.env src/cli/connections.ts",
     "connections:verify-decrypt": "tsx --env-file-if-exists=.env src/cli/verify-connection-decrypt.ts",
-    "slack:smoke": "tsx --env-file-if-exists=.env src/cli/slack-smoke.ts"
+    "slack:smoke": "tsx --env-file-if-exists=.env src/cli/slack-smoke.ts",
+    "github:get-user-smoke": "tsx --env-file-if-exists=.env src/cli/github-get-user-smoke.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.122.0",
