@@ -1,0 +1,158 @@
+# Manual, EXPLICITLY-CONFIRMED GitHub connection + read-only-tool readiness check.
+#
+# Runs the merged diagnostic `pnpm github:get-user-smoke <tenantId> <connectionId>` against
+# the intended production connection, through the REAL worker-style path (ToolExecutor +
+# RefreshingConnectionResolver + OAuth token source + tenant-scoped ConnectionRepository +
+# github_get_authenticated_user -> GET /user), reusing the worker-free environment secrets.
+# It proves the stored GitHub connection resolves, decrypts, and authenticates — which the
+# scheduled worker needs — WITHOUT the LLM, the worker entrypoint, webhooks, or any write.
+#
+# NOT DATABASE-READ-ONLY: a successful resolve updates connections.last_used_at, and if the
+# stored OAuth access token is at/near expiry the resolver refreshes it and persists the
+# rotated credential (compare-and-swap) while GitHub rotates the refresh token. The EXTERNAL
+# GitHub operation itself is read-only (GET /user). It never registers or calls
+# github_create_issue, Slack, the LLM, the worker entrypoint, or a webhook.
+#
+# Safety (asserted by src/test/unit/github-readiness-workflow.test.ts): manual-only trigger;
+# main-only job; exact confirmation RUN_GITHUB_READ_ONLY_SMOKE; UUID inputs validated + masked
+# and passed as env (never shell-interpolated); hardcoded smoke CLI + its two UUID args; no
+# command-runner input; reuses worker-free DATABASE_URL + keyring + OAuth forwarding.
+
+name: github readiness (manual, confirmed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        # A non-secret identifier (NOT a credential).
+        description: "Tenant UUID (non-secret identifier)"
+        required: true
+        type: string
+      connection_id:
+        # A non-secret identifier (NOT a credential).
+        description: "GitHub connection UUID (non-secret identifier)"
+        required: true
+        type: string
+      confirmation:
+        description: "Type exactly RUN_GITHUB_READ_ONLY_SMOKE to authorize the live GET /user"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-readiness
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: github read-only smoke (GET /user)
+    # Secret-bearing job: run ONLY from the default branch. A non-main dispatch skips before
+    # the worker-free environment is accessed. The owner MUST ALSO restrict the `worker-free`
+    # Environment's deployment branches to `main` (this guard is defense in depth, not a
+    # replacement for Environment protection).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: worker-free
+
+    steps:
+      # Reject a malformed id or a wrong confirmation phrase BEFORE checkout, build, or any
+      # DB/GitHub access. Inputs are read as env vars (never shell-interpolated); values are
+      # not echoed. After validation, the two UUIDs are masked for all later job logs.
+      - name: Validate inputs and confirmation
+        shell: bash
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONNECTION_ID: ${{ inputs.connection_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          rc=0
+          if [[ ! "${TENANT_ID}" =~ ${uuid_re} ]]; then echo "::error::tenant_id must be a UUID"; rc=1; fi
+          if [[ ! "${CONNECTION_ID}" =~ ${uuid_re} ]]; then echo "::error::connection_id must be a UUID"; rc=1; fi
+          if [ "${CONFIRMATION}" != "RUN_GITHUB_READ_ONLY_SMOKE" ]; then
+            echo "::error::confirmation must be exactly RUN_GITHUB_READ_ONLY_SMOKE"; rc=1
+          fi
+          if [ "${rc}" -ne 0 ]; then exit 1; fi
+          echo "::add-mask::${TENANT_ID}"
+          echo "::add-mask::${CONNECTION_ID}"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # Optional v2 keyring + GitHub OAuth client, forwarded to the app's runtime names ONLY
+      # when set (an unset secret stays ABSENT, never "") — identical to worker-free.yml. The
+      # OAuth client is needed only if the stored token must be refreshed during the resolve.
+      # Values flow only into $GITHUB_ENV via the masked heredoc; only presence lines print.
+      - name: Resolve optional OAuth + keyring configuration
+        env:
+          OPT_CREDENTIAL_ENCRYPTION_KEYS: ${{ secrets.CREDENTIAL_ENCRYPTION_KEYS }}
+          OPT_GITHUB_CLIENT_ID: ${{ vars.OAUTH_GH_CLIENT_ID }}
+          OPT_GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GH_CLIENT_SECRET }}
+        run: |
+          if [ -n "${OPT_CREDENTIAL_ENCRYPTION_KEYS}" ]; then
+            {
+              echo "CREDENTIAL_ENCRYPTION_KEYS<<__GH_ENV_EOF__"
+              echo "${OPT_CREDENTIAL_ENCRYPTION_KEYS}"
+              echo "__GH_ENV_EOF__"
+            } >> "${GITHUB_ENV}"
+            echo "keyring: CREDENTIAL_ENCRYPTION_KEYS provided (v2 active key available)"
+          else
+            echo "keyring: CREDENTIAL_ENCRYPTION_KEYS not set (legacy CREDENTIAL_ENCRYPTION_KEY only)"
+          fi
+          id_set=false
+          secret_set=false
+          if [ -n "${OPT_GITHUB_CLIENT_ID}" ]; then id_set=true; fi
+          if [ -n "${OPT_GITHUB_CLIENT_SECRET}" ]; then secret_set=true; fi
+          if [ "${id_set}" != "${secret_set}" ]; then
+            echo "::error::OAUTH_GH_CLIENT_ID (variable) and OAUTH_GH_CLIENT_SECRET (secret) must be set together (both or neither)."
+            exit 1
+          fi
+          if [ "${id_set}" = "true" ]; then
+            {
+              echo "GITHUB_CLIENT_ID<<__GH_ENV_EOF__"
+              echo "${OPT_GITHUB_CLIENT_ID}"
+              echo "__GH_ENV_EOF__"
+              echo "GITHUB_CLIENT_SECRET<<__GH_ENV_EOF__"
+              echo "${OPT_GITHUB_CLIENT_SECRET}"
+              echo "__GH_ENV_EOF__"
+            } >> "${GITHUB_ENV}"
+            echo "github oauth: client id + secret provided (refresh enabled if needed)"
+          else
+            echo "github oauth: client id/secret not set (no token refresh available)"
+          fi
+
+      # READ-ONLY GitHub smoke — the hardcoded diagnostic CLI with its two UUID args, no other
+      # flag. Prints only a sanitized RESULT: PASS login=<login> / FAIL [code]; fails nonzero
+      # on invalid config, missing connection, decryption failure, OAuth failure, or a failed
+      # GET /user. Inputs via env, never shell-interpolated.
+      - name: GitHub read-only smoke (GET /user)
+        env:
+          NODE_ENV: production
+          HOST: 0.0.0.0
+          APP_ORIGIN: https://automation-7d1c.onrender.com
+          LOG_LEVEL: silent
+          DATABASE_POOL_MAX: "5"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONNECTION_ID: ${{ inputs.connection_id }}
+        run: |
+          pnpm github:get-user-smoke "${TENANT_ID}" "${CONNECTION_ID}"
