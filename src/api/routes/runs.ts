@@ -11,11 +11,15 @@
  * by someone else, returns the exact same 404 as any other miss: a tenant cannot
  * probe for the existence of another tenant's runs.
  *
- * The detail response is summary-only, byte-for-byte the same `RunInspection` DTO
- * the CLI renders — the repository is the single source of truth for shape and
- * redaction. There is deliberately no `--detail`-style raw mode on the API yet;
- * exposing raw payload/context/output over HTTP is reserved for a future endpoint
- * with its own authorization model.
+ * The response is summary-only, byte-for-byte the same `RunInspection` DTO the CLI
+ * renders — the repository is the single source of truth for shape and redaction.
+ * That summary now includes the safe tool-effect metadata (step key, tool name,
+ * ordinal, provider, state, an `ambiguous` indicator, and a sanitized `{code,
+ * message}` error) projected from the durable effect ledger — the authoritative
+ * record of actual tool execution — never raw tool results, arguments, idempotency
+ * keys, leases, or owner tokens. There is deliberately no `--detail`-style raw mode
+ * on the API yet; exposing raw payload/context/output over HTTP is reserved for a
+ * future endpoint with its own authorization model.
  *
  * The collection endpoint (`GET /v1/runs`) is also read-only and tenant-scoped,
  * returning keyset-paginated summary rows with optional status/workflow filters.

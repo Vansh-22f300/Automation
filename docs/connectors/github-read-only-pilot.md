@@ -55,6 +55,22 @@ action and run it only when you are ready for the pilot to execute. (To execute 
 and watch it, trigger `worker-free` via `workflow_dispatch` right after enqueuing;
 cadence is otherwise best-effort and the scheduled worker drops most `*/5` ticks.)
 
+**Stage 3 — confirm the completed run (read-only).** Once the run finishes, verify it
+through the authenticated run-inspection interfaces — no credentials or live GitHub/LLM
+calls are needed, inspection reads only stored rows:
+
+```bash
+pnpm runs:inspect <tenantId> <runId>                     # CLI, default output
+curl -s https://<api-host>/v1/runs/<runId> \
+  -H "Authorization: Bearer <tenant-api-key>"            # API
+```
+
+The durable **tool-effect summary** is the authoritative evidence the GitHub call ran —
+expect one `succeeded` `github_get_authenticated_user` effect on step `whoami`. The
+inferred `tools.toolRounds` is NOT a tool-call count; see
+[run inspection — confirming a run](../operations/run-inspection.md) for the full field
+list, the inferred-vs-durable distinction, and the security model.
+
 ## `max_tool_rounds` does NOT guarantee exactly one GitHub request
 
 `max_tool_rounds: 2` bounds the number of model→tool **rounds** the `llm` step runs — it

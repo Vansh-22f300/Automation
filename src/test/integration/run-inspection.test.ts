@@ -15,7 +15,10 @@
  *     the scrubbed raw values;
  *   - a run of another tenant, or a nonexistent run, both return null (the API's
  *     identical 404);
- *   - `leased` reflects a live lease held on a running job.
+ *   - `leased` reflects a live lease held on a running job;
+ *   - durable tool-effect rows (the authoritative actual-tool-call record) surface
+ *     on BOTH the summary and detail surfaces, projected to safe fields only, and
+ *     are unreachable across tenants.
  */
 
 import { eq } from "drizzle-orm";
@@ -110,6 +113,31 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
 
     const repo = (tenantId: string, now?: () => Date) =>
       new RunInspectionRepository(new TenantScope(handle.db, tenantId), now);
+
+    /** Insert one durable effect-ledger row for a run (sensible read-tool defaults). */
+    const seedEffect = async (
+      tenantId: string,
+      runId: string,
+      over: Partial<typeof toolEffects.$inferInsert> = {},
+    ): Promise<void> => {
+      const stepKey = over.stepKey ?? "whoami";
+      const toolName = over.toolName ?? "github_get_authenticated_user";
+      const ordinal = over.ordinal ?? 1;
+      await handle.db.insert(toolEffects).values({
+        tenantId,
+        runId,
+        stepKey,
+        toolName,
+        ordinal,
+        idempotencyKey: `${runId}:${stepKey}:${toolName}:${ordinal}`,
+        provider: over.provider ?? "github",
+        state: over.state ?? "succeeded",
+        owner: over.owner ?? null,
+        leaseExpiresAt: over.leaseExpiresAt ?? null,
+        result: over.result ?? null,
+        error: over.error ?? null,
+      });
+    };
 
     it("assembles a coherent view of an own run", async () => {
       const runId = await seedRun(tenantA, "coherent", "a");
@@ -265,39 +293,70 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
       expect(JSON.stringify(view)).not.toContain("worker-1");
     });
 
-    it("exposes an ambiguous external effect in detail mode: state, tool, ordinal — never secrets", async () => {
-      const runId = await seedRun(tenantA, "ambiguous-effect", "notify");
-      const [stepRun] = await handle.db
-        .insert(workflowStepRuns)
-        .values({
-          tenantId: tenantA,
-          runId,
-          stepKey: "notify",
-          stepType: "llm",
-          status: "failed",
-          startedAt: new Date(1_000),
-          finishedAt: new Date(1_050),
-          durationMs: 50,
-        })
-        .returning({ id: workflowStepRuns.id });
+    it("surfaces a succeeded external effect on the SUMMARY surface (default, no --detail)", async () => {
+      const runId = await seedRun(tenantA, "effect-success", "whoami");
+      await seedEffect(tenantA, runId, {
+        toolName: "github_get_authenticated_user",
+        provider: "github",
+        ordinal: 1,
+        state: "succeeded",
+        result: { login: "octocat", id: 583231 },
+      });
 
+      const summary = await repo(tenantA).getRun(runId);
+      expect(summary!.toolEffects).toEqual([
+        {
+          stepKey: "whoami",
+          toolName: "github_get_authenticated_user",
+          ordinal: 1,
+          provider: "github",
+          state: "succeeded",
+          ambiguous: false,
+          error: null,
+        },
+      ]);
+      // The stored raw result is never projected, on either surface.
+      expect(JSON.stringify(summary!.toolEffects)).not.toContain("583231");
+      // Effects are mode-independent — identical on the detail surface.
+      const detailed = await repo(tenantA).getRun(runId, { detail: true });
+      expect(detailed!.toolEffects).toEqual(summary!.toolEffects);
+    });
+
+    it("surfaces a failed external effect with a sanitized {code, message} error", async () => {
+      const runId = await seedRun(tenantA, "effect-failed", "whoami");
+      await seedEffect(tenantA, runId, {
+        state: "failed",
+        error: {
+          code: "http_500",
+          message: "bad gateway",
+          details: { trace: "secret-trace-xyz" },
+        },
+      });
+
+      const summary = await repo(tenantA).getRun(runId);
+      expect(summary!.toolEffects).toHaveLength(1);
+      const effect = summary!.toolEffects[0]!;
+      expect(effect.state).toBe("failed");
+      expect(effect.ambiguous).toBe(false);
+      // toSafeError keeps {code, message}, drops the details payload.
+      expect(effect.error).toEqual({ code: "http_500", message: "bad gateway" });
+      expect(JSON.stringify(summary!.toolEffects)).not.toContain("secret-trace-xyz");
+    });
+
+    it("surfaces an ambiguous effect on the summary surface — state/tool/ordinal present, secrets absent", async () => {
+      const runId = await seedRun(tenantA, "effect-ambiguous", "whoami");
       // A crash left this Slack send with an unknown outcome: the ledger settled it
       // `ambiguous` (deliberately not auto-resent). The row carries fields that MUST
-      // NOT surface — the idempotency key, the owner/lease token, the stored result,
-      // and an error whose details hold a bot token — so the assertions prove they
-      // are absent while state/tool/ordinal are present for an operator to triage.
-      await handle.db.insert(toolEffects).values({
-        tenantId: tenantA,
-        runId,
-        stepKey: "notify",
+      // NOT surface — the idempotency key, the owner token, the stored result, and an
+      // error whose details hold a bot token.
+      const OWNER = "11111111-1111-4111-8111-111111111111";
+      await seedEffect(tenantA, runId, {
         toolName: "send_slack_message",
-        ordinal: 1,
-        idempotencyKey: `${runId}:notify:send_slack_message:1`,
         provider: "slack",
+        ordinal: 1,
         state: "ambiguous",
-        owner: stepRun!.id,
-        leaseExpiresAt: null,
-        result: null,
+        owner: OWNER,
+        result: { channel: "C123", ts: "1700000000.000100" },
         error: {
           code: "effect_ambiguous",
           message: "worker crashed after dispatch, before settlement",
@@ -305,31 +364,64 @@ describe.skipIf(TEST_DATABASE_URL === undefined)(
         },
       });
 
-      // Summary surface: no tool-effects section at all.
+      // Present on the SUMMARY surface now (no --detail), with exactly the safe fields.
       const summary = await repo(tenantA).getRun(runId);
-      expect(summary!.toolEffects).toBeUndefined();
-
-      // Detail surface: the ambiguous effect is present with exactly the safe fields.
-      const detailed = await repo(tenantA).getRun(runId, { detail: true });
-      expect(detailed!.toolEffects).toHaveLength(1);
-      const effect = detailed!.toolEffects![0]!;
+      expect(summary!.toolEffects).toHaveLength(1);
+      const effect = summary!.toolEffects[0]!;
       expect(effect.state).toBe("ambiguous");
       expect(effect.ambiguous).toBe(true);
       expect(effect.toolName).toBe("send_slack_message");
       expect(effect.ordinal).toBe(1);
       expect(effect.provider).toBe("slack");
-      // toSafeError keeps {code, message}, drops the details payload.
       expect(effect.error).toEqual({
         code: "effect_ambiguous",
         message: "worker crashed after dispatch, before settlement",
       });
+      // Identical on the detail surface.
+      const detailed = await repo(tenantA).getRun(runId, { detail: true });
+      expect(detailed!.toolEffects).toEqual(summary!.toolEffects);
 
       // Nothing sensitive crosses the boundary.
-      const serialized = JSON.stringify(detailed!.toolEffects);
+      const serialized = JSON.stringify(summary!.toolEffects);
       expect(serialized).not.toContain("xoxb-super-secret"); // secret in error.details
       expect(serialized).not.toContain("C-private"); // error.details
-      expect(serialized).not.toContain(`${runId}:notify:send_slack_message:1`); // idempotency key
-      expect(serialized).not.toContain(stepRun!.id); // owner token
+      expect(serialized).not.toContain("1700000000.000100"); // stored result ts
+      expect(serialized).not.toContain(OWNER); // owner token
+      expect(serialized).not.toContain(
+        `${runId}:whoami:send_slack_message:1`,
+      ); // idempotency key
+    });
+
+    it("orders repeated durable calls to the same tool by ordinal (actual per-call record)", async () => {
+      const runId = await seedRun(tenantA, "effect-repeated", "whoami");
+      // Two distinct calls to the same tool in one step — distinguished by ordinal,
+      // which the INFERRED tool-activity count cannot do.
+      await seedEffect(tenantA, runId, { ordinal: 2, state: "succeeded" });
+      await seedEffect(tenantA, runId, { ordinal: 1, state: "succeeded" });
+
+      const summary = await repo(tenantA).getRun(runId);
+      expect(summary!.toolEffects.map((e) => e.ordinal)).toEqual([1, 2]);
+      expect(
+        summary!.toolEffects.every(
+          (e) => e.toolName === "github_get_authenticated_user",
+        ),
+      ).toBe(true);
+    });
+
+    it("returns an empty toolEffects array for a run with no ledgered tool call", async () => {
+      const runId = await seedRun(tenantA, "effect-empty", "a");
+      const summary = await repo(tenantA).getRun(runId);
+      expect(summary!.toolEffects).toEqual([]);
+    });
+
+    it("never surfaces another tenant's effects (foreign-tenant isolation)", async () => {
+      const runId = await seedRun(tenantA, "effect-isolated", "whoami");
+      await seedEffect(tenantA, runId, { ordinal: 1, state: "succeeded" });
+      // Tenant A sees its own effect.
+      expect((await repo(tenantA).getRun(runId))!.toolEffects).toHaveLength(1);
+      // Tenant B cannot resolve the run at all — the same null as a nonexistent run —
+      // so A's effect rows are unreachable to B.
+      expect(await repo(tenantB).getRun(runId)).toBeNull();
     });
 
     it("lists runs newest first, filters safely, and paginates without duplicates", async () => {

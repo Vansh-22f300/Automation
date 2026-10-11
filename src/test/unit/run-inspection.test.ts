@@ -258,10 +258,10 @@ describe('assembleRunInspection — run error', () => {
 });
 
 describe('assembleRunInspection — tool effects', () => {
-  it('shapes ledger rows into the DTO in detail mode: state, tool, ordinal, provider', () => {
+  it('projects ledger rows into the safe DTO on the SUMMARY surface (no --detail needed)', () => {
     const view = assembleRunInspection(
       base({ toolEffects: [toolEffect()] }),
-      { detail: true, now: 2_000 },
+      { detail: false, now: 2_000 },
     );
     expect(view.toolEffects).toEqual([
       {
@@ -276,15 +276,75 @@ describe('assembleRunInspection — tool effects', () => {
     ]);
   });
 
-  it('omits tool effects entirely on the summary (non-detail) surface', () => {
-    const view = assembleRunInspection(
-      base({ toolEffects: [toolEffect()] }),
-      { detail: false, now: 2_000 },
-    );
-    expect(view.toolEffects).toBeUndefined();
+  it('is byte-for-byte identical on the summary and detail surfaces', () => {
+    const summary = assembleRunInspection(base({ toolEffects: [toolEffect()] }), { detail: false, now: 2_000 });
+    const detailed = assembleRunInspection(base({ toolEffects: [toolEffect()] }), { detail: true, now: 2_000 });
+    expect(summary.toolEffects).toEqual(detailed.toolEffects);
   });
 
-  it('exposes only safe fields — never the idempotency key, owner, lease, result, or error details', () => {
+  it('is an empty array when the run made no ledgered tool call', () => {
+    const summary = assembleRunInspection(base(), { detail: false, now: 2_000 });
+    const detailed = assembleRunInspection(base(), { detail: true, now: 2_000 });
+    expect(summary.toolEffects).toEqual([]);
+    expect(detailed.toolEffects).toEqual([]);
+  });
+
+  it('orders by step-execution order then ordinal, including repeated calls to the same tool', () => {
+    const view = assembleRunInspection(
+      base({
+        steps: [
+          stepRun({ id: 'sr-1', stepKey: 'a', startedAt: T(1_100) }),
+          stepRun({ id: 'sr-2', stepKey: 'b', startedAt: T(1_300) }),
+        ],
+        toolEffects: [
+          // Deliberately out of order on input; expected sorted by step order then ordinal.
+          toolEffect({ id: 'te-b1', stepKey: 'b', ordinal: 1, state: 'succeeded' }),
+          toolEffect({ id: 'te-a2', stepKey: 'a', ordinal: 2, state: 'succeeded' }),
+          toolEffect({ id: 'te-a1', stepKey: 'a', ordinal: 1, state: 'succeeded' }),
+        ],
+      }),
+      { detail: false, now: 2_000 },
+    );
+    // Two durable calls to the same tool in step `a` (ordinals 1,2) — the authoritative
+    // per-call record, where the INFERRED `tools.toolRounds` would not distinguish them.
+    expect(view.toolEffects.map((e) => [e.stepKey, e.ordinal])).toEqual([
+      ['a', 1],
+      ['a', 2],
+      ['b', 1],
+    ]);
+  });
+
+  it('represents successful, failed, and ambiguous states distinctly', () => {
+    const view = assembleRunInspection(
+      base({
+        steps: [
+          stepRun({ id: 'sr-1', stepKey: 'a', startedAt: T(1_100) }),
+          stepRun({ id: 'sr-2', stepKey: 'b', startedAt: T(1_300) }),
+        ],
+        toolEffects: [
+          toolEffect({ id: 'te-b', stepKey: 'b', ordinal: 1, state: 'failed', error: { code: 'http_500', message: 'bad gateway' } }),
+          toolEffect({ id: 'te-a2', stepKey: 'a', ordinal: 2, state: 'ambiguous', error: { code: 'effect_ambiguous', message: 'unknown' } }),
+          toolEffect({ id: 'te-a1', stepKey: 'a', ordinal: 1, state: 'succeeded' }),
+        ],
+      }),
+      { detail: false, now: 2_000 },
+    );
+    expect(view.toolEffects.map((e) => [e.stepKey, e.ordinal, e.state, e.ambiguous])).toEqual([
+      ['a', 1, 'succeeded', false],
+      ['a', 2, 'ambiguous', true],
+      ['b', 1, 'failed', false],
+    ]);
+    // `ambiguous` is a distinct boolean, never conflated with the `failed` state.
+    expect(view.toolEffects.find((e) => e.state === 'failed')!.ambiguous).toBe(false);
+    expect(view.toolEffects.find((e) => e.state === 'ambiguous')!.ambiguous).toBe(true);
+    // A failed effect keeps only the safe {code, message}.
+    expect(view.toolEffects.find((e) => e.state === 'failed')!.error).toEqual({
+      code: 'http_500',
+      message: 'bad gateway',
+    });
+  });
+
+  it('exposes only safe fields — never the idempotency key, owner, lease, result, or error details (even on the summary surface)', () => {
     const view = assembleRunInspection(
       base({
         toolEffects: [
@@ -298,9 +358,9 @@ describe('assembleRunInspection — tool effects', () => {
           }),
         ],
       }),
-      { detail: true, now: 2_000 },
+      { detail: false, now: 2_000 },
     );
-    const effect = view.toolEffects![0]!;
+    const effect = view.toolEffects[0]!;
     // Only the seven safe keys, nothing else.
     expect(Object.keys(effect).sort()).toEqual(
       ['ambiguous', 'error', 'ordinal', 'provider', 'state', 'stepKey', 'toolName'].sort(),
@@ -313,33 +373,5 @@ describe('assembleRunInspection — tool effects', () => {
     expect(serialized).not.toContain('C-secret'); // error details
     expect(serialized).not.toContain('1700000000.000100'); // stored result ts
     expect(serialized).not.toContain('sr-1'); // owner (step-run id token)
-  });
-
-  it('represents an ambiguous effect distinctly from a plain failure', () => {
-    const view = assembleRunInspection(
-      base({
-        steps: [
-          stepRun({ id: 'sr-1', stepKey: 'a', startedAt: T(1_100) }),
-          stepRun({ id: 'sr-2', stepKey: 'b', startedAt: T(1_300) }),
-        ],
-        toolEffects: [
-          // Out of execution order on input; expected sorted by step order then ordinal.
-          toolEffect({ id: 'te-b', stepKey: 'b', ordinal: 1, state: 'failed', error: { code: 'http_500', message: 'bad gateway' } }),
-          toolEffect({ id: 'te-a2', stepKey: 'a', ordinal: 2, state: 'ambiguous', error: { code: 'effect_ambiguous', message: 'unknown' } }),
-          toolEffect({ id: 'te-a1', stepKey: 'a', ordinal: 1, state: 'succeeded' }),
-        ],
-      }),
-      { detail: true, now: 2_000 },
-    );
-    expect(view.toolEffects!.map((e) => [e.stepKey, e.ordinal, e.state, e.ambiguous])).toEqual([
-      ['a', 1, 'succeeded', false],
-      ['a', 2, 'ambiguous', true],
-      ['b', 1, 'failed', false],
-    ]);
-    // `ambiguous` is a distinct boolean, not conflated with the `failed` state.
-    const failed = view.toolEffects!.find((e) => e.state === 'failed')!;
-    expect(failed.ambiguous).toBe(false);
-    const ambiguous = view.toolEffects!.find((e) => e.state === 'ambiguous')!;
-    expect(ambiguous.ambiguous).toBe(true);
   });
 });
