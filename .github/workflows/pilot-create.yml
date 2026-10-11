@@ -1,0 +1,155 @@
+# Manual, EXPLICITLY-CONFIRMED GitHub pilot CREATION workflow.
+#
+# Performs a REAL production database write (authors an ACTIVE workflow) via
+#   pnpm github:prepare-pilot <tenantId> <connectionId> --commit
+# Deliberately separate from pilot-dry-run.yml and gated THREE ways: default-branch only,
+# UUID-validated ids, and an exact confirmation phrase. It still never enqueues a job, runs
+# the worker, refreshes a token, or calls the LLM/GitHub API — the CLI only reads connection
+# metadata and writes the workflow + its active version.
+#
+# Safety (asserted by src/test/unit/pilot-create-workflow.test.ts):
+#   * manual-only: workflow_dispatch is the ONLY trigger (no push/pull_request/schedule/
+#     workflow_run), so nothing runs automatically;
+#   * default-branch-only: the secret-bearing job runs only on refs/heads/main (the owner
+#     must ALSO restrict the worker-free Environment's deployment branches to `main`);
+#   * requires the exact confirmation phrase CREATE_GITHUB_READ_ONLY_PILOT before --commit;
+#   * UUID inputs validated + masked before the CLI runs; inputs passed as env, never
+#     shell-interpolated; the --commit invocation is hardcoded (no command-runner input);
+#   * reuses worker-free's DATABASE_URL + keyring secret handling; supplies no Anthropic/OAuth.
+#
+# RESIDUAL EXECUTION RISK (creation does NOT make later execution impossible): see the job
+# comment below for the webhook ingress path and operator precautions.
+
+name: pilot authoring CREATE (manual, confirmed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        # A non-secret identifier (NOT a credential).
+        description: "Tenant UUID (non-secret identifier)"
+        required: true
+        type: string
+      connection_id:
+        # A non-secret identifier (NOT a credential).
+        description: "GitHub connection UUID (non-secret identifier)"
+        required: true
+        type: string
+      confirmation:
+        description: "Type exactly CREATE_GITHUB_READ_ONLY_PILOT to authorize the production write"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Serialise pilot CREATION so two concurrent --commit dispatches cannot both pass the
+# (non-transactional) duplicate guard and author two pilots. Read-only dry-runs use a
+# separate group and need not serialize against this (they never write).
+concurrency:
+  group: pilot-create
+  cancel-in-progress: false
+
+jobs:
+  create:
+    name: create github-read-only-pilot (production write)
+    # DEFENSE IN DEPTH: workflow_dispatch lets the operator pick any branch, but this job —
+    # which reads the production worker-free secrets and performs a DB write — must run ONLY
+    # from the default branch. A non-main dispatch skips before the environment is accessed.
+    # This guard does NOT replace GitHub Environment protection: the owner MUST ALSO restrict
+    # the `worker-free` Environment's deployment branches to `main`.
+    #
+    # RESIDUAL EXECUTION RISK: the workflow this job creates is ACTIVE with a webhook trigger
+    # (source=github-read-only-pilot). A SUBSEQUENT delivery to POST /v1/webhooks/
+    # github-read-only-pilot, authenticated with a valid tenant API key, would create a run
+    # and enqueue a job that the worker-free cron then executes. The pilot's trigger config
+    # carries NO HMAC signature, so the tenant bearer API key is the ONLY gate on that
+    # ingress. Events sent before creation are NOT replayed retroactively (a run is created
+    # only at ingest time against an active workflow), and the DB's one-active-workflow-per-
+    # (tenant, source) index prevents a silent source collision. OPERATOR PRECAUTION before
+    # dispatch: confirm no external sender is configured to POST that source with a live API
+    # key, and keep execution gated by not sending that webhook until a first live run is
+    # separately approved.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: worker-free
+
+    steps:
+      # Reject malformed ids or a wrong confirmation phrase BEFORE checkout, build, or any
+      # DB access. Inputs are read as env vars (never shell-interpolated); values are not
+      # echoed. After validation, the two UUIDs are masked for all later job logs.
+      - name: Validate inputs and confirmation
+        shell: bash
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONNECTION_ID: ${{ inputs.connection_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          rc=0
+          if [[ ! "${TENANT_ID}" =~ ${uuid_re} ]]; then echo "::error::tenant_id must be a UUID"; rc=1; fi
+          if [[ ! "${CONNECTION_ID}" =~ ${uuid_re} ]]; then echo "::error::connection_id must be a UUID"; rc=1; fi
+          if [ "${CONFIRMATION}" != "CREATE_GITHUB_READ_ONLY_PILOT" ]; then
+            echo "::error::confirmation must be exactly CREATE_GITHUB_READ_ONLY_PILOT"; rc=1
+          fi
+          if [ "${rc}" -ne 0 ]; then exit 1; fi
+          echo "::add-mask::${TENANT_ID}"
+          echo "::add-mask::${CONNECTION_ID}"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # Optional multi-key keyring, forwarded to the app's runtime name ONLY when set, so an
+      # unset secret stays ABSENT (not "") to the Zod parser — identical handling to
+      # worker-free.yml / pilot-dry-run.yml. No value is ever echoed to stdout.
+      - name: Resolve optional keyring configuration
+        env:
+          OPT_CREDENTIAL_ENCRYPTION_KEYS: ${{ secrets.CREDENTIAL_ENCRYPTION_KEYS }}
+        run: |
+          if [ -n "${OPT_CREDENTIAL_ENCRYPTION_KEYS}" ]; then
+            {
+              echo "CREDENTIAL_ENCRYPTION_KEYS<<__PILOT_ENV_EOF__"
+              echo "${OPT_CREDENTIAL_ENCRYPTION_KEYS}"
+              echo "__PILOT_ENV_EOF__"
+            } >> "${GITHUB_ENV}"
+            echo "keyring: CREDENTIAL_ENCRYPTION_KEYS provided (v2 active key available)"
+          else
+            echo "keyring: CREDENTIAL_ENCRYPTION_KEYS not set (legacy CREDENTIAL_ENCRYPTION_KEY only)"
+          fi
+
+      # PRODUCTION WRITE — runs the merged CLI with the hardcoded --commit flag, only after
+      # the validation + confirmation step above succeeded. The CLI validates the ids,
+      # verifies the connection via metadata (never decrypts), and authors the workflow +
+      # its ACTIVE version; it enqueues NO run and starts no worker. It fails cleanly on a
+      # bad id, inactive/missing connection, missing config, or an existing-pilot duplicate.
+      # Inputs are passed via env, never shell-interpolated; LOG_LEVEL=silent keeps output to
+      # the CLI's sanitized RESULT line.
+      - name: Create the pilot workflow (--commit)
+        env:
+          NODE_ENV: production
+          HOST: 0.0.0.0
+          APP_ORIGIN: https://automation-7d1c.onrender.com
+          LOG_LEVEL: silent
+          DATABASE_POOL_MAX: "5"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CREDENTIAL_ENCRYPTION_KEY: ${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          TENANT_ID: ${{ inputs.tenant_id }}
+          CONNECTION_ID: ${{ inputs.connection_id }}
+        run: |
+          pnpm github:prepare-pilot "${TENANT_ID}" "${CONNECTION_ID}" --commit
