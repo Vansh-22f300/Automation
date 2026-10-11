@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   buildDiagnosticRegistry,
+  createQuietCliLogger,
   GITHUB_SMOKE_TOOL,
   isValidId,
   runCli,
@@ -19,6 +20,7 @@ import {
   type GithubSmokeCliDeps,
   type ToolExecutorLike,
 } from '@/cli/github-get-user-smoke.js';
+import { parseEnv } from '@/config/env.js';
 import type { ConnectionMetadata, ConnectionRef, ConnectionResolver } from '@/domain/connection.js';
 import type { ToolCall } from '@/domain/tool.js';
 import { ToolExecutor } from '@/domain/tool-executor.js';
@@ -345,5 +347,68 @@ describe('isValidId — rejects non-UUID shapes', () => {
     for (const bad of [undefined, '', 'not-a-uuid', '123', TID.slice(0, -1), `${TID}x`, 'g'.repeat(36)]) {
       expect(isValidId(bad as string | undefined)).toBe(false);
     }
+  });
+});
+
+describe('createQuietCliLogger — silent regardless of ambient LOG_LEVEL', () => {
+  it('pins the level to silent and emits nothing even at LOG_LEVEL=info', () => {
+    const lines: string[] = [];
+    const env = parseEnv({ DATABASE_URL: 'postgresql://u:p@localhost:5432/ai_workforce_test', LOG_LEVEL: 'info' });
+    const logger = createQuietCliLogger(env, { write: (chunk) => { lines.push(chunk); } });
+    expect(logger.level).toBe('silent');
+    logger.info({ database: { host: 'secret-db.internal', database: 'prod' } }, 'database connected');
+    logger.error({ event: 'x', code: 'boom' }, 'error');
+    logger.child({ tenant_id: TID }).info('child noise');
+    expect(lines).toEqual([]);
+  });
+});
+
+describe('runCli — stdout carries exactly one sanitized RESULT line (real quiet logger)', () => {
+  it('emits exactly one PASS line and nothing else on success', async () => {
+    const out = collect();
+    const code = await runCli(
+      { argv: [TID, CID], stdout: out.stream, stderr: collect().stream },
+      {
+        loadEnv: () => parseEnv({ DATABASE_URL: 'postgresql://u:p@localhost:5432/ai_workforce_test', LOG_LEVEL: 'info' }),
+        createLogger: createQuietCliLogger,
+        createCipher: () => ({ hasKey: true } as never),
+        createDatabase: () => fakeDb(),
+        runSmoke: async ({ stdout }) => { stdout.write('RESULT: PASS — login=Vansh-22f300\n'); return { outcome: 'pass', reason: 'ok', login: 'Vansh-22f300', exitCode: 0 }; },
+      },
+    );
+    expect(code).toBe(0);
+    expect(out.text()).toBe('RESULT: PASS — login=Vansh-22f300\n');
+    expect(out.text().match(/\n/g)).toHaveLength(1);
+  });
+
+  it('emits exactly one sanitized FAIL line (code, no secrets) when init throws', async () => {
+    const out = collect();
+    const code = await runCli(
+      { argv: [TID, CID], stdout: out.stream, stderr: collect().stream },
+      {
+        loadEnv: () => parseEnv({ DATABASE_URL: 'postgresql://u:p@localhost:5432/ai_workforce_test', LOG_LEVEL: 'info' }),
+        createLogger: createQuietCliLogger,
+        createCipher: () => ({ hasKey: true } as never),
+        createDatabase: () => { throw new Error('fail postgres://user:S3CRET@db.internal:5432/prod token=ghp_LEAKLEAKLEAK'); },
+      },
+    );
+    expect(code).toBe(1);
+    const text = out.text();
+    expect(text).toBe('RESULT: FAIL [unknown] — the smoke test could not run.\n');
+    expect(text.match(/\n/g)).toHaveLength(1);
+    for (const secret of ['S3CRET', 'ghp_LEAKLEAKLEAK', 'postgres://', 'db.internal']) {
+      expect(text).not.toContain(secret);
+    }
+  });
+});
+
+describe('runGithubGetUserSmoke — a classified tool failure is one sanitized line', () => {
+  it('prints exactly one FAIL line carrying the code and nothing else', async () => {
+    const transport = new FakeGithubTransport({ userResponse: { status: 401, body: {} } });
+    const out = collect();
+    await runGithubGetUserSmoke({ executor: realExecutor(transport), getMetadata: async () => githubMeta('active'), tenantId: TID, connectionId: CID, stdout: out.stream });
+    const text = out.text();
+    expect(text).toMatch(/^RESULT: FAIL \[github_unauthorized\] — [^\n]+\n$/);
+    expect(text.match(/\n/g)).toHaveLength(1);
   });
 });

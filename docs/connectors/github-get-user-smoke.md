@@ -62,8 +62,11 @@ them in shell history. (`.env` is read if present.)
 - **Conditionally:** if the stored access token is at/near expiry, the resolver refreshes
   it and persists the rotated credential via compare-and-swap, and GitHub rotates the
   refresh token.
-- **One** external call: `GET /user` (read). **No** GitHub repository changes, issues,
-  workflows, webhooks, jobs, LLM calls, Slack calls, or effect-ledger writes.
+- **GitHub requests:** normally a single `GET /user` (read). If the stored access token
+  is expired or near expiry, the resolver first issues an **OAuth token-refresh request**
+  to GitHub's token endpoint and then calls `GET /user` with the rotated token. **No**
+  GitHub repository changes, issues, workflows, webhooks, jobs, LLM calls, Slack calls, or
+  effect-ledger writes.
 
 ## Warnings
 

@@ -193,11 +193,25 @@ export interface GithubSmokeCliDeps {
   readonly runSmoke?: (input: RealSmokeInput) => Promise<SmokeVerdict>;
 }
 
+/**
+ * The diagnostic's logger. It is built from the app's logger factory but has its level
+ * pinned to 'silent', so the ambient LOG_LEVEL (default 'info') can never let the
+ * database, cipher, or connector emit a line that would interleave with the single
+ * RESULT line this CLI prints on stdout. Only this process's logger is affected — the
+ * shared createLogger and application-wide logging behaviour are untouched. The optional
+ * `destination` mirrors createLogger's own test seam.
+ */
+export function createQuietCliLogger(env: Env, destination?: { write(chunk: string): void }): Logger {
+  const logger = createLogger(env, { service: 'cli' }, destination);
+  logger.level = 'silent';
+  return logger;
+}
+
 const DEFAULT_DEPS: GithubSmokeCliDeps = {
   // parseEnv (throws) rather than loadEnv (process.exit) so a config error flows through
   // the guard below and becomes one sanitized RESULT: FAIL line, never a raw dump.
   loadEnv: () => parseEnv(),
-  createLogger: (env) => createLogger(env, { service: 'cli' }),
+  createLogger: createQuietCliLogger,
   createCipher: (env, logger) => createCredentialCipher(env, { logger }),
   createDatabase: (env, logger) => createDatabase(env, logger, { service: 'cli' }),
   runSmoke: realRunSmoke,
@@ -241,13 +255,12 @@ export async function runCli(io: GithubSmokeCliIo, deps: GithubSmokeCliDeps = DE
     const verdict = await runSmoke({ env, logger, cipher, database, tenantId, connectionId, stdout: io.stdout });
     return verdict.exitCode;
   } catch (error) {
-    if (logger !== undefined) {
-      logger.error(
-        { event: 'github_get_user_smoke_error', code: isAppError(error) ? error.code : 'unknown' },
-        'github_get_user_smoke_error',
-      );
-    }
-    io.stdout.write('RESULT: FAIL — the smoke test could not run (see run logs for a non-secret error code).\n');
+    // The CLI's logger is silent by design, so the sanitized non-secret code goes on the
+    // one RESULT line itself rather than into logs. AppError codes are typed machine
+    // strings (e.g. database_unreachable); a non-AppError degrades to 'unknown'. Never a
+    // raw message, stack, URL, or credential.
+    const code = isAppError(error) ? error.code : 'unknown';
+    io.stdout.write(`RESULT: FAIL [${code}] — the smoke test could not run.\n`);
     return 1;
   } finally {
     if (database !== undefined) {
@@ -261,7 +274,8 @@ export async function runCli(io: GithubSmokeCliIo, deps: GithubSmokeCliDeps = DE
 }
 
 async function main(): Promise<void> {
-  // LOG_LEVEL is expected to be `silent` for a clean single-line result.
+  // The CLI pins its own logger to 'silent' (see createQuietCliLogger), so stdout is
+  // exactly one RESULT line regardless of the ambient LOG_LEVEL.
   process.exitCode = await runCli({ argv: process.argv.slice(2), stdout: process.stdout, stderr: process.stderr });
 }
 
