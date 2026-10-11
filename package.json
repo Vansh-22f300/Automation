@@ -35,7 +35,8 @@
     "connections": "tsx --env-file-if-exists=.env src/cli/connections.ts",
     "connections:verify-decrypt": "tsx --env-file-if-exists=.env src/cli/verify-connection-decrypt.ts",
     "slack:smoke": "tsx --env-file-if-exists=.env src/cli/slack-smoke.ts",
-    "github:get-user-smoke": "tsx --env-file-if-exists=.env src/cli/github-get-user-smoke.ts"
+    "github:get-user-smoke": "tsx --env-file-if-exists=.env src/cli/github-get-user-smoke.ts",
+    "github:prepare-pilot": "tsx --env-file-if-exists=.env src/cli/create-github-pilot.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.122.0",
