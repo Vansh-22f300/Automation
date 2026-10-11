@@ -19,6 +19,7 @@ import type { AuthContext, Authenticator } from "@/auth/context.js";
 import type {
   Event,
   Job,
+  ToolEffect,
   Workflow,
   WorkflowRun,
   WorkflowStepRun,
@@ -35,6 +36,7 @@ import type {
 const KEY_T1 = "key-1";
 const KEY_T2 = "key-2";
 const OWN_RUN = "run-own";
+const RUN_WITH_EFFECTS = "run-effects";
 
 const authenticator: Authenticator = {
   authenticate: async (credential: string): Promise<AuthContext> => {
@@ -128,12 +130,129 @@ function fixture(): RunInspection {
 
 const FIXTURE = fixture();
 
+/**
+ * A run whose durable effect ledger carries two actual tool calls — a succeeded
+ * GitHub read (the pilot's `whoami` evidence) and an ambiguous Slack send seeded
+ * with values that MUST NOT cross the HTTP boundary (idempotency key, owner token,
+ * stored result, and an error whose `details` holds a bot token). Built through the
+ * real assembler in SUMMARY mode (`detail: false`), proving the effect projection
+ * reaches the HTTP summary without any detail flag.
+ */
+function fixtureWithEffects(): RunInspection {
+  const run = {
+    id: RUN_WITH_EFFECTS,
+    tenantId: "tenant-1",
+    workflowId: "wf-1",
+    workflowVersionId: "ver-1",
+    eventId: "ev-1",
+    status: "succeeded",
+    currentStepKey: "whoami",
+    context: {},
+    error: null,
+    createdAt: T(1_000),
+    startedAt: T(1_100),
+    finishedAt: T(1_200),
+  } as WorkflowRun;
+  const workflow = {
+    id: "wf-1",
+    tenantId: "tenant-1",
+    name: "WF",
+    status: "active",
+    createdAt: T(0),
+    updatedAt: T(0),
+  } as Workflow;
+  const version = {
+    id: "ver-1",
+    tenantId: "tenant-1",
+    workflowId: "wf-1",
+    version: 1,
+    definition: {},
+    triggerType: "webhook",
+    triggerConfig: { source: "s" },
+    isActive: true,
+    createdAt: T(0),
+  } as WorkflowVersion;
+  const event = {
+    id: "ev-1",
+    tenantId: "tenant-1",
+    source: "s",
+    dedupeKey: "d",
+    payload: { ok: 1 },
+    receivedAt: T(500),
+  } as Event;
+  const step = {
+    id: "sr-1",
+    tenantId: "tenant-1",
+    runId: RUN_WITH_EFFECTS,
+    stepKey: "whoami",
+    stepType: "llm",
+    attempt: 0,
+    status: "succeeded",
+    input: null,
+    output: { login: "octocat" },
+    error: null,
+    startedAt: T(1_100),
+    finishedAt: T(1_150),
+    durationMs: 50,
+  } as WorkflowStepRun;
+  const effects: ToolEffect[] = [
+    {
+      id: "te-1",
+      tenantId: "tenant-1",
+      runId: RUN_WITH_EFFECTS,
+      stepKey: "whoami",
+      toolName: "github_get_authenticated_user",
+      ordinal: 1,
+      idempotencyKey: `${RUN_WITH_EFFECTS}:whoami:github_get_authenticated_user:1`,
+      provider: "github",
+      state: "succeeded",
+      owner: "owner-token-sr-1",
+      leaseExpiresAt: null,
+      result: { login: "octocat", id: 583231 },
+      error: null,
+      createdAt: T(1_120),
+      updatedAt: T(1_130),
+    } as ToolEffect,
+    {
+      id: "te-2",
+      tenantId: "tenant-1",
+      runId: RUN_WITH_EFFECTS,
+      stepKey: "whoami",
+      toolName: "send_slack_message",
+      ordinal: 2,
+      idempotencyKey: `${RUN_WITH_EFFECTS}:whoami:send_slack_message:2`,
+      provider: "slack",
+      state: "ambiguous",
+      owner: "owner-token-sr-1",
+      leaseExpiresAt: null,
+      result: null,
+      error: {
+        code: "effect_ambiguous",
+        message: "worker crashed after dispatch",
+        details: { botToken: "xoxb-planted-effect-secret", channel: "C-private" },
+      },
+      createdAt: T(1_140),
+      updatedAt: T(1_150),
+    } as ToolEffect,
+  ];
+  return assembleRunInspection(
+    { run, workflow, version, event, steps: [step], jobs: [], llmUsage: [], toolEffects: effects },
+    { detail: false, now: 2_000 },
+  );
+}
+
+const FIXTURE_EFFECTS = fixtureWithEffects();
+
 const readerFor = (auth: AuthContext): RunInspectionReader & RunListReader => ({
   getRun: async (
     runId: string,
     _options?: RunInspectionOptions,
-  ): Promise<RunInspection | null> =>
-    auth.tenantId === "tenant-1" && runId === OWN_RUN ? FIXTURE : null,
+  ): Promise<RunInspection | null> => {
+    if (auth.tenantId !== "tenant-1") return null;
+    if (runId === OWN_RUN) return FIXTURE;
+    if (runId === RUN_WITH_EFFECTS) return FIXTURE_EFFECTS;
+    return null;
+  },
   listRuns: async (options = {}) => {
     if (auth.tenantId === "tenant-2") return { items: [], nextCursor: null };
     if (options.cursor === "cursor-1") {
@@ -307,6 +426,57 @@ describe("GET /v1/runs/:runId", () => {
     // But the safe, summarized view IS present.
     expect(res.json().run.contextSummary.bytes).toBeGreaterThan(0);
     expect(res.json().jobs[0].leased).toBe(true);
+  });
+
+  it("includes safe tool-effect metadata in the summary body (no detail flag)", async () => {
+    app = await makeApp();
+    const res = await app.inject({
+      method: "GET",
+      url: `/v1/runs/${RUN_WITH_EFFECTS}`,
+      headers: bearer(KEY_T1),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().toolEffects).toEqual([
+      {
+        stepKey: "whoami",
+        toolName: "github_get_authenticated_user",
+        ordinal: 1,
+        provider: "github",
+        state: "succeeded",
+        ambiguous: false,
+        error: null,
+      },
+      {
+        stepKey: "whoami",
+        toolName: "send_slack_message",
+        ordinal: 2,
+        provider: "slack",
+        state: "ambiguous",
+        ambiguous: true,
+        error: {
+          code: "effect_ambiguous",
+          message: "worker crashed after dispatch",
+        },
+      },
+    ]);
+  });
+
+  it("never leaks effect secrets or internal effect-ledger fields over HTTP", async () => {
+    app = await makeApp();
+    const res = await app.inject({
+      method: "GET",
+      url: `/v1/runs/${RUN_WITH_EFFECTS}`,
+      headers: bearer(KEY_T1),
+    });
+    const raw = res.body;
+    expect(raw).not.toContain("xoxb-planted-effect-secret"); // error.details secret
+    expect(raw).not.toContain("C-private"); // error.details
+    expect(raw).not.toContain("owner-token-sr-1"); // owner / lease token
+    expect(raw).not.toContain("idempotencyKey"); // internal field name
+    expect(raw).not.toContain(`${RUN_WITH_EFFECTS}:whoami:`); // idempotency key value
+    expect(raw).not.toContain("583231"); // stored raw result id (never projected)
+    // The authoritative actual-tool-call evidence IS present and safe.
+    expect(res.json().toolEffects).toHaveLength(2);
   });
 });
 

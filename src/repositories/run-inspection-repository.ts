@@ -182,19 +182,19 @@ export class RunInspectionRepository
           .where(
             this.scope.where(llmUsage.tenantId, eq(llmUsage.runId, runId)),
           ),
-        // Effect-ledger rows back only the detail-mode triage view, so the summary
-        // path (CLI list, API) pays for no extra query. The assembler orders them.
-        detail
-          ? this.db
-              .select()
-              .from(toolEffects)
-              .where(
-                this.scope.where(
-                  toolEffects.tenantId,
-                  eq(toolEffects.runId, runId),
-                ),
-              )
-          : Promise.resolve([]),
+        // Effect-ledger rows back the authoritative "actual tool calls" view, which
+        // is now part of BOTH the summary and detail surfaces (the assembler projects
+        // only safe fields), so it is always fetched. One indexed point query by
+        // (tenant_id, run_id); the assembler orders them.
+        this.db
+          .select()
+          .from(toolEffects)
+          .where(
+            this.scope.where(
+              toolEffects.tenantId,
+              eq(toolEffects.runId, runId),
+            ),
+          ),
       ]);
 
     const workflow = workflowRows[0];

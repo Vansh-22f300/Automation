@@ -14,9 +14,20 @@
  * is attached ONLY when `detail` is requested — a mode the CLI exposes behind
  * `--detail` and the API deliberately does not offer yet.
  *
- * Tool activity is not stored in a table of its own; it is reconstructed from
- * `llm_usage` round counts — a step run with more than one metered round used
- * tools. Per-call tool names and arguments live only in logs, never here.
+ * Two different things describe tool use, and they must NOT be conflated:
+ *   - `tools` (ToolActivityDto) is INFERRED from `llm_usage` round counts — a step
+ *     run with more than one metered round used tools. `toolRounds` is therefore an
+ *     estimate, never an actual tool-call count: one round can issue several calls,
+ *     so it under-counts, and it is derived telemetry, not a durable fact.
+ *   - `toolEffects` (ToolEffectDto) are the DURABLE effect-ledger rows — the
+ *     authoritative, per-call record of each external tool call, projected to safe
+ *     fields only. This is where an "actual tool call happened" claim must come from.
+ *     Per-call arguments and raw results live only in the ledger's private columns
+ *     and logs, never here.
+ *
+ * Both surfaces carry the safe `toolEffects` projection; `detail` governs ONLY
+ * whether the raw, secret-scrubbed values (context/payload/input/output) are
+ * additionally attached. The effect projection is already safe in either mode.
  */
 
 import type {
@@ -130,12 +141,18 @@ export interface LlmUsageDto {
  * Reconstructed tool activity for one `llm` step run. Not a stored fact: derived
  * from the round count, since a tool-calling step meters each round separately
  * (round 1 is the initial call; each extra round followed a tool execution).
+ *
+ * INFERENCE, not a tool-call count. `toolRounds` counts rounds that were followed
+ * by at least one tool execution — it is NOT the number of tool calls made (one
+ * round can issue several), so it under-counts. For the authoritative, per-call
+ * record of what actually executed, read {@link ToolEffectDto} (`toolEffects`),
+ * which is backed by durable effect-ledger rows.
  */
 export interface ToolActivityDto {
   readonly stepKey: string;
   readonly rounds: number;
   readonly usedTools: boolean;
-  /** Number of tool-execution rounds (rounds beyond the first). */
+  /** INFERRED tool-execution rounds (rounds beyond the first). Not a tool-call count. */
   readonly toolRounds: number;
 }
 
@@ -188,11 +205,15 @@ export interface RunInspection {
   readonly llmUsage: readonly LlmUsageDto[];
   readonly tools: readonly ToolActivityDto[];
   /**
-   * Durable external-effect ledger rows for the run, ordered by step-execution order
-   * then `ordinal`. Present only in detail mode — the operator-triage surface where
-   * spotting an `ambiguous` effect matters. The summary surfaces never carry it.
+   * Durable external-effect ledger rows for the run — the authoritative, per-call
+   * record of actual tool execution — ordered by step-execution order then `ordinal`.
+   * Always present (an empty array when the run made no ledgered tool call), on BOTH
+   * the summary and detail surfaces: the projection carries only safe fields
+   * ({@link ToolEffectDto}), so it needs no `detail` gate. Spotting an `ambiguous`
+   * effect — an external call whose outcome is unknown after a crash — is the reason
+   * it is surfaced by default.
    */
-  readonly toolEffects?: readonly ToolEffectDto[];
+  readonly toolEffects: readonly ToolEffectDto[];
   readonly usageTotals: UsageTotalsDto;
 }
 
@@ -205,7 +226,7 @@ export interface RawRunData {
   readonly steps: readonly WorkflowStepRun[];
   readonly jobs: readonly Job[];
   readonly llmUsage: readonly LlmUsage[];
-  /** Effect-ledger rows for this run. Optional so summary callers can omit the query. */
+  /** Effect-ledger rows for this run. Optional only so a caller/test may omit them (treated as none). */
   readonly toolEffects?: readonly ToolEffect[];
 }
 
@@ -356,35 +377,33 @@ export function assembleRunInspection(data: RawRunData, options: AssembleOptions
     { rounds: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, latencyMs: 0 },
   );
 
-  // External-effect ledger rows, attached only in detail mode (the triage surface).
-  // Ordered by the step's first-execution order, then per-step `ordinal`, so an
-  // operator reads them in the sequence the run issued them. Rows whose step key is
-  // not among this run's steps (should not happen) sort last. Only the safe fields
-  // cross the boundary: never the idempotency key, stored result, owner/lease, or a
-  // raw error payload — `toSafeError` reduces a failure to {code, message}.
-  const toolEffectsDto: ToolEffectDto[] | undefined = detail
-    ? (() => {
-        const stepKeyOrder = new Map<string, number>();
-        orderedSteps.forEach((s, i) => {
-          if (!stepKeyOrder.has(s.stepKey)) stepKeyOrder.set(s.stepKey, i);
-        });
-        return [...(data.toolEffects ?? [])]
-          .sort((a, b) => {
-            const ai = stepKeyOrder.get(a.stepKey) ?? Number.MAX_SAFE_INTEGER;
-            const bi = stepKeyOrder.get(b.stepKey) ?? Number.MAX_SAFE_INTEGER;
-            return ai === bi ? a.ordinal - b.ordinal : ai - bi;
-          })
-          .map((e) => ({
-            stepKey: e.stepKey,
-            toolName: e.toolName,
-            ordinal: e.ordinal,
-            provider: e.provider,
-            state: e.state,
-            ambiguous: e.state === 'ambiguous',
-            error: toSafeError(e.error),
-          }));
-      })()
-    : undefined;
+  // External-effect ledger rows — the durable, authoritative record of actual tool
+  // calls — projected to safe fields and surfaced on BOTH summary and detail (the
+  // projection carries nothing sensitive, so it needs no `detail` gate). Ordered by
+  // the step's first-execution order, then per-step `ordinal`, so an operator reads
+  // them in the sequence the run issued them. Rows whose step key is not among this
+  // run's steps (should not happen) sort last. Only the safe fields cross the
+  // boundary: never the idempotency key, stored result, owner/lease, or a raw error
+  // payload — `toSafeError` reduces a failure to {code, message}.
+  const stepKeyOrder = new Map<string, number>();
+  orderedSteps.forEach((s, i) => {
+    if (!stepKeyOrder.has(s.stepKey)) stepKeyOrder.set(s.stepKey, i);
+  });
+  const toolEffectsDto: ToolEffectDto[] = [...(data.toolEffects ?? [])]
+    .sort((a, b) => {
+      const ai = stepKeyOrder.get(a.stepKey) ?? Number.MAX_SAFE_INTEGER;
+      const bi = stepKeyOrder.get(b.stepKey) ?? Number.MAX_SAFE_INTEGER;
+      return ai === bi ? a.ordinal - b.ordinal : ai - bi;
+    })
+    .map((e) => ({
+      stepKey: e.stepKey,
+      toolName: e.toolName,
+      ordinal: e.ordinal,
+      provider: e.provider,
+      state: e.state,
+      ambiguous: e.state === 'ambiguous',
+      error: toSafeError(e.error),
+    }));
 
   return {
     run,
@@ -395,7 +414,7 @@ export function assembleRunInspection(data: RawRunData, options: AssembleOptions
     jobs,
     llmUsage: llmUsageDtos,
     tools,
-    ...(toolEffectsDto !== undefined ? { toolEffects: toolEffectsDto } : {}),
+    toolEffects: toolEffectsDto,
     usageTotals,
   };
 }

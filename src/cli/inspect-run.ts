@@ -7,7 +7,10 @@
  * tenant-scoped `RunInspectionRepository` (so it can only ever see runs of the
  * given tenant) and prints the same `RunInspection` view the HTTP endpoint
  * returns. Values are summarized (size + redacted preview) by default; `--detail`
- * additionally prints the secret-scrubbed raw context/payload/input/output.
+ * additionally prints the secret-scrubbed raw context/payload/input/output. The
+ * safe external-tool-effect summary (the durable, authoritative record of actual
+ * tool calls) is always printed — it carries no raw values, so it needs no
+ * `--detail`.
  *
  * A run that does not exist for the tenant — absent or another tenant's — prints
  * "not found" and exits non-zero, exactly the ambiguity the API's 404 preserves.
@@ -88,18 +91,22 @@ function render(view: RunInspection): string {
   }
   if (view.tools.length > 0) {
     lines.push('');
-    lines.push('tool activity (reconstructed from round counts):');
+    lines.push('tool activity (INFERRED from LLM round counts — NOT an actual tool-call count):');
     for (const t of view.tools) {
-      lines.push(`  step=${t.stepKey}  rounds=${t.rounds}  used_tools=${t.usedTools}  tool_rounds=${t.toolRounds}`);
+      lines.push(`  step=${t.stepKey}  rounds=${t.rounds}  used_tools=${t.usedTools}  tool_rounds=${t.toolRounds} (inferred)`);
     }
+    lines.push('  (for the authoritative per-call record, see external tool effects below)');
   }
-  // External-effect ledger, detail mode only. `view.toolEffects` is present iff the
-  // run was fetched with --detail. An `ambiguous` effect is the reason this section
-  // exists — an external call whose outcome is unknown after a crash — so it is
-  // marked with a leading `!! AMBIGUOUS` an operator cannot miss when scanning.
-  if (view.toolEffects !== undefined) {
-    lines.push('');
-    lines.push(`external effects (${view.toolEffects.length}), execution order:`);
+  // External-effect ledger — the DURABLE, authoritative record of actual tool calls.
+  // Always present now (an empty array when the run made no ledgered tool call) and
+  // shown on the default surface, not just --detail. An `ambiguous` effect is the
+  // sharpest reason it exists — an external call whose outcome is unknown after a
+  // crash — so it is marked with a leading `!! AMBIGUOUS` an operator cannot miss.
+  lines.push('');
+  lines.push(`external tool effects (${view.toolEffects.length}) — actual durable tool calls (effect ledger), execution order:`);
+  if (view.toolEffects.length === 0) {
+    lines.push('  none recorded');
+  } else {
     const ambiguousCount = view.toolEffects.filter((x) => x.ambiguous).length;
     if (ambiguousCount > 0) {
       lines.push(`  !! ${ambiguousCount} AMBIGUOUS effect(s) — outcome unknown, not auto-resent; reconcile manually`);
