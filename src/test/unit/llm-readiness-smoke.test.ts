@@ -14,6 +14,7 @@ import {
   runCli,
   runLlmReadiness,
   type LlmReadinessDeps,
+  type RawAnthropicConfig,
   type ReadinessProvider,
 } from '@/cli/llm-readiness-smoke.js';
 import { PermanentError } from '@/domain/errors.js';
@@ -141,5 +142,75 @@ describe('runCli — credential/model gates and provider wiring', () => {
     } as unknown as LlmReadinessDeps);
     expect(code).toBe(1);
     expect(out.text()).toContain('[llm_ambiguous_credentials]');
+  });
+});
+
+describe('runCli — ANTHROPIC_BASE_URL validation (before any provider build or network)', () => {
+  const bearer = (url?: string): RawAnthropicConfig => ({
+    ANTHROPIC_AUTH_TOKEN: 't',
+    ANTHROPIC_MODEL: 'm',
+    ANTHROPIC_BASE_URL: url,
+  });
+  const neverProvider = () =>
+    vi.fn(
+      (_env: unknown, _logger: unknown) =>
+        ({ name: 'claude', defaultModel: 'm', completeStructured: vi.fn() }) as unknown as ReadinessProvider,
+    );
+  async function run(cfg: RawAnthropicConfig, createProvider: LlmReadinessDeps['createProvider']) {
+    const out = collect();
+    const code = await runCli(
+      { stdout: out.stream, stderr: collect().stream },
+      { readConfig: () => cfg, createLogger: () => ({}) as never, createProvider },
+    );
+    return { code, text: out.text() };
+  }
+
+  it('bearer mode: FAILs [llm_base_url_required] when the URL is missing/empty, no provider built', async () => {
+    for (const url of [undefined, '   ']) {
+      const createProvider = neverProvider();
+      const { code, text } = await run(bearer(url), createProvider);
+      expect(code).toBe(1);
+      expect(text).toContain('[llm_base_url_required]');
+      expect(createProvider).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    ['unparseable', 'not a url'],
+    ['insecure http', 'http://gw.example'],
+    ['trailing /v1', 'https://gw.example/v1'],
+    ['trailing /v1/', 'https://gw.example/v1/'],
+  ])('FAILs [llm_base_url_invalid] for %s — no provider built, URL not printed', async (_label, url) => {
+    const createProvider = neverProvider();
+    const { code, text } = await run(bearer(url), createProvider);
+    expect(code).toBe(1);
+    expect(text).toContain('[llm_base_url_invalid]');
+    expect(text).not.toContain(url);
+    expect(createProvider).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['bare https origin', 'https://gw.example'],
+    ['https with a base path', 'https://gw.example/api/anthropic'],
+  ])('accepts %s and proceeds to build the provider and PASS', async (_label, url) => {
+    const { provider, completeStructured } = makeProvider(async () => okCompletion('m'));
+    const createProvider = vi.fn((_env: unknown, _logger: unknown) => provider);
+    const { code } = await run(bearer(url), createProvider);
+    expect(code).toBe(0);
+    expect(createProvider).toHaveBeenCalledTimes(1);
+    expect(completeStructured).toHaveBeenCalledTimes(1);
+  });
+
+  it('direct API-key mode: allows an absent base URL but still rejects an invalid one', async () => {
+    const { provider } = makeProvider(async () => okCompletion());
+    const okFactory = vi.fn((_env: unknown, _logger: unknown) => provider);
+    expect((await run({ ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'm' }, okFactory)).code).toBe(0);
+    expect(okFactory).toHaveBeenCalledTimes(1);
+
+    const never = neverProvider();
+    const bad = await run({ ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'm', ANTHROPIC_BASE_URL: 'http://gw' }, never);
+    expect(bad.code).toBe(1);
+    expect(bad.text).toContain('[llm_base_url_invalid]');
+    expect(never).not.toHaveBeenCalled();
   });
 });

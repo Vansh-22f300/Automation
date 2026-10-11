@@ -113,6 +113,25 @@ export interface LlmReadinessIo {
 }
 
 /**
+ * Production-equivalent ANTHROPIC_BASE_URL check, mirroring env.ts: a parseable, ABSOLUTE
+ * HTTPS URL whose path does NOT end in `/v1` (the SDK appends `/v1/messages`). A gateway
+ * base path is allowed. Returns a sanitized code on failure, or null when acceptable.
+ * Never echoes the URL.
+ */
+export function baseUrlProblem(baseUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return 'llm_base_url_invalid';
+  }
+  if (url.protocol !== 'https:') return 'llm_base_url_invalid';
+  if (/\/v1\/?$/.test(url.pathname)) return 'llm_base_url_invalid';
+  return null;
+}
+
+
+/**
  * Run the check end to end (never throws). Fails nonzero — never silently green — when the
  * credential or model is absent, so a missing config can never pass; then it builds the real
  * provider and runs exactly one structured request.
@@ -127,6 +146,23 @@ export async function runCli(io: LlmReadinessIo, deps: LlmReadinessDeps = DEFAUL
   if (model === undefined || model === '') {
     io.stdout.write('RESULT: FAIL [llm_model_not_configured] — ANTHROPIC_MODEL is not set.\n');
     return 1;
+  }
+
+  // Prove the intended gateway BEFORE building the provider or making any request. In
+  // bearer-token mode an explicit HTTPS gateway URL is required (never an SDK default), and
+  // any supplied URL (either mode) must be absolute HTTPS and must not end with /v1.
+  const baseUrl = cfg.ANTHROPIC_BASE_URL?.trim();
+  const bearerMode = cfg.ANTHROPIC_AUTH_TOKEN !== undefined && cfg.ANTHROPIC_AUTH_TOKEN.trim() !== '';
+  if (bearerMode && (baseUrl === undefined || baseUrl === '')) {
+    io.stdout.write('RESULT: FAIL [llm_base_url_required] — ANTHROPIC_BASE_URL must be set in bearer-token mode.\n');
+    return 1;
+  }
+  if (baseUrl !== undefined && baseUrl !== '') {
+    const problem = baseUrlProblem(baseUrl);
+    if (problem !== null) {
+      io.stdout.write(`RESULT: FAIL [${problem}] — ANTHROPIC_BASE_URL is not an acceptable HTTPS gateway URL.\n`);
+      return 1;
+    }
   }
 
   try {
