@@ -16,7 +16,7 @@
  * is emitted to logs or persisted rows.
  */
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { parseEnv } from '@/config/env.js';
@@ -69,7 +69,9 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('github tool execution through 
     new RefreshingConnectionResolver(new ConnectionRepository(new TenantScope(handle.db, tenantId), cipher), tokenSource);
   const effectLedgerFactory = (tenantId: string) => new EffectLedgerRepository(new TenantScope(handle.db, tenantId));
 
-  const queue = () => new PostgresJobQueue(handle.db);
+  // The test worker claims only THIS suite's tenant (tenant A owns every run/job seeded
+  // here), so it never drains another suite's jobs from the shared test database.
+  const queue = () => new PostgresJobQueue(handle.db, { tenantId: tenantA });
 
   const silent = () =>
     createLogger(parseEnv({ DATABASE_URL: 'postgresql://u:p@localhost:5432/db', LOG_LEVEL: 'silent' }) as never, {
@@ -199,14 +201,17 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('github tool execution through 
     await handle.close();
   });
 
+  // Scope cleanup strictly to this suite's own two tenants, so a shared single-fork test
+  // database is never wiped out from under another suite. FK-safe child → parent order.
   beforeEach(async () => {
-    await handle.db.delete(toolEffects);
-    await handle.db.delete(llmUsage);
-    await handle.db.delete(workflowStepRuns);
-    await handle.db.delete(jobs);
-    await handle.db.delete(workflowRuns);
-    await handle.db.delete(events);
-    await handle.db.delete(connections);
+    const scope = [tenantA, tenantB];
+    await handle.db.delete(toolEffects).where(inArray(toolEffects.tenantId, scope));
+    await handle.db.delete(llmUsage).where(inArray(llmUsage.tenantId, scope));
+    await handle.db.delete(workflowStepRuns).where(inArray(workflowStepRuns.tenantId, scope));
+    await handle.db.delete(jobs).where(inArray(jobs.tenantId, scope));
+    await handle.db.delete(workflowRuns).where(inArray(workflowRuns.tenantId, scope));
+    await handle.db.delete(events).where(inArray(events.tenantId, scope));
+    await handle.db.delete(connections).where(inArray(connections.tenantId, scope));
   });
 
   it('executes github_get_authenticated_user end to end: run/step/job succeed, token used once', async () => {
@@ -240,7 +245,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('github tool execution through 
     expect(usage.map((u) => u.round).sort()).toEqual([1, 2]); // one row per provider round
 
     // The effect ledger reserved + recorded exactly one github effect (the dedupe boundary).
-    const effects = await handle.db.select().from(toolEffects);
+    const effects = await handle.db.select().from(toolEffects).where(eq(toolEffects.runId, runId));
     expect(effects).toHaveLength(1);
     expect(effects[0]!.toolName).toBe(GITHUB_GET_AUTHENTICATED_USER_TOOL);
     expect(effects[0]!.provider).toBe(GITHUB_PROVIDER);
@@ -268,7 +273,7 @@ describe.skipIf(TEST_DATABASE_URL === undefined)('github tool execution through 
     expect((await stepRunsFor(runId))[0]!.status).toBe('failed');
     const [job] = await handle.db.select().from(jobs).where(eq(jobs.runId, runId));
     expect(job!.status).toBe('failed');
-    expect(await handle.db.select().from(toolEffects)).toHaveLength(0); // failed before the ledger engaged
+    expect(await handle.db.select().from(toolEffects).where(eq(toolEffects.runId, runId))).toHaveLength(0); // failed before the ledger engaged
     assertNoSecrets(cap.text(), {});
   });
 
