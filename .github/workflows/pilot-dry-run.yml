@@ -8,6 +8,10 @@
 # Safety (asserted by src/test/unit/pilot-dry-run-workflow.test.ts):
 #   * manual-only: workflow_dispatch is the ONLY trigger (no push/pull_request/schedule),
 #     so it can never run during PR CI or on merge;
+#   * default-branch-only: the job runs only on refs/heads/main, so a non-main dispatch
+#     skips before the worker-free production secrets are read (defense in depth; the owner
+#     must ALSO restrict the worker-free Environment's deployment branches to `main`);
+#   * the non-secret tenant/connection UUID inputs are masked in logs after validation;
 #   * NO --commit anywhere — this workflow never enables the write path, enqueues a job,
 #     runs the worker, refreshes a token, or calls the LLM/GitHub API;
 #   * inputs are validated as UUIDs and passed as environment variables (never raw shell
@@ -22,11 +26,13 @@ on:
   workflow_dispatch:
     inputs:
       tenant_id:
-        description: "Tenant UUID (entered privately at dispatch; never stored in source)"
+        # A non-secret identifier (NOT a credential); provided at dispatch, not stored in source.
+        description: "Tenant UUID (non-secret identifier)"
         required: true
         type: string
       connection_id:
-        description: "GitHub connection UUID (entered privately at dispatch)"
+        # A non-secret identifier (NOT a credential).
+        description: "GitHub connection UUID (non-secret identifier)"
         required: true
         type: string
 
@@ -43,6 +49,14 @@ concurrency:
 jobs:
   dry-run:
     name: pilot authoring dry run
+    # DEFENSE IN DEPTH: workflow_dispatch lets the operator pick any branch, but this job —
+    # which reads the production worker-free secrets — must run ONLY from the default branch.
+    # A non-main dispatch skips here, before the worker-free environment is ever accessed.
+    # This guard does NOT replace GitHub Environment protection: the repository owner MUST
+    # ALSO restrict the `worker-free` Environment's deployment branches to `main`
+    # (Settings > Environments > worker-free) before dispatching any workflow that receives
+    # production secrets.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Scope the production DATABASE_URL / credential-encryption secrets to the SAME
@@ -62,7 +76,12 @@ jobs:
           rc=0
           if [[ ! "${TENANT_ID}" =~ ${uuid_re} ]]; then echo "::error::tenant_id must be a UUID"; rc=1; fi
           if [[ ! "${CONNECTION_ID}" =~ ${uuid_re} ]]; then echo "::error::connection_id must be a UUID"; rc=1; fi
-          exit "${rc}"
+          if [ "${rc}" -ne 0 ]; then exit 1; fi
+          # Mask the validated identifiers in all subsequent job logs (defense in depth).
+          # They are non-secret identifiers, not credentials, but need not appear verbatim in
+          # shared CI logs; the CLI's sanitized plan (provider/status/name/limits) stays visible.
+          echo "::add-mask::${TENANT_ID}"
+          echo "::add-mask::${CONNECTION_ID}"
 
       - name: Checkout
         uses: actions/checkout@v5

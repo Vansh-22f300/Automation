@@ -118,3 +118,24 @@ describe('pilot-dry-run.yml — dry-run only, safe secret handling', () => {
     expect(workflow).not.toMatch(/echo[^\n]*\$\{\{\s*secrets\./);
   });
 });
+
+describe('pilot-dry-run.yml — production-secret hardening', () => {
+  it('runs the secret-bearing job only on the default branch (main)', () => {
+    expect(workflow).toContain("if: github.ref == 'refs/heads/main'");
+  });
+
+  it('masks the validated tenant/connection identifiers before the CLI runs', () => {
+    const validate = stepBlock('Validate inputs are UUIDs');
+    expect(validate).toContain('::add-mask::${TENANT_ID}');
+    expect(validate).toContain('::add-mask::${CONNECTION_ID}');
+  });
+
+  it('describes the inputs as non-secret identifiers, not credentials', () => {
+    expect(onBlock).toContain('non-secret identifier');
+    expect(onBlock).not.toContain('entered privately');
+  });
+
+  it('documents that the worker-free Environment must be restricted to main', () => {
+    expect(workflow).toMatch(/deployment branches to .?main/);
+  });
+});
